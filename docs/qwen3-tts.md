@@ -1,76 +1,94 @@
 # Qwen3-TTS engine
 
 `pega-omni qwen3-tts --model-path <Qwen3-TTS-12Hz-1.7B-CustomVoice>` serves the
-12 Hz CustomVoice checkpoint on one GPU. Crates: `omni-cuda` (the talker's
-kernels and GPU layer) and `omni-qwen3-tts` (weights, prompt, talker, codec,
-engine). The codec decoder is a [kern](https://github.com/pegainfer-project/kern)
-manifest the crate generates at load and `kern-runtime` executes.
+12 Hz CustomVoice checkpoint on one GPU. The whole synthesis path (talker,
+code predictor, sampler, codec decoder) is one
+[kern](https://github.com/pegainfer-project/kern) manifest that
+`omni-qwen3-tts` generates at load and one `kern-runtime` executes.
+
+## Programs
+
+A request is `prefill`, then `first`, then `decode` until it draws the end
+token:
+
+| program | runs | rows | does |
+|---|---|---|---|
+| `init` | once, at load | 1 | the text track's `<tts_pad>` embedding every decode row adds |
+| `prefill` | eager | `tokens`: the new prompts, ragged | text projection + codec track, 28 talker layers into paged KV, each prompt's last hidden state into `hidden` |
+| `first` | CUDA graph per bucket | `seqs` | `hidden` → frame → PCM: codec head, codebook-0 draw, fifteen code-predictor passes, codec decoder |
+| `decode` | CUDA graph per bucket | `seqs` | last frame → talker (1 token) → frame → PCM, the same tail as `first` |
+
+`first` exists so a prompt's frame needs no talker row of its own: prefill
+already produced the hidden state it is drawn from. A decode step is one
+graph launch, then one copy of the frames and PCM back.
+
+Graph calls pad `seqs` to a bucket (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96,
+128); padding rows run on a lease of their own.
+
+## State
+
+- **Talker KV**: kern paged state, one state per layer (`[slot][K | V][8
+  heads][128]` bf16), pages of 16 tokens. A request leases its whole KV at
+  admission, sized by a frame cap proportional to its input, so nothing is
+  preempted and a running request never waits for memory.
+- **Per-sequence slot**: the last frame's sixteen codes, the bitmap of
+  codebook-0 codes under the repetition penalty, and the codec decoder's
+  state (each causal conv's last input rows, each overlapping transposed
+  conv's last GEMM row, each attention layer's K/V for the last 72 frames).
+  The draws write the frame and the bitmap there; `decode` reads its input
+  from there. Nothing but the frame and its PCM crosses to the host.
+- **Code predictor KV**: a workspace of 16 slots per sequence, rewritten
+  every call: the predictor sees each frame on its own.
 
 ## One step
 
-Everything runs serially, in one thread:
-
-1. **Admit** waiting requests FIFO while batch slots, the per-step token
-   budget (`--max-step-tokens`) and KV pages allow. A request reserves its
-   whole KV at admission, sized by a frame cap proportional to its input, so
-   nothing is preempted and a running request never waits for memory.
-2. **Talker**: one forward over a ragged batch (new prompts first, then each
-   running row's last frame summed over its 16 codebook embeddings), paged KV
-   through FlashInfer's batch prefill kernel, then codebook 0 drawn on the GPU
-   (repetition penalty, special-token suppression, top-k, temperature).
-3. **Code predictor**: fifteen passes filling codebooks 1-15 for every row.
-   Its KV holds at most 16 tokens, so it gets one page per batch slot,
-   rewritten every step. Codes stay on the device until the frame is complete:
-   a step synchronizes with the host once.
-4. **Codec**: every frame the step produced is decoded in one batched call,
-   one frame per request. The decoder streams: each request holds a slot of
-   decoder state (each causal conv's last input rows, each overlapping
-   transposed conv's last GEMM row, each attention layer's K/V for the last
-   72 frames), so a frame costs the same at any point of an utterance and
-   nothing is recomputed.
-5. **Emit**: requests with a chunk due (first after `--first-chunk-frames`,
-   then every `--chunk-frames`, the rest at the end) send their decoded
-   samples as s16le. Chunk sizes only decide when audio leaves.
-
-Overlapping the codec with the next talker step is the obvious next change;
-it lands only with an `omni-bench` A/B.
+The engine thread runs steps back to back: admit waiting requests FIFO while
+batch slots, the per-step prompt budget (`--max-step-tokens`) and KV allow;
+`prefill` + `first` for the admitted ones; `decode` for the rest; then send
+whichever requests have a chunk due (first after `--first-chunk-frames`, then
+every `--chunk-frames`, the rest at the end). Chunk sizes only decide when
+audio leaves: every call already returns its frames decoded.
 
 ## Kernels
 
-`omni-cuda/csrc` holds the talker's three files: `attention.cu` (FlashInfer
-paged prefill for the talker and predictor), `transformer.cu` (RMSNorm via
-FlashInfer, fused q/k norm + RoPE + KV write, SiLU-gate, embedding
-gather-sum, bias + activation) and `sampling.cu` (the whole draw in one kernel
-per row). GEMMs are cuBLAS.
+`kernels/talker.cu` is the talker's and predictor's: paged attention (one
+block per row and KV head, online softmax over 32-key tiles; a ragged prefill
+row finds its sequence's pages through `kv_indptr`) and its dense twin for
+the predictor, per-head RMSNorm + RoPE + K/V write, fused residual RMSNorm (with
+a strided row selection, so the predictor's first pass keeps only its second
+row), SiLU-gate, embedding gathers, and the sampler. The sampler keeps the
+Hugging Face processor order in one block per row: repetition penalty and
+control-token suppression on the raw logits, temperature, top-k keeping ties
+(a radix select over the float bits), softmax, and a draw against the
+request's own uniform in vocabulary order; a `force` input (−1 = draw) takes a
+given code instead, which is how the golden test runs the serving path.
 
-`omni-qwen3-tts/kernels/codec.cu` is the codec's: RVQ lookup, RMSNorm, RoPE
-into the K/V ring, ring attention, SnakeBeta, causal im2col over a
-history ring, overlap-add carrying the previous chunk's row, depthwise conv +
-LayerNorm, the output conv, and the elementwise epilogues. `build.rs` compiles
-it to a cubin; `codec.rs` pins its sha256 in the manifest, one `decode`
-program over a `seqs` var whose calls are those kernels and kern's cuBLASLt
-GEMM. kern verifies the manifest, checks every launch's ABI against the
-cubin, allocates the workspaces at their bounds, hands out per-request state
-slots, and captures the program as a CUDA graph per batch bucket. Weight
-layout transforms (fused QKV, conv taps, folded scales) happen once at load,
-on the host, for both halves.
+`kernels/codec.cu` is the codec's: RVQ lookup, RMSNorm, RoPE into the K/V
+ring, ring attention, SnakeBeta, causal im2col over a history ring,
+overlap-add carrying the previous row, depthwise conv + LayerNorm, the output
+conv, and the elementwise epilogues.
 
-FlashInfer is a git submodule pinned at v0.7.0; `build.rs` initializes it (and
-only its CCCL) on first build. `OMNI_CUDA_ARCH` picks the target (default
-`103a`, GB300).
+GEMMs are kern's cuBLASLt built-in. `build.rs` compiles both files to cubins
+(`OMNI_CUDA_ARCH`, default `103a`, GB300); the manifest pins their sha256.
+kern verifies the manifest, checks every launch's ABI against its cubin,
+allocates buffers at their var bounds, hands out KV pages and state slots, and
+captures `first` and `decode` per bucket. Weight layout transforms (fused QKV
+and gate/up, conv taps, folded scales) happen once at load, on the host.
 
 ## Correctness
 
 `tools/qwen3_tts/golden.py` records the official implementation's run (qwen-tts
 at 022e286b, torch 2.11, bf16) and `crates/omni-qwen3-tts/tests/golden.rs`
-compares against it, teacher-forced with the recorded codes:
+compares against it through `prefill`, `first` and `decode`, the recorded
+codes forced in place of the draws, three streams at once (two in lockstep,
+one joining 7 steps late, so it is prefilled next to running rows):
 
 | | ours vs official |
 |---|---|
 | tokenizer ids | identical |
 | prompt embeddings | worst row cosine 0.99999 |
-| talker logits, 80 steps | worst cosine 0.99994, argmax agrees 98.8% |
-| code-predictor logits, 79 × 15 | worst cosine 0.9993, argmax agrees 94.5% |
+| talker logits, 80 steps | worst cosine 0.99990, argmax agrees 98.8% |
+| code-predictor logits, 79 × 15 | worst cosine 0.9997, argmax agrees 94.1% |
 | codec, streamed frame by frame | 36.6 dB SNR |
 | codec, a stream joining 7 frames late in the same batches | 36.6 dB SNR |
 
@@ -93,8 +111,24 @@ Japanese, including 8 concurrent requests in one batch.
 
 ## Performance
 
-[qwen3-tts-vs-vllm-omni.md](qwen3-tts-vs-vllm-omni.md) holds the numbers:
-the method, a script to reproduce them, and results under vLLM-Omni's own
-benchmark on one GB300. With the same chunk schedule, first audio arrives
-5-8x sooner than with vLLM-Omni, and from c=8 up the engine serves 1.3-1.6x the
-audio per second.
+[qwen3-tts-vs-vllm-omni.md](qwen3-tts-vs-vllm-omni.md) holds the method, a
+script to reproduce it, and results under vLLM-Omni's own benchmark on one
+GB300, measured before the talker moved onto kern. With the same chunk
+schedule, first audio arrived 5-8x sooner than with vLLM-Omni, and from c=8
+up the engine served 1.3-1.6x the audio per second.
+
+Moving the talker, predictor and sampler into the manifest (one graph launch
+per decode step instead of per-kernel launches for the talker and predictor),
+measured 2026-09-23 in one session on one GB300, server and client pinned to
+separate cores, against the previous commit, two runs each:
+
+| c | audio-s/s, vLLM-Omni's bench | audio-s/s, omni-bench | median RTF (omni-bench) |
+|---:|---:|---:|---:|
+| 1 | 12.6 → 15.8 (+25%) | 12.6 → 15.8 (+25%) | 0.079 → 0.063 |
+| 8 | 86.7 → 102.4 (+18%) | 85.3 → 103.2 (+21%) | 0.088 → 0.074 |
+| 64 | 350 → 465 (+33%) | 355 → 495 (+39%) | 0.156 → 0.116 |
+
+Median time to first audio is unchanged at c=8 (21 ms) and moves by a few ms
+either way at c=64 (vLLM-Omni's bench 44 → 48 ms, omni-bench 37 → 27 ms); a
+step that admits requests runs `prefill` + `first` and `decode` as two calls,
+each waited for.
