@@ -6,6 +6,16 @@ members = [
     "crates/omni-frontend",
     "crates/omni-server",
     "crates/omni-bench",
+    "crates/omni-cuda",
+    "crates/omni-qwen3-tts",
+]
+# A plain `cargo build` needs no CUDA toolkit; `--workspace` builds the GPU crates too.
+default-members = [
+    "crates/omni-engine",
+    "crates/omni-sim",
+    "crates/omni-frontend",
+    "crates/omni-server",
+    "crates/omni-bench",
 ]
 
 [workspace.package]
@@ -18,26 +28,34 @@ repository = "https://github.com/pegainfer-project/pega-omni"
 omni-engine = { path = "crates/omni-engine" }
 omni-sim = { path = "crates/omni-sim" }
 omni-frontend = { path = "crates/omni-frontend" }
+omni-cuda = { path = "crates/omni-cuda" }
+omni-qwen3-tts = { path = "crates/omni-qwen3-tts" }
 
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
+cc = "1"
 clap = { version = "4", features = ["derive"] }
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "cublas", "f16", "dynamic-loading", "cuda-13000"] }
 futures-util = "0.3"
+half = "2"
 hdrhistogram = "7"
 http-body-util = "0.1"
+memmap2 = "0.9"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 mimalloc = "0.1"
 pprof = { version = "0.15", features = ["flamegraph"] }
 proptest = "1"
-rand = "0.9"
-rand_distr = "0.5"
+rand = "0.10"
+rand_distr = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
+safetensors = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 tower = { version = "0.5", features = ["util"] }

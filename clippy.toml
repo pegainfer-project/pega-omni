@@ -2,3 +2,6 @@ disallowed-types = [
     { path = "std::collections::HashMap", reason = "iteration order is random per process; use BTreeMap" },
     { path = "std::collections::HashSet", reason = "iteration order is random per process; use BTreeSet" },
 ]
+# Kernel launches take shapes, pointers and a stream; bundling them into
+# structs per call would only move the argument list.
+too-many-arguments-threshold = 12
