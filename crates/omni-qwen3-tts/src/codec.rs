@@ -241,7 +241,7 @@ impl Gen {
         self.ops.insert(
             label.into(),
             json!({"params": params, "impl": {"launches": [
-                {"module": "codec", "entry": entry, "block": [block, 1, 1], "grid": grid}
+                {"module": "codec", "entry": entry, "block": [block, 1, 1], "grid": grid, "pdl": true}
             ]}}),
         );
         let args: Vec<Value> = args.into_iter().map(|(_, v)| v).collect();

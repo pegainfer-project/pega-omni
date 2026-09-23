@@ -98,6 +98,13 @@ __device__ __forceinline__ void bias_snake8(float* v, const bf16* bias, const fl
   for (int k = 0; k < 8; ++k) v[k] = snake(v[k] + b[k], av[k], ib[k]);
 }
 
+// Every kernel here is launched with programmatic dependent launch: it waits
+// for its predecessor to complete before touching anything, then lets its
+// successor launch, which waits in turn.
+__device__ __forceinline__ void pdl() {
+  asm volatile("griddepcontrol.wait;\n\tgriddepcontrol.launch_dependents;" ::: "memory");
+}
+
 __device__ __forceinline__ bf16* slot(void* state, const int32_t* lines, int s, int64_t stride) {
   return reinterpret_cast<bf16*>(static_cast<char*>(state) + (int64_t)lines[s] * stride);
 }
@@ -105,6 +112,7 @@ __device__ __forceinline__ bf16* slot(void* state, const int32_t* lines, int s, 
 // Row r: [codebook 0 | Σ codebooks 1..15], each `half` wide; `books` is
 // [16 * rows_per_book, half]. Eight channels per thread, blockDim.x = half / 8.
 extern "C" __global__ void codec_rvq(const int32_t* codes, const bf16* books, bf16* out, int half, int rows_per_book) {
+  pdl();
   const int r = blockIdx.x, c = threadIdx.x * 8;
   const int32_t* code = codes + r * 16;
   copy8(out + (int64_t)r * 2 * half + c, books + (int64_t)code[0] * half + c);
@@ -121,6 +129,7 @@ extern "C" __global__ void codec_rvq(const int32_t* codes, const bf16* books, bf
 
 // x = gelu(x + bias) in place, eight channels per thread (`total` counts the groups).
 extern "C" __global__ void codec_bias_gelu(bf16* x, const bf16* bias, int cols, int total) {
+  pdl();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   float v[8], b[8];
@@ -137,6 +146,7 @@ extern "C" __global__ void codec_bias_gelu(bf16* x, const bf16* bias, int cols, 
 // out = snake(x + bias), eight channels per thread.
 extern "C" __global__ void codec_bias_snake(const bf16* x, const bf16* bias, const float* a, const float* inv_b,
                                             bf16* out, int cols, int total) {
+  pdl();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   float v[8];
@@ -147,6 +157,7 @@ extern "C" __global__ void codec_bias_snake(const bf16* x, const bf16* bias, con
 
 // SiLU(gate) * up over fused [gate | up] rows, eight channels per thread.
 extern "C" __global__ void codec_silu_mul(const bf16* gate_up, bf16* out, int inter, int total) {
+  pdl();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int64_t n = i / (inter / 8), c = i % (inter / 8) * 8;
@@ -198,11 +209,13 @@ __device__ __forceinline__ void add_rms_norm(const bf16* add, int64_t add_step, 
 }
 
 extern "C" __global__ void codec_add_rms_norm(bf16* x, bf16* res, const bf16* w, int dim, float eps, int rows) {
+  pdl();
   add_rms_norm(x, dim, res, w, x, dim, eps, rows);
 }
 
 extern "C" __global__ void codec_bias_rms_norm(bf16* res, const bf16* bias, const bf16* w, bf16* out, int dim, float eps,
                                                int rows) {
+  pdl();
   add_rms_norm(bias, 0, res, w, out, dim, eps, rows);
 }
 
@@ -224,6 +237,7 @@ __device__ __forceinline__ float warp_max(float v) {
 extern "C" __global__ void __launch_bounds__(128)
     codec_attention(const bf16* qkv, const int32_t* pos, const int32_t* lines, void* kv, bf16* out, int64_t stride,
                     int heads, float theta) {
+  pdl();
   __shared__ float sq[kHead];
   __shared__ float ss[kWindow + 8];
   __shared__ float sacc[4][kHead];
@@ -354,12 +368,14 @@ __device__ __forceinline__ void im2col(const bf16* x, const bf16* bias, const fl
 extern "C" __global__ void codec_im2col(const bf16* x, const bf16* bias, void* state, const int32_t* pos,
                                         const int32_t* lines, bf16* col, int T, int C, int K, int d, int64_t stride,
                                         int total) {
+  pdl();
   im2col<false>(x, bias, nullptr, nullptr, state, pos, lines, col, T, C, K, d, stride, total);
 }
 
 extern "C" __global__ void codec_im2col_snake(const bf16* x, const bf16* bias, const float* a, const float* inv_b,
                                               void* state, const int32_t* pos, const int32_t* lines, bf16* col, int T,
                                               int C, int K, int d, int64_t stride, int total) {
+  pdl();
   im2col<true>(x, bias, a, inv_b, state, pos, lines, col, T, C, K, d, stride, total);
 }
 
@@ -370,6 +386,7 @@ extern "C" __global__ void codec_im2col_snake(const bf16* x, const bf16* bias, c
 // Eight channels per thread.
 extern "C" __global__ void codec_col2im(const bf16* z, const bf16* bias, void* state, const int32_t* lines, bf16* out,
                                         int L, int r, int C, int64_t stride, int total) {
+  pdl();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int C8 = C / 8;
@@ -404,6 +421,7 @@ extern "C" __global__ void codec_dwconv_ln(const bf16* z, const bf16* zb, const 
                                            const bf16* ln_w, const bf16* ln_b, void* state, const int32_t* pos,
                                            const int32_t* lines, bf16* xin, bf16* out, int T, int r, int C, int K,
                                            int64_t stride, float eps) {
+  pdl();
   const int64_t g = blockIdx.x;
   const int s = g / T, t = g % T, c = threadIdx.x * 8, H = K - 1;
   const int p = pos[s];
@@ -465,6 +483,7 @@ extern "C" __global__ void __launch_bounds__(kOutTile)
     codec_conv_out(const bf16* x, const bf16* bias, const float* a, const float* inv_b, const bf16* w, const bf16* wb,
                    void* state, const int32_t* pos, const int32_t* lines, bf16* out, int T, int C, int K,
                    int64_t stride) {
+  pdl();
   // Rows C / 2 + 1 words apart, an odd count: a warp reading consecutive rows hits distinct banks.
   __shared__ __nv_bfloat162 sx[(kOutTile + kOutK) * (kOutC / 2 + 1)];
   __shared__ float sw[kOutK * kOutC];
