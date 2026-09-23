@@ -1,0 +1,29 @@
+[package]
+name = "omni-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pega-omni"
+path = "src/main.rs"
+
+[features]
+# pprof's sampler (SIGPROF, no perf_event access needed) behind `--cpu-profile`.
+cpu-profile = ["dep:pprof"]
+
+[dependencies]
+omni-engine.workspace = true
+omni-frontend.workspace = true
+omni-sim.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+metrics-exporter-prometheus.workspace = true
+pprof = { workspace = true, optional = true }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/omni-engine",
+    "crates/omni-sim",
+    "crates/omni-frontend",
+    "crates/omni-server",
+    "crates/omni-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/pegainfer-project/pega-omni"
+
+[workspace.dependencies]
+omni-engine = { path = "crates/omni-engine" }
+omni-sim = { path = "crates/omni-sim" }
+omni-frontend = { path = "crates/omni-frontend" }
+
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+hdrhistogram = "7"
+http-body-util = "0.1"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+mimalloc = "0.1"
+pprof = { version = "0.15", features = ["flamegraph"] }
+proptest = "1"
+rand = "0.9"
+rand_distr = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.clippy]
+disallowed_types = "deny"
+dbg_macro = "deny"
+todo = "deny"
+type_complexity = "allow"
+
+[profile.release]
+debug = "line-tables-only"

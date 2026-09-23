@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="pega-omni">
+  <rect width="512" height="512" rx="96" fill="#141b2b"/>
+  <g fill="none" stroke="#ffffff" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+    <!-- wing: feathers that are also a waveform -->
+    <path d="M96 150 L250 214"/>
+    <path d="M84 196 L246 236"/>
+    <path d="M92 244 L240 256"/>
+    <path d="M112 292 L236 276"/>
+    <path d="M140 336 L238 296"/>
+    <!-- pegasus body, head and forelegs, after the pegainfer mark -->
+    <path d="M250 214 L300 190 L322 168 L352 160 L346 146 L366 150 L384 170 L404 204 L398 214 L380 208 L364 196 L346 206 L332 232 L348 262 L380 262 L372 318 L352 334 L360 310 L348 290 L316 300 L238 330 L186 380"/>
+    <path d="M318 180 L336 222 L322 250 L300 262"/>
+  </g>
+  <!-- sound bars under the wing -->
+  <g fill="#7aa2ff">
+    <rect x="96" y="392" width="16" height="40" rx="8"/>
+    <rect x="128" y="376" width="16" height="72" rx="8"/>
+    <rect x="160" y="400" width="16" height="24" rx="8"/>
+    <rect x="192" y="368" width="16" height="88" rx="8"/>
+    <rect x="224" y="388" width="16" height="48" rx="8"/>
+    <rect x="256" y="404" width="16" height="16" rx="8"/>
+  </g>
+</svg>

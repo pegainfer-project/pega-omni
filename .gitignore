@@ -1,0 +1,5 @@
+target/
+/results/
+*.svg.tmp
+__pycache__/
+/.venv

@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dco:
+    if: github.event_name == 'pull_request'
+    name: DCO sign-off
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check commit sign-offs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          unsigned=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/commits?per_page=100" \
+            --jq '.[] | select(.commit.message | test("(?m)^Signed-off-by: .+ <.+@.+>") | not) | .sha[0:10]')
+          if [ -n "$unsigned" ]; then
+            echo "::error::commits without Signed-off-by: $unsigned (fix: git rebase --signoff origin/main)"
+            exit 1
+          fi
+
+  rust:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --all-features --locked
+
+  e2e:
+    name: OpenAI SDK and load smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - run: cargo build --release --locked
+      - name: Start the simulated engine
+        run: |
+          target/release/pega-omni sim --listen 127.0.0.1:8000 > server.log 2>&1 &
+          for _ in $(seq 50); do curl -sf localhost:8000/health && exit 0; sleep 0.2; done
+          cat server.log; exit 1
+      - name: Official openai SDK conforms
+        run: uv run --with openai tools/openai_sdk_check.py --base-url http://127.0.0.1:8000/v1
+      - name: Load smoke, raw audio
+        run: target/release/omni-bench --num-requests 20000 --max-concurrency 256 --extra '{"frames":13}' --warmup 256
+      - name: Load smoke, SSE wav
+        run: target/release/omni-bench --num-requests 5000 --max-concurrency 256 --response-format wav --stream-format sse --extra '{"frames":13}'
