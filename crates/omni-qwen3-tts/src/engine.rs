@@ -79,11 +79,6 @@ pub fn frame_cap(input_chars: usize, model_max: usize) -> usize {
     (50 + 6 * input_chars).min(model_max)
 }
 
-/// Talker KV tokens that fit in `gib`.
-pub fn kv_tokens(gib: f64, bytes_per_token: usize) -> usize {
-    (gib * (1u64 << 30) as f64) as usize / bytes_per_token
-}
-
 /// The front end's view: CustomVoice speakers, languages, and a sampling seed.
 pub fn info(model: &Model, name: &str, max_input_chars: usize) -> EngineInfo {
     let t = &model.config.model.talker_config;
@@ -124,15 +119,14 @@ impl Job {
         Draw { uniforms: std::array::from_fn(|_| self.rng.random::<f32>()), force: None }
     }
 
-    /// Takes row `i` of a call's output.
-    fn take(&mut self, out: &Out, i: usize, end: i32, spf: usize) {
-        if out.codes[i][0] == end {
+    /// Takes a frame: the end, or its audio.
+    fn take(&mut self, end: bool, wav: &[f32]) {
+        if end {
             self.ended = true;
             return;
         }
         self.frames += 1;
-        let pcm = out.wav[i * spf..(i + 1) * spf].iter().flat_map(|&x| ((x * 32767.0).round() as i16).to_le_bytes());
-        self.pcm.extend(pcm);
+        self.pcm.extend(wav.iter().flat_map(|&x| ((x * 32767.0).round() as i16).to_le_bytes()));
     }
 }
 
@@ -141,6 +135,12 @@ pub struct Engine {
     opts: Options,
     waiting: VecDeque<Job>,
     running: Vec<Job>,
+}
+
+/// Hands each job its row of `out`.
+fn take(jobs: &mut [Job], out: &Out, model: &Model, spf: usize) {
+    let wav = out.wav.chunks(spf);
+    jobs.iter_mut().zip(&out.codes).zip(wav).for_each(|((j, codes), wav)| j.take(model.is_end(codes), wav));
 }
 
 fn abort(sink: &UnboundedSender<Event>) {
@@ -177,7 +177,7 @@ impl Engine {
         })
     }
 
-    fn take(&mut self, speech: Speech, sink: UnboundedSender<Event>) {
+    fn enqueue(&mut self, speech: Speech, sink: UnboundedSender<Event>) {
         match self.job(&speech, sink.clone()) {
             Ok(job) => self.waiting.push_back(job),
             Err(e) => {
@@ -222,8 +222,7 @@ impl Engine {
     /// One step: admit and start, one frame for every other running request, due chunks out.
     pub fn step(&mut self) -> Result<()> {
         let fresh = self.admit()?;
-        let (end, spf) =
-            (self.model.config.model.talker_config.codec_eos_token_id, self.model.config.samples_per_frame);
+        let spf = self.model.config.samples_per_frame;
         let split = self.running.len() - fresh;
         let (old, new) = self.running.split_at_mut(split);
         if !new.is_empty() {
@@ -231,14 +230,14 @@ impl Engine {
             let mut rows: Vec<_> =
                 new.iter_mut().zip(draws).map(|(j, d)| (j.seq.as_mut().expect("admitted"), &j.prompt, d)).collect();
             let out = self.model.start(&mut rows)?;
-            new.iter_mut().enumerate().for_each(|(i, j)| j.take(&out, i, end, spf));
+            take(new, &out, &self.model, spf);
         }
         if !old.is_empty() {
             let draws: Vec<Draw> = old.iter_mut().map(Job::draw).collect();
             let mut rows: Vec<_> =
                 old.iter_mut().zip(draws).map(|(j, d)| (j.seq.as_mut().expect("admitted"), d)).collect();
             let out = self.model.step(&mut rows)?;
-            old.iter_mut().enumerate().for_each(|(i, j)| j.take(&out, i, end, spf));
+            take(old, &out, &self.model, spf);
         }
         self.emit();
         Ok(())
@@ -287,12 +286,7 @@ pub fn start(
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let thread = std::thread::Builder::new().name("omni-qwen3-tts".into()).spawn(move || {
         let loaded = (|| {
-            let config = crate::config::Config::load(&dir)?;
-            let limits = Limits {
-                max_batch: opts.max_batch,
-                max_tokens: opts.max_step_tokens,
-                kv_tokens: kv_tokens(opts.kv_gib, Model::kv_bytes_per_token(&config)),
-            };
+            let limits = Limits { max_batch: opts.max_batch, max_tokens: opts.max_step_tokens, kv_gib: opts.kv_gib };
             let model = Model::load(device, &dir, limits).with_context(|| format!("load {}", dir.display()))?;
             let (handle, inbox) = omni_engine::channel(info(&model, &name, max_input_chars), queue);
             anyhow::Ok((handle, inbox, Engine::new(model, opts)))
@@ -321,13 +315,13 @@ fn run(inbox: Inbox, mut engine: Engine) -> Result<()> {
                 return Ok(());
             }
             match inbox.rx.recv() {
-                Ok(s) => engine.take(s.speech, s.sink),
+                Ok(s) => engine.enqueue(s.speech, s.sink),
                 Err(_) => return Ok(()),
             }
         }
         loop {
             match inbox.rx.try_recv() {
-                Ok(s) => engine.take(s.speech, s.sink),
+                Ok(s) => engine.enqueue(s.speech, s.sink),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     open = false;

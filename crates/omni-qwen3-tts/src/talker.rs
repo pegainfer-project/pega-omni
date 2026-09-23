@@ -12,10 +12,10 @@
 //!   The predictor sees each frame on its own, so its KV is a workspace of
 //!   [`SPAN`] slots per sequence, rewritten every call.
 //!
-//! A sequence's slot of the `seq` state starts with its last frame (sixteen
-//! i32) and the bitmap of codebook-0 codes under the repetition penalty
-//! ([`Talker::state_bytes`]); the draws write both, so nothing but the frame
-//! itself goes back to the host.
+//! The talker's region of a sequence's slot of the `seq` state holds its last
+//! frame (sixteen i32) and the bitmap of codebook-0 codes under the repetition
+//! penalty; the draws write both, so nothing but the frame itself goes back to
+//! the host.
 
 use anyhow::Result;
 use anyhow::ensure;
@@ -38,8 +38,8 @@ use crate::manifest::state_in;
 use crate::manifest::state_io;
 use crate::manifest::stride;
 use crate::stack::HEAD_DIM;
+use crate::stack::Keep;
 use crate::stack::Kv;
-use crate::stack::Out;
 use crate::stack::Pass;
 use crate::stack::Scratch;
 use crate::stack::Stack;
@@ -59,6 +59,8 @@ const P: Scratch = Scratch { x: "p.x", res: "p.res", qkv: "p.qkv", attn: "p.attn
 
 pub struct Talker {
     cfg: config::Model,
+    /// Offset of the talker's region of a sequence's slot.
+    state: u64,
     sampling: config::Generation,
     talker: Stack,
     predictor: Stack,
@@ -72,10 +74,6 @@ pub struct Talker {
     lm_heads: String,
 }
 
-fn int(v: i32) -> (&'static str, Value) {
-    ("i32", json!({"i32": v}))
-}
-
 impl Talker {
     pub fn load(g: &mut Gen, file: &File, cfg: &config::Model, sampling: &config::Generation) -> Result<Self> {
         let t = &cfg.talker_config;
@@ -83,7 +81,6 @@ impl Talker {
         let (vocab, p_vocab) = (t.stack.vocab_size, t.code_predictor_config.vocab_size);
         ensure!(t.num_code_groups == GROUPS, "{} code groups, the engine is built for {GROUPS}", t.num_code_groups);
         ensure!(vocab <= 4096 && p_vocab <= 4096, "the sampler is built for vocabularies up to 4096");
-        g.module = "talker";
         let w = |n: &str, shape: &[usize]| file.expect(n, shape);
         let text_vocab = file.shape("talker.model.text_embedding.weight")?[0];
         let stacked = |n: &str, rows: usize, cols: usize| -> Result<Vec<f32>> {
@@ -104,6 +101,7 @@ impl Talker {
         let fc2 = pair("talker.fc2", "talker.text_projection.linear_fc2", h, h)?;
         let mtp = pair("talker.mtp", "talker.code_predictor.small_to_mtp_projection", p, h)?;
         Ok(Self {
+            state: g.region(4 * (GROUPS + vocab.div_ceil(32))),
             text_emb: g.weight(
                 "talker.text_emb",
                 &[text_vocab, h],
@@ -139,11 +137,6 @@ impl Talker {
         &self.text_emb
     }
 
-    /// Bytes of a sequence's slot the talker owns, at its start.
-    pub fn state_bytes(&self) -> usize {
-        4 * (GROUPS + self.vocab().div_ceil(32))
-    }
-
     fn vocab(&self) -> usize {
         self.cfg.talker_config.stack.vocab_size
     }
@@ -175,38 +168,24 @@ impl Talker {
     /// Writes `pad_embed`.
     pub fn init(&self, g: &mut Gen) {
         let h = self.hidden();
-        let one = json!({"i32": 1});
-        let total = i32a(h / 8);
+        let one = json!(1);
         g.launch(
             "init.embed",
             "talker_embed_id",
             [json!(1), json!(1), json!(1)],
             (h / 8) as u32,
-            vec![inb(&self.text_emb), int(self.cfg.tts_pad_token_id), outb("t.e"), i32a(h)],
+            vec![inb(&self.text_emb), i32a(self.cfg.tts_pad_token_id), outb("t.e"), i32a(h)],
         );
-        g.gemm_rows("init.fc1", (buf("t.p"), buf("t.e"), buf(&self.fc1.0)), one.clone(), (h, h));
-        g.launch(
-            "init.fc1.bias",
-            "talker_bias_silu",
-            [json!((h / 8).div_ceil(256)), json!(1), json!(1)],
-            256,
-            vec![io("t.p"), inb(&self.fc1.1), i32a(h), total.clone()],
-        );
-        g.gemm_rows("init.fc2", (buf("pad_embed"), buf("t.p"), buf(&self.fc2.0)), one, (h, h));
-        g.launch(
-            "init.fc2.bias",
-            "talker_bias",
-            [json!((h / 8).div_ceil(256)), json!(1), json!(1)],
-            256,
-            vec![io("pad_embed"), inb(&self.fc2.1), i32a(h), total],
-        );
+        g.gemm_rows("init.fc1", (buf("t.p"), buf("t.e"), buf(&self.fc1.0)), json!({"i32": 1}), (h, h));
+        g.each8("init.fc1.bias", "talker_bias_silu", &one, h, vec![io("t.p"), inb(&self.fc1.1), i32a(h)]);
+        g.gemm_rows("init.fc2", (buf("pad_embed"), buf("t.p"), buf(&self.fc2.0)), json!({"i32": 1}), (h, h));
+        g.each8("init.fc2.bias", "talker_bias", &one, h, vec![io("pad_embed"), inb(&self.fc2.1), i32a(h)]);
     }
 
     /// Prompts in, `embeds` and each sequence's last hidden state out.
     pub fn prefill(&self, g: &mut Gen) {
         let h = self.hidden();
         let rows = json!("tokens");
-        let groups = json!({"mul": ["tokens", h / 8]});
         g.launch(
             "prefill.embed",
             "talker_gather",
@@ -215,13 +194,7 @@ impl Talker {
             vec![ini("t_ids"), i32a(1), inb(&self.text_emb), outb("t.e"), i32a(h)],
         );
         g.gemm_rows("prefill.fc1", (buf("t.p"), buf("t.e"), buf(&self.fc1.0)), count(&rows), (h, h));
-        g.launch(
-            "prefill.fc1.bias",
-            "talker_bias_silu",
-            [json!({"ceil_div": [groups.clone(), 256]}), json!(1), json!(1)],
-            256,
-            vec![io("t.p"), inb(&self.fc1.1), i32a(h), ("i32", json!({"expr": groups}))],
-        );
+        g.each8("prefill.fc1.bias", "talker_bias_silu", &rows, h, vec![io("t.p"), inb(&self.fc1.1), i32a(h)]);
         g.gemm_rows("prefill.fc2", (buf("embeds"), buf("t.p"), buf(&self.fc2.0)), count(&rows), (h, h));
         g.launch(
             "prefill.codec",
@@ -235,7 +208,7 @@ impl Talker {
             rows,
             input: "embeds",
             kv: Kv::Paged { prefix: "kv", ragged: true },
-            out: Out { out: T.x, every: 1, which: 0 },
+            keep: Keep { out: T.x, every: 1, which: 0 },
         };
         self.talker.forward(g, pass, &T);
         g.launch(
@@ -256,7 +229,7 @@ impl Talker {
             [json!("seqs"), json!(1), json!(1)],
             (h / 8) as u32,
             vec![
-                state_in(0),
+                state_in(self.state),
                 ini("lines"),
                 stride(),
                 inb("pad_embed"),
@@ -272,7 +245,7 @@ impl Talker {
             rows: json!("seqs"),
             input: "t.e",
             kv: Kv::Paged { prefix: "kv", ragged: false },
-            out: Out { out: "hidden", every: 1, which: 0 },
+            keep: Keep { out: "hidden", every: 1, which: 0 },
         };
         self.talker.forward(g, pass, &T);
     }
@@ -297,16 +270,16 @@ impl Talker {
                 ("in buffer<bf16>", logits),
                 i32a(vocab),
                 f32a(temperature),
-                int(top_k),
+                i32a(top_k),
                 f32a(penalty),
                 i32a(suppress.0),
                 i32a(suppress.1),
-                int(exempt),
+                i32a(exempt),
                 i32a(min_frames),
                 ini("pos"),
                 inf("uniforms"),
                 ini("force"),
-                state_io(0),
+                state_io(self.state),
                 ini("lines"),
                 stride(),
                 i32a((group == 0) as usize),
@@ -348,9 +321,9 @@ impl Talker {
         }
         for group in 1..GROUPS {
             let label = format!("p{group}");
-            let (rows, per, base, out) = match group {
-                1 => (json!({"mul": ["seqs", 2]}), 2, 0, Out { out: "p.last", every: 2, which: 1 }),
-                _ => (seqs.clone(), 1, group, Out { out: "p.last", every: 1, which: 0 }),
+            let (rows, per, base, keep) = match group {
+                1 => (json!({"mul": ["seqs", 2]}), 2, 0, Keep { out: "p.last", every: 2, which: 1 }),
+                _ => (seqs.clone(), 1, group, Keep { out: "p.last", every: 1, which: 0 }),
             };
             if group > 1 {
                 g.launch(
@@ -367,17 +340,10 @@ impl Talker {
                     ],
                 );
             }
-            let groups = json!({"mul": [rows.clone(), p / 8]});
             g.gemm_rows(&format!("{label}.mtp"), (buf("p.h"), buf("p.in"), buf(&self.mtp.0)), count(&rows), (p, h));
-            g.launch(
-                &format!("{label}.mtp.bias"),
-                "talker_bias",
-                [json!({"ceil_div": [groups.clone(), 256]}), json!(1), json!(1)],
-                256,
-                vec![io("p.h"), inb(&self.mtp.1), i32a(p), ("i32", json!({"expr": groups}))],
-            );
+            g.each8(&format!("{label}.mtp.bias"), "talker_bias", &rows, p, vec![io("p.h"), inb(&self.mtp.1), i32a(p)]);
             let kv = Kv::Dense { prefix: "pkv", per, base, span: SPAN };
-            self.predictor.forward(g, Pass { label: &label, rows: rows.clone(), input: "p.h", kv, out }, &P);
+            self.predictor.forward(g, Pass { label: &label, rows: rows.clone(), input: "p.h", kv, keep }, &P);
             let logits = buf_at("p_logits", (group - 1) * max_seqs * p_vocab * 2);
             g.gemm_rows(
                 &format!("{label}.head"),

@@ -5,12 +5,12 @@
 //! [`codec`] turns frames into PCM in the same call. [`engine`] runs a batch
 //! of requests through it behind an [`omni_engine::Inbox`].
 
-pub mod codec;
+mod codec;
 pub mod config;
 pub mod engine;
-pub mod manifest;
+mod manifest;
 pub mod model;
 pub mod prompt;
-pub mod stack;
-pub mod talker;
+mod stack;
+mod talker;
 pub mod weights;

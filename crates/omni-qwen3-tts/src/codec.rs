@@ -36,14 +36,13 @@ use crate::manifest::outb;
 use crate::manifest::per_seq;
 use crate::manifest::state_io;
 use crate::manifest::stride;
+use crate::talker::GROUPS;
 use crate::weights::File;
-use crate::weights::Host;
 use crate::weights::concat_rows;
 use crate::weights::conv_taps;
 use crate::weights::scale_rows;
 use crate::weights::transposed_taps;
 
-const GROUPS: usize = 16;
 const KERNEL: usize = 7;
 
 impl Gen {
@@ -59,7 +58,6 @@ impl Gen {
     /// `out = conv(act(x + bias))` for a causal conv of `k` taps dilated by
     /// `d`, `act` SnakeBeta when given; the conv's own bias is left to its
     /// consumer. `act(x + bias)` of the last `(k - 1)·d` rows is its history.
-    #[allow(clippy::too_many_arguments)]
     fn conv(
         &mut self,
         label: &str,
@@ -91,7 +89,7 @@ impl Gen {
             i32a(d),
             stride(),
         ]);
-        self.each8(&format!("{label}.im2col"), entry, (h + t) * cin, args);
+        self.each8(&format!("{label}.im2col"), entry, &json!("seqs"), (h + t) * cin, args);
         self.gemm(&format!("{label}.gemm"), out, "col", w, t, (cout, k * cin));
     }
 }
@@ -133,7 +131,6 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
         out_dim.is_multiple_of(32) && out_dim <= 128,
         "codec output conv width {out_dim} unsupported (32 | c ≤ 128)"
     );
-    g.module = "codec";
 
     // RVQ: [first | Σ rest] → one projection.
     let codebook = |p: &str| -> Result<Vec<f32>> {
@@ -173,14 +170,14 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
         let b = file.expect(&format!("{prefix}.bias"), &shape[..1])?;
         Ok((g.weight(&format!("{name}.w"), &[shape[0], shape[2] * shape[1]], &conv_taps(&w)), b.data))
     };
-    let zeros = g.weight("zeros", &[dim.max(latent)], &vec![0.0; dim.max(latent)]);
+    let zeros = g.weight("zeros", &[dim], &vec![0.0; dim]);
     let (pre, pre_b) = conv_w(g, "decoder.pre_conv.conv", "pre_conv", [latent, dim, 3])?;
     g.conv("pre_conv", ("a", &zeros, None), (&pre, "b"), 1, (dim, latent), (3, 1));
 
     // Transformer over the frames, residual stream in `res`; pre_conv's bias
     // goes through input_proj.
     let pt = "decoder.pre_transformer";
-    let linear = |p: &str, shape: [usize; 2]| -> Result<(Host, Host)> {
+    let linear = |p: &str, shape: [usize; 2]| -> Result<_> {
         Ok((file.expect(&format!("{p}.weight"), &shape)?, file.expect(&format!("{p}.bias"), &shape[..1])?))
     };
     let (in_w, in_b) = linear(&format!("{pt}.input_proj"), [hidden, latent])?;
@@ -243,7 +240,7 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
             );
         };
 
-        let kv = g.region(2 * 72 * qd * 2);
+        let kv = g.region(2 * cfg.sliding_window * qd * 2);
         g.gemm(&format!("l{i}.qkv"), "col", "x", &qkv, 1, (3 * qd, hidden));
         g.launch(
             &format!("l{i}.attn"),
@@ -264,7 +261,8 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
         g.gemm(&format!("l{i}.o"), "x", "a", &o, 1, (hidden, qd));
         add_norm(g, format!("l{i}.post_attn_norm"), &ln2);
         g.gemm(&format!("l{i}.gate_up"), "col", "x", &gate_up, 1, (2 * inter, hidden));
-        g.each8(&format!("l{i}.silu_mul"), "codec_silu_mul", inter, vec![inb("col"), outb("a"), i32a(inter)]);
+        let seqs = json!("seqs");
+        g.each8(&format!("l{i}.silu_mul"), "codec_silu_mul", &seqs, inter, vec![inb("col"), outb("a"), i32a(inter)]);
         g.gemm(&format!("l{i}.down"), "x", "a", &down, 1, (hidden, inter));
         add_norm(g, format!("l{i}.next_norm"), &next);
     }
@@ -301,7 +299,7 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
         let pw1_w = g.weight(&format!("up{i}.pw1.w"), &[4 * latent, latent], &pw1_w.data);
         let pw1_b = g.weight(&format!("up{i}.pw1.b"), &[4 * latent], &pw1_b.data);
         let gamma = file.expect(&format!("{p}.1.gamma"), &[latent])?;
-        let pw2: Host = file.expect(&format!("{p}.1.pwconv2.weight"), &[latent, 4 * latent])?;
+        let pw2 = file.expect(&format!("{p}.1.pwconv2.weight"), &[latent, 4 * latent])?;
         let pw2_b = file.expect(&format!("{p}.1.pwconv2.bias"), &[latent])?;
         let pw2_w = g.weight(&format!("up{i}.pw2.w"), &[latent, 4 * latent], &scale_rows(&pw2.data, &gamma.data));
 
@@ -336,7 +334,8 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
         g.each8(
             &format!("up{i}.pw1.bias"),
             "codec_bias_gelu",
-            t * 4 * latent,
+            &per_seq(t),
+            4 * latent,
             vec![io("col"), inb(&pw1_b), i32a(4 * latent)],
         );
         g.gemm_acc(&format!("up{i}.pw2"), tmp, "col", &pw2_w, t, (latent, 4 * latent));
@@ -366,7 +365,8 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
         g.each8(
             &format!("b{i}.snake"),
             "codec_bias_snake",
-            t * cin,
+            &per_seq(t),
+            cin,
             vec![inb(cur), inb(&in_b), inf(&snake.0), inf(&snake.1), outb(tmp), i32a(cin)],
         );
         g.gemm(&format!("b{i}.up"), "col", tmp, &up_w, t, (2 * rate * cout, cin));
@@ -374,7 +374,8 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
         g.each8(
             &format!("b{i}.col2im"),
             "codec_col2im",
-            t * rate * cout,
+            &per_seq(t),
+            rate * cout,
             vec![
                 inb("col"),
                 inb(&up_b),
@@ -406,7 +407,8 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
             g.each8(
                 &format!("{label}.snake2"),
                 "codec_bias_snake",
-                t * cout,
+                &per_seq(t),
+                cout,
                 vec![inb(tmp), inb(&c1_b), inf(&s2.0), inf(&s2.1), outb("x"), i32a(cout)],
             );
             g.gemm_acc(&format!("{label}.conv2"), cur, "x", &c2, t, (cout, cout));
@@ -443,7 +445,6 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
             stride(),
         ],
     );
-    debug_assert_eq!(t, spf);
     g.need("res", hidden);
     Ok(())
 }

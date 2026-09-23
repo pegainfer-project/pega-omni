@@ -91,7 +91,7 @@ struct Qwen3TtsArgs {
     device: usize,
     #[arg(long, default_value_t = 64)]
     max_batch: usize,
-    /// Talker tokens per step, prompts included.
+    /// Prompt tokens prefilled per step.
     #[arg(long, default_value_t = 8192)]
     max_step_tokens: usize,
     /// Talker KV cache size.

@@ -4,8 +4,9 @@
 //! [`Gen`] collects everything a generator emits. A launch's geometry lives in
 //! its op, and almost every call here has its own shape, so every kernel call
 //! is an op of its own, named by its label; every GEMM calls the one
-//! `extern:cublaslt_bf16_tn` op (`..._acc` when it accumulates). Calls accumulate until [`Gen::take`] cuts them
-//! into a segment; programs are concatenations of segments.
+//! `extern:cublaslt_bf16_tn` op (`..._acc` when it accumulates). Calls
+//! accumulate until [`Gen::take`] cuts them into a segment; programs are
+//! concatenations of segments.
 //!
 //! Per-sequence state is one `seq` state; generators carve it into regions
 //! ([`Gen::region`]) and pass [`stride`] wherever a kernel addresses a
@@ -36,17 +37,13 @@ pub const THREADS: u32 = 256;
 /// The manifest under construction.
 #[derive(Default)]
 pub struct Gen {
-    pub buffers: serde_json::Map<String, Value>,
-    pub ops: serde_json::Map<String, Value>,
-    pub calls: Vec<Value>,
-    pub tensors: BTreeMap<String, (DType, Vec<u64>, Vec<u8>)>,
-    pub state_bytes: u64,
+    buffers: serde_json::Map<String, Value>,
+    ops: serde_json::Map<String, Value>,
+    calls: Vec<Value>,
+    tensors: BTreeMap<String, (DType, Vec<u64>, Vec<u8>)>,
+    state_bytes: u64,
     /// Per-sequence width of each `seqs`-shaped workspace: the widest thing written into it.
-    pub widths: BTreeMap<String, usize>,
-    /// The module `launch` takes its kernels from. The codec's kernels are
-    /// written for programmatic dependent launch (each waits on the grid
-    /// before touching what an earlier launch produced); the talker's are not.
-    pub module: &'static str,
+    widths: BTreeMap<String, usize>,
 }
 
 impl Gen {
@@ -86,43 +83,48 @@ impl Gen {
         at
     }
 
-    /// One kernel launch of `self.module` as its own op, `args` typed by param.
+    /// One kernel launch as its own op, `args` typed by param. `entry` is
+    /// `<module>_<kernel>`. The codec's kernels are written for programmatic
+    /// dependent launch (each waits on the grid before touching what an
+    /// earlier launch produced); the talker's are not.
     pub fn launch(&mut self, label: &str, entry: &str, grid: [Value; 3], block: u32, args: Vec<(&str, Value)>) {
+        let module = entry.split('_').next().expect("an entry name");
         let params: Vec<&str> = args.iter().map(|(t, _)| *t).collect();
         self.ops.insert(
             label.into(),
             json!({"params": params, "impl": {"launches": [
-                {"module": self.module, "entry": entry, "block": [block, 1, 1], "grid": grid,
-                 "pdl": self.module == "codec"}
+                {"module": module, "entry": entry, "block": [block, 1, 1], "grid": grid, "pdl": module == "codec"}
             ]}}),
         );
         let args: Vec<Value> = args.into_iter().map(|(_, v)| v).collect();
         self.calls.push(json!({"label": label, "op": label, "args": args}));
     }
 
-    /// Elementwise over `n` values per stream.
-    pub fn each(&mut self, label: &str, entry: &str, n: usize, mut args: Vec<(&str, Value)>) {
-        args.push(("i32", json!({"expr": per_seq(n)})));
-        self.launch(label, entry, [blocks(n), json!(1), json!(1)], THREADS, args);
-    }
-
-    /// Elementwise over `n` values per stream, eight (16 bytes) per thread.
-    pub fn each8(&mut self, label: &str, entry: &str, n: usize, args: Vec<(&str, Value)>) {
+    /// Elementwise over `n` values of each of `rows` rows (a var expression
+    /// or a number), eight (16 bytes) per thread; the kernel's last param is
+    /// the thread count.
+    pub fn each8(&mut self, label: &str, entry: &str, rows: &Value, n: usize, mut args: Vec<(&str, Value)>) {
         assert_eq!(n % 8, 0, "{label}: {n} values do not split into 16-byte groups");
-        self.each(label, entry, n / 8, args);
+        let groups = times(rows, n / 8);
+        let (grid, total) = match groups.as_u64() {
+            Some(g) => (json!(g.div_ceil(THREADS.into())), json!({"i32": g})),
+            None => (json!({"ceil_div": [groups, THREADS]}), count(&groups)),
+        };
+        args.push(("i32", total));
+        self.launch(label, entry, [grid, json!(1), json!(1)], THREADS, args);
     }
 
     /// `y[rows, n] = x[rows, k] · w[n, k]ᵀ` over `t` rows per stream.
     pub fn gemm(&mut self, label: &str, y: &'static str, x: &str, w: &str, t: usize, (n, k): (usize, usize)) {
         self.need(y, t * n);
-        self.gemm_rows(label, (buf(y), buf(x), buf(w)), rows_arg(t), (n, k));
+        self.gemm_rows(label, (buf(y), buf(x), buf(w)), count(&per_seq(t)), (n, k));
     }
 
     /// `y[rows, n] += x[rows, k] · w[n, k]ᵀ` over `t` rows per stream.
     pub fn gemm_acc(&mut self, label: &str, y: &'static str, x: &str, w: &str, t: usize, (n, k): (usize, usize)) {
         self.need(y, t * n);
         self.calls.push(json!({"label": label, "op": "gemm_acc", "args": [
-            buf(x), buf(w), buf(y), rows_arg(t), {"i32": n}, {"i32": k}
+            buf(x), buf(w), buf(y), count(&per_seq(t)), {"i32": n}, {"i32": k}
         ]}));
     }
 
@@ -163,11 +165,25 @@ impl Gen {
         self.ops.insert("gemm_acc".into(), gemm("extern:cublaslt_bf16_tn_acc", "inout buffer<bf16>"));
         s
     }
+
+    /// The buffers, ops and weights, once [`Gen::finish`] declared the workspaces.
+    pub fn into_parts(self) -> (serde_json::Map<String, Value>, serde_json::Map<String, Value>, HostTensors) {
+        (self.buffers, self.ops, HostTensors(self.tensors))
+    }
+}
+
+/// `rows · n`: a number when `rows` is one, else a var expression.
+fn times(rows: &Value, n: usize) -> Value {
+    match rows.as_u64() {
+        Some(r) => json!(r * n as u64),
+        None if n == 1 => rows.clone(),
+        None => json!({"mul": [rows, n]}),
+    }
 }
 
 /// `seqs · n`, as a var expression.
 pub fn per_seq(n: usize) -> Value {
-    if n == 1 { json!("seqs") } else { json!({"mul": ["seqs", n]}) }
+    times(&json!("seqs"), n)
 }
 
 /// A row count (a var expression) as a call argument.
@@ -178,14 +194,6 @@ pub fn count(rows: &Value) -> Value {
     }
 }
 
-pub fn rows_arg(n: usize) -> Value {
-    if n == 1 { json!({"var": "seqs"}) } else { json!({"expr": {"mul": ["seqs", n]}}) }
-}
-
-pub fn blocks(n: usize) -> Value {
-    json!({"ceil_div": [per_seq(n), THREADS]})
-}
-
 pub fn buf(name: &str) -> Value {
     json!({"buf": name})
 }
@@ -194,8 +202,8 @@ pub fn buf_at(name: &str, offset: usize) -> Value {
     json!({"buf": name, "offset": offset})
 }
 
-pub fn i32a(v: usize) -> (&'static str, Value) {
-    ("i32", json!({"i32": v as i32}))
+pub fn i32a(v: impl TryInto<i32, Error: std::fmt::Debug>) -> (&'static str, Value) {
+    ("i32", json!({"i32": v.try_into().expect("an i32 argument")}))
 }
 
 pub fn f32a(v: f32) -> (&'static str, Value) {
@@ -238,7 +246,7 @@ pub fn stride() -> (&'static str, Value) {
 }
 
 /// Weights after the load-time transforms, by buffer name.
-pub struct HostTensors(pub BTreeMap<String, (DType, Vec<u64>, Vec<u8>)>);
+pub struct HostTensors(BTreeMap<String, (DType, Vec<u64>, Vec<u8>)>);
 
 impl Tensors for HostTensors {
     fn find(&self, name: &str) -> kern_runtime::Result<Tensor<'_>> {
@@ -246,11 +254,6 @@ impl Tensors for HostTensors {
             self.0.get(name).ok_or_else(|| kern_runtime::Error::WeightArtifact(format!("no tensor `{name}`")))?;
         Ok(Tensor { dtype: *dtype, shape: shape.clone(), data: Blob::Host(data) })
     }
-}
-
-pub fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
-    // SAFETY: only ever called on i32 and f32 slices, which have no padding.
-    unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), std::mem::size_of_val(v)) }
 }
 
 pub fn hex(bytes: &[u8]) -> String {

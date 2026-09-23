@@ -36,7 +36,6 @@ use crate::config::Config;
 use crate::manifest::Gen;
 use crate::manifest::HostTensors;
 use crate::manifest::bucket;
-use crate::manifest::bytes_of;
 use crate::manifest::hex;
 use crate::manifest::kernels_dir;
 use crate::prompt::NO_CODEC;
@@ -44,9 +43,10 @@ use crate::prompt::Prompt;
 use crate::prompt::Tokenizer;
 use crate::stack::PAGE;
 use crate::stack::Stack;
-use crate::talker::GROUPS;
 use crate::talker::Talker;
 use crate::weights::File;
+
+pub use crate::talker::GROUPS;
 
 const CODEC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/codec.cubin"));
 const TALKER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/talker.cubin"));
@@ -57,8 +57,8 @@ pub struct Limits {
     pub max_batch: usize,
     /// Prompt tokens per `prefill` call.
     pub max_tokens: usize,
-    /// Talker KV, in tokens.
-    pub kv_tokens: usize,
+    /// Talker KV cache size.
+    pub kv_gib: f64,
 }
 
 /// One sequence's KV and state.
@@ -66,13 +66,6 @@ pub struct Seq {
     lease: Lease,
     prompt: usize,
     frames: usize,
-}
-
-impl Seq {
-    /// Frames drawn so far, the end token included.
-    pub fn frames(&self) -> usize {
-        self.frames
-    }
 }
 
 /// A sequence's draws for one frame: a uniform per codebook, or the frame to
@@ -83,8 +76,15 @@ pub struct Draw {
     pub force: Option<[i32; GROUPS]>,
 }
 
-/// A sequence's row of a graph call: its lease, talker position, frame index and draw.
-type Frame<'a> = (&'a Lease, usize, usize, Draw);
+/// A sequence's row of a graph call.
+struct Frame<'a> {
+    lease: &'a Lease,
+    /// The talker position its last frame goes in.
+    position: usize,
+    /// The index of the frame this call draws.
+    frame: usize,
+    draw: Draw,
+}
 
 /// A call's frames and their PCM, `samples_per_frame` per sequence, in order.
 #[derive(Debug)]
@@ -108,6 +108,10 @@ fn vars(tokens: usize, seqs: usize) -> BTreeMap<String, u64> {
     BTreeMap::from([("tokens".into(), tokens as u64), ("seqs".into(), seqs as u64)])
 }
 
+fn ints(v: &[i32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
 fn bf16s(bytes: &[u8]) -> Vec<f32> {
     bytes.as_chunks::<2>().0.iter().map(|&b| bf16::from_le_bytes(b).to_f32()).collect()
 }
@@ -118,7 +122,8 @@ impl Model {
         let config = Config::load(dir)?;
         let tokenizer = Tokenizer::load(dir)?;
         let max_seqs = bucket(limits.max_batch);
-        let pages_max = limits.kv_tokens.div_ceil(PAGE) + 1;
+        let kv_tokens = (limits.kv_gib * (1u64 << 30) as f64) as usize / kv_bytes_per_token(&config);
+        let pages_max = kv_tokens.div_ceil(PAGE) + 1;
         let cubins = [("codec", CODEC), ("talker", TALKER)].map(|(n, b)| (n, hex(&sha2::Sha256::digest(b)), b));
         // Each padding row of a graph call names the pad lease's page once more.
         let page_table = pages_max + max_seqs;
@@ -126,7 +131,7 @@ impl Model {
         let verified = kern_manifest::verify(kern_manifest::Manifest::from_json(&manifest.to_string())?)
             .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
         let dir = kernels_dir(&cubins.each_ref().map(|(n, sha, b)| (*n, sha.as_str(), *b)))?;
-        let capacity = Capacity { tokens: Some(limits.kv_tokens as u64), seqs: limits.max_batch as u64 + 1 };
+        let capacity = Capacity { tokens: Some(kv_tokens as u64), seqs: limits.max_batch as u64 + 1 };
         let mut rt = Runtime::load(&verified, Some(&dir), device, Some(capacity), None)?;
         rt.load_weights(&tensors)?;
         rt.issue("init", &BTreeMap::new())?;
@@ -134,18 +139,8 @@ impl Model {
         Ok(Self { config, tokenizer, rt, pad, limits, max_seqs, pages_max })
     }
 
-    /// Talker KV bytes per token: every layer's K and V.
-    pub fn kv_bytes_per_token(config: &Config) -> usize {
-        let t = &config.model.talker_config.stack;
-        t.num_hidden_layers * Stack::kv_bytes(t)
-    }
-
-    pub fn limits(&self) -> Limits {
-        self.limits
-    }
-
-    /// A sequence of up to `tokens` positions, or why not: `Busy` and
-    /// `Remapping` pass, the rest never will.
+    /// A sequence of a `prompt`-token prompt and up to `frames` frames, or
+    /// why not: `Busy` and `Remapping` pass, the rest never will.
     pub fn open(&mut self, prompt: usize, frames: usize) -> Result<Result<Seq, Denied>> {
         let lease = match self.rt.lease(prompt + frames) {
             Ok(l) => l,
@@ -159,12 +154,8 @@ impl Model {
         Ok(Ok(Seq { lease, prompt, frames: 0 }))
     }
 
-    fn eos(&self) -> i32 {
-        self.config.model.talker_config.codec_eos_token_id
-    }
-
     pub fn is_end(&self, frame: &[i32; GROUPS]) -> bool {
-        frame[0] == self.eos()
+        frame[0] == self.config.model.talker_config.codec_eos_token_id
     }
 
     /// Prefills each sequence's prompt, then draws and decodes its first frame.
@@ -184,9 +175,10 @@ impl Model {
         }
         let v = vars(tokens, n);
         t.write(&mut self.rt, &v, true)?;
-        self.rt.write_input_at("last_row", bytes_of(&last_row), &v)?;
+        self.rt.write_input_at("last_row", &ints(&last_row), &v)?;
         self.rt.issue("prefill", &v)?;
-        let steps: Vec<Frame> = rows.iter().map(|(s, _, d)| (&s.lease, 0, 0, *d)).collect();
+        let steps: Vec<Frame> =
+            rows.iter().map(|(s, _, d)| Frame { lease: &s.lease, position: 0, frame: 0, draw: *d }).collect();
         self.graph_inputs(&steps, false)?;
         let out = self.run("first", n)?;
         rows.iter_mut().for_each(|(s, _, _)| s.frames = 1);
@@ -198,7 +190,10 @@ impl Model {
         let n = rows.len();
         ensure!(n > 0 && n <= self.limits.max_batch, "{n} sequences in one call");
         ensure!(rows.iter().all(|(s, _)| s.frames > 0), "a sequence that has not started");
-        let steps: Vec<Frame> = rows.iter().map(|(s, d)| (&s.lease, s.prompt + s.frames - 1, s.frames, *d)).collect();
+        let steps: Vec<Frame> = rows
+            .iter()
+            .map(|(s, d)| Frame { lease: &s.lease, position: s.prompt + s.frames - 1, frame: s.frames, draw: *d })
+            .collect();
         self.graph_inputs(&steps, true)?;
         let out = self.run("decode", n)?;
         rows.iter_mut().for_each(|(s, _)| s.frames += 1);
@@ -210,22 +205,22 @@ impl Model {
     /// talker row at the position its last frame goes in.
     fn graph_inputs(&mut self, frames: &[Frame], talker: bool) -> Result<()> {
         let b = bucket(frames.len());
-        let pad = Draw { uniforms: [0.5; GROUPS], force: None };
-        let padded: Vec<Frame> =
-            frames.iter().copied().chain(std::iter::repeat((&self.pad, 0, 0, pad))).take(b).collect();
-        let lines = padded.iter().map(|f| f.0.seq_line("lines", 0)).collect::<Result<Vec<_>, _>>()?;
-        let pos: Vec<i32> = padded.iter().map(|f| f.2 as i32).collect();
-        let uniforms: Vec<f32> = padded.iter().flat_map(|f| f.3.uniforms).collect();
-        let force: Vec<i32> = padded.iter().flat_map(|f| f.3.force.unwrap_or([-1; GROUPS])).collect();
-        let mut t = Rows::default();
-        padded.iter().enumerate().filter(|_| talker).for_each(|(s, f)| t.push_seq(f.0, f.1..f.1 + 1, s));
+        let draw = Draw { uniforms: [0.5; GROUPS], force: None };
+        let pad = Frame { lease: &self.pad, position: 0, frame: 0, draw };
+        let padded: Vec<&Frame> = frames.iter().chain(std::iter::repeat(&pad)).take(b).collect();
+        let lines = padded.iter().map(|f| f.lease.seq_line("lines", 0)).collect::<Result<Vec<_>, _>>()?;
+        let pos: Vec<i32> = padded.iter().map(|f| f.frame as i32).collect();
+        let uniforms: Vec<u8> = padded.iter().flat_map(|f| f.draw.uniforms).flat_map(f32::to_le_bytes).collect();
+        let force: Vec<i32> = padded.iter().flat_map(|f| f.draw.force.unwrap_or([-1; GROUPS])).collect();
         let v = vars(b, b);
         let rt = &mut self.rt;
-        rt.write_input_at("lines", bytes_of(&lines), &v)?;
-        rt.write_input_at("pos", bytes_of(&pos), &v)?;
-        rt.write_input_at("uniforms", bytes_of(&uniforms), &v)?;
-        rt.write_input_at("force", bytes_of(&force), &v)?;
+        rt.write_input_at("lines", &ints(&lines), &v)?;
+        rt.write_input_at("pos", &ints(&pos), &v)?;
+        rt.write_input_at("uniforms", &uniforms, &v)?;
+        rt.write_input_at("force", &ints(&force), &v)?;
         if talker {
+            let mut t = Rows::default();
+            padded.iter().enumerate().for_each(|(s, f)| t.push_seq(f.lease, f.position..f.position + 1, s));
             t.write(rt, &v, false)?;
         }
         Ok(())
@@ -304,16 +299,22 @@ impl Rows {
 
     fn write(&self, rt: &mut Runtime, v: &BTreeMap<String, u64>, prompt: bool) -> Result<()> {
         if prompt {
-            rt.write_input_at("t_ids", bytes_of(&self.ids), v)?;
-            rt.write_input_at("t_codec", bytes_of(&self.codec), v)?;
+            rt.write_input_at("t_ids", &ints(&self.ids), v)?;
+            rt.write_input_at("t_codec", &ints(&self.codec), v)?;
         }
-        rt.write_input_at("t_pos", bytes_of(&self.pos), v)?;
-        rt.write_input_at("t_slot", bytes_of(&self.slot), v)?;
-        rt.write_input_at("t_seq", bytes_of(&self.seq), v)?;
-        rt.write_input_at("kv_indptr", bytes_of(&self.indptr), v)?;
-        rt.write_input_at("kv_pages", bytes_of(&self.pages), v).context("kv_pages")?;
+        rt.write_input_at("t_pos", &ints(&self.pos), v)?;
+        rt.write_input_at("t_slot", &ints(&self.slot), v)?;
+        rt.write_input_at("t_seq", &ints(&self.seq), v)?;
+        rt.write_input_at("kv_indptr", &ints(&self.indptr), v)?;
+        rt.write_input_at("kv_pages", &ints(&self.pages), v).context("kv_pages")?;
         Ok(())
     }
+}
+
+/// Talker KV bytes per token: every layer's K and V.
+fn kv_bytes_per_token(config: &Config) -> usize {
+    let t = &config.model.talker_config.stack;
+    t.num_hidden_layers * Stack::kv_bytes(t)
 }
 
 /// The manifest (JSON) and the tensors its weight buffers bind.
@@ -328,7 +329,6 @@ fn generate(
     let t = &config.model.talker_config;
     let mut g = Gen::default();
     let talker = Talker::load(&mut g, &File::open(&dir.join("model.safetensors"))?, &config.model, &config.generation)?;
-    ensure!(g.region(talker.state_bytes()) == 0, "the talker's state leads the slot");
     talker.init(&mut g);
     let init = g.take();
     talker.prefill(&mut g);
@@ -381,6 +381,7 @@ fn generate(
         states.insert(format!("kv{i}"), json!({"bytes_per_token": Stack::kv_bytes(&t.stack)}));
     }
     states.insert("seq".into(), json!({"bytes_per_seq": s}));
+    let (buffers, ops, tensors) = g.into_parts();
     let modules: serde_json::Map<String, Value> = cubins
         .iter()
         .map(|(n, sha, _)| ((*n).into(), json!({"source": format!("{n}-{}.cubin", &sha[..12]), "sha256": sha})))
@@ -390,10 +391,10 @@ fn generate(
         "model": "qwen3-tts-12hz",
         "vars": {"seqs": {"max": max_seqs}, "tokens": {"max": max_tokens.max(max_seqs)}},
         "states": states,
-        "buffers": g.buffers,
+        "buffers": buffers,
         "modules": modules,
-        "ops": g.ops,
+        "ops": ops,
         "programs": programs,
     });
-    Ok((manifest, HostTensors(g.tensors)))
+    Ok((manifest, tensors))
 }

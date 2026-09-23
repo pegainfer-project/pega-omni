@@ -57,8 +57,8 @@ pub enum Kv<'a> {
     Dense { prefix: &'a str, per: usize, base: usize, span: usize },
 }
 
-/// A pass's output: the final norm's rows `n % every == which`, compacted into `out`.
-pub struct Out<'a> {
+/// The rows a pass keeps: the final norm's rows `n % every == which`, compacted into `out`.
+pub struct Keep<'a> {
     pub out: &'a str,
     pub every: usize,
     pub which: usize,
@@ -72,7 +72,7 @@ pub struct Pass<'a> {
     pub rows: Value,
     pub input: &'a str,
     pub kv: Kv<'a>,
-    pub out: Out<'a>,
+    pub keep: Keep<'a>,
 }
 
 /// Workspace names of a stack's activations, each `rows` wide at most.
@@ -140,137 +140,93 @@ impl Stack {
     }
 
     pub fn forward(&self, g: &mut Gen, pass: Pass, s: &Scratch) {
-        let Pass { label, rows, input, kv, out } = pass;
+        let Pass { label, rows, input, kv, keep } = pass;
         let rows = &rows;
         let c = &self.cfg;
-        let (h, hq, hk, inter) = (c.hidden_size, c.num_attention_heads, c.num_key_value_heads, c.intermediate_size);
-        let (eps, qkv_w) = (c.rms_norm_eps, self.qkv_width());
+        let (h, hq, inter) = (c.hidden_size, c.num_attention_heads, c.intermediate_size);
         let n_arg = count(rows);
         let norm_block = (h / 8) as u32;
         let per_row = [rows.clone(), json!(1), json!(1)];
-        let scale = f32a(1.0 / (HEAD_DIM as f32).sqrt());
         g.launch(
             &format!("{label}.embed_norm"),
             "talker_norm_copy",
             per_row.clone(),
             norm_block,
-            vec![inb(input), inb(&self.layers[0].ln1), outb(s.x), outb(s.res), i32a(h), f32a(eps)],
+            vec![inb(input), inb(&self.layers[0].ln1), outb(s.x), outb(s.res), i32a(h), f32a(c.rms_norm_eps)],
         );
         for (i, l) in self.layers.iter().enumerate() {
             let at = |s: &str| format!("{label}.l{i}.{s}");
-            g.gemm_rows(&at("qkv"), (buf(s.qkv), buf(s.x), buf(&l.qkv)), n_arg.clone(), (qkv_w, h));
-            let heads = json!((hq + 2 * hk).div_ceil(8));
-            let (hq_a, hk_a) = (i32a(hq), i32a(hk));
-            match kv {
-                Kv::Paged { prefix, ragged } => {
-                    let state = json!({"state": format!("{prefix}{i}")});
-                    g.launch(
-                        &at("rope"),
-                        "talker_rope",
-                        [rows.clone(), heads, json!(1)],
-                        256,
-                        vec![
-                            io(s.qkv),
-                            inb(&l.q_norm),
-                            inb(&l.k_norm),
-                            ini("t_pos"),
-                            ini("t_slot"),
-                            ("inout state", state.clone()),
-                            hq_a.clone(),
-                            hk_a.clone(),
-                            f32a(eps),
-                            f32a(c.rope_theta),
-                        ],
-                    );
-                    g.launch(
-                        &at("attn"),
-                        "talker_attend",
-                        [rows.clone(), json!(hk), json!(1)],
-                        128,
-                        vec![
-                            inb(s.qkv),
-                            ("in state", state),
-                            ini("t_pos"),
-                            ini("t_seq"),
-                            i32a(ragged as usize),
-                            ini("kv_indptr"),
-                            ini("kv_pages"),
-                            outb(s.attn),
-                            hq_a,
-                            hk_a,
-                            i32a(PAGE),
-                            scale.clone(),
-                        ],
-                    );
-                }
-                Kv::Dense { prefix, per, base, span } => {
-                    let ws = format!("{prefix}{i}");
-                    g.launch(
-                        &at("rope"),
-                        "talker_rope_dense",
-                        [rows.clone(), heads, json!(1)],
-                        256,
-                        vec![
-                            io(s.qkv),
-                            inb(&l.q_norm),
-                            inb(&l.k_norm),
-                            outb(&ws),
-                            i32a(per),
-                            i32a(base),
-                            i32a(span),
-                            hq_a.clone(),
-                            hk_a.clone(),
-                            f32a(eps),
-                            f32a(c.rope_theta),
-                        ],
-                    );
-                    g.launch(
-                        &at("attn"),
-                        "talker_attend_dense",
-                        [rows.clone(), json!(hk), json!(1)],
-                        128,
-                        vec![
-                            inb(s.qkv),
-                            inb(&ws),
-                            outb(s.attn),
-                            i32a(per),
-                            i32a(base),
-                            i32a(span),
-                            hq_a,
-                            hk_a,
-                            scale.clone(),
-                        ],
-                    );
-                }
-            }
+            g.gemm_rows(&at("qkv"), (buf(s.qkv), buf(s.x), buf(&l.qkv)), n_arg.clone(), (self.qkv_width(), h));
+            self.attention(g, &format!("{label}.l{i}"), rows, (i, l), kv, s);
             g.gemm_rows(&at("o"), (buf(s.x), buf(s.attn), buf(&l.o)), n_arg.clone(), (h, hq * HEAD_DIM));
             g.launch(
                 &at("post_attn_norm"),
                 "talker_add_norm",
                 per_row.clone(),
                 norm_block,
-                vec![inb(s.x), io(s.res), inb(&l.ln2), outb(s.x), i32a(h), f32a(eps), i32a(1), i32a(0)],
+                vec![inb(s.x), io(s.res), inb(&l.ln2), outb(s.x), i32a(h), f32a(c.rms_norm_eps), i32a(1), i32a(0)],
             );
             g.gemm_rows(&at("gate_up"), (buf(s.gate_up), buf(s.x), buf(&l.gate_up)), n_arg.clone(), (2 * inter, h));
-            g.launch(
-                &at("silu_mul"),
-                "talker_silu_mul",
-                [json!({"ceil_div": [{"mul": [rows, inter / 8]}, 256]}), json!(1), json!(1)],
-                256,
-                vec![inb(s.gate_up), outb(s.act), i32a(inter), ("i32", json!({"expr": {"mul": [rows, inter / 8]}}))],
-            );
+            g.each8(&at("silu_mul"), "talker_silu_mul", rows, inter, vec![inb(s.gate_up), outb(s.act), i32a(inter)]);
             g.gemm_rows(&at("down"), (buf(s.x), buf(s.act), buf(&l.down)), n_arg.clone(), (h, inter));
             let (next, dst, every, which) = match self.layers.get(i + 1) {
                 Some(n) => (&n.ln1, s.x, 1, 0),
-                None => (&self.norm, out.out, out.every, out.which),
+                None => (&self.norm, keep.out, keep.every, keep.which),
             };
             g.launch(
                 &at("next_norm"),
                 "talker_add_norm",
                 per_row.clone(),
                 norm_block,
-                vec![inb(s.x), io(s.res), inb(next), outb(dst), i32a(h), f32a(eps), i32a(every), i32a(which)],
+                vec![
+                    inb(s.x),
+                    io(s.res),
+                    inb(next),
+                    outb(dst),
+                    i32a(h),
+                    f32a(c.rms_norm_eps),
+                    i32a(every),
+                    i32a(which),
+                ],
             );
         }
+    }
+
+    /// Layer `i`'s Q/K norm and rotary embedding, K and V into `kv`, and
+    /// attention from `s.qkv` into `s.attn`.
+    fn attention(&self, g: &mut Gen, label: &str, rows: &Value, (i, l): (usize, &Layer), kv: Kv, s: &Scratch) {
+        let c = &self.cfg;
+        let (hq, hk) = (c.num_attention_heads, c.num_key_value_heads);
+        let (rope, rope_kv, attend, attend_kv) = match kv {
+            Kv::Paged { prefix, ragged } => {
+                let state = json!({"state": format!("{prefix}{i}")});
+                let paged = vec![
+                    ("in state", state.clone()),
+                    ini("t_pos"),
+                    ini("t_seq"),
+                    i32a(ragged as usize),
+                    ini("kv_indptr"),
+                    ini("kv_pages"),
+                    i32a(PAGE),
+                ];
+                ("talker_rope", vec![ini("t_pos"), ini("t_slot"), ("inout state", state)], "talker_attend", paged)
+            }
+            Kv::Dense { prefix, per, base, span } => {
+                let ws = format!("{prefix}{i}");
+                let layout = [i32a(per), i32a(base), i32a(span)];
+                let rope_kv = [&[outb(&ws)][..], &layout].concat();
+                ("talker_rope_dense", rope_kv, "talker_attend_dense", [&[inb(&ws)][..], &layout].concat())
+            }
+        };
+        let heads = json!((hq + 2 * hk).div_ceil(8));
+        let rope_args = [
+            &[io(s.qkv), inb(&l.q_norm), inb(&l.k_norm)][..],
+            &rope_kv,
+            &[i32a(hq), i32a(hk), f32a(c.rms_norm_eps), f32a(c.rope_theta)],
+        ];
+        g.launch(&format!("{label}.rope"), rope, [rows.clone(), heads, json!(1)], 256, rope_args.concat());
+        let scale = f32a(1.0 / (HEAD_DIM as f32).sqrt());
+        let attend_args = [&[inb(s.qkv)][..], &attend_kv, &[outb(s.attn), i32a(hq), i32a(hk), scale]];
+        g.launch(&format!("{label}.attn"), attend, [rows.clone(), json!(hk), json!(1)], 128, attend_args.concat());
     }
 }

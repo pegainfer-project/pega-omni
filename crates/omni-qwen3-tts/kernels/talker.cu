@@ -322,7 +322,7 @@ __device__ __forceinline__ void attend_any(const bf16* qkv, const bf16* kv, bf16
 // `pages[indptr[s]..]`.
 extern "C" __global__ void __launch_bounds__(kAttnWarps * 32)
     talker_attend(const bf16* qkv, const void* kv, const int32_t* pos, const int32_t* seq, int ragged,
-                  const int32_t* indptr, const int32_t* pages, bf16* out, int hq, int hk, int page, float scale) {
+                  const int32_t* indptr, const int32_t* pages, int page, bf16* out, int hq, int hk, float scale) {
   const int n = blockIdx.x;
   const int s = ragged ? seq[n] : n;
   attend_any(qkv, static_cast<const bf16*>(kv), out, n, pos[n] + 1, hq, hk, scale, PagedSlots{pages + indptr[s], page});
@@ -330,7 +330,7 @@ extern "C" __global__ void __launch_bounds__(kAttnWarps * 32)
 
 // Code-predictor rows over the dense workspace, laid out as `talker_rope_dense`.
 extern "C" __global__ void __launch_bounds__(kAttnWarps * 32)
-    talker_attend_dense(const bf16* qkv, const bf16* kv, bf16* out, int per, int base, int span, int hq, int hk,
+    talker_attend_dense(const bf16* qkv, const bf16* kv, int per, int base, int span, bf16* out, int hq, int hk,
                         float scale) {
   const int n = blockIdx.x;
   attend_any(qkv, kv, out, n, base + n % per + 1, hq, hk, scale, DenseSlots{(int64_t)(n / per) * span});

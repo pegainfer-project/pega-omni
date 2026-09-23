@@ -10,11 +10,11 @@
 use std::path::PathBuf;
 
 use omni_qwen3_tts::model::Draw;
+use omni_qwen3_tts::model::GROUPS;
 use omni_qwen3_tts::model::Limits;
 use omni_qwen3_tts::model::Model;
 use omni_qwen3_tts::model::Seq;
 use omni_qwen3_tts::prompt;
-use omni_qwen3_tts::talker::GROUPS;
 use omni_qwen3_tts::weights::File;
 
 fn paths() -> Option<(PathBuf, PathBuf)> {
@@ -83,7 +83,7 @@ const LAG: usize = 7;
 fn matches_the_official_run() {
     let Some((dir, golden)) = paths() else { return };
     let golden = Golden::open(&golden);
-    let limits = Limits { max_batch: 3, max_tokens: 1024, kv_tokens: 4096 };
+    let limits = Limits { max_batch: 3, max_tokens: 1024, kv_gib: 0.5 };
     let mut model = Model::load(0, &dir, limits).unwrap();
     let config = model.config.clone();
 
@@ -98,8 +98,8 @@ fn matches_the_official_run() {
     let n = frames.len();
     let (_, talker_logits) = golden.f32("talker_logits");
     let (_, predictor_logits) = golden.f32("predictor_logits");
-    let (h, vocab, p_vocab) =
-        (config.model.talker_config.stack.hidden_size, config.model.talker_config.stack.vocab_size, 2048);
+    let t = &config.model.talker_config;
+    let (h, vocab, p_vocab) = (t.stack.hidden_size, t.stack.vocab_size, t.code_predictor_config.vocab_size);
     let spf = config.samples_per_frame;
 
     let mut seqs: Vec<Seq> = (0..3).map(|_| model.open(prompt.len(), n + 1).unwrap().unwrap()).collect();
