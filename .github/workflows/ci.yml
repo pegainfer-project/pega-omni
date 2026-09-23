@@ -44,13 +44,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Install the CUDA compiler and runtime
+      - name: Install the CUDA compiler, runtime and cuBLAS headers
         run: |
           set -euo pipefail
           curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update -o Acquire::Retries=3
-          sudo apt-get install -y --no-install-recommends cuda-nvcc-$CUDA cuda-cudart-dev-$CUDA
+          sudo apt-get install -y --no-install-recommends cuda-nvcc-$CUDA cuda-cudart-dev-$CUDA libcublas-dev-$CUDA
           cuda=/usr/local/cuda-${CUDA/-/.}
           echo "$cuda/bin" >> "$GITHUB_PATH"
           echo "LD_LIBRARY_PATH=$cuda/lib64" >> "$GITHUB_ENV"
