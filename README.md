@@ -72,6 +72,8 @@ differs from OpenAI, it says so instead of guessing:
 - Model-specific options go in one `extra` object that the engine declares
   (the simulator accepts `{"frames": N}`; Qwen3-TTS `language`, `temperature`,
   `top_k`, `seed`); unknown top-level fields are a `400`.
+- `stream` (not OpenAI's; vLLM clients such as `vllm bench serve` send it) is
+  accepted and changes nothing: every response streams.
 - A full engine queue is an immediate `429`, never a wait in the front end.
 
 ## Layout
