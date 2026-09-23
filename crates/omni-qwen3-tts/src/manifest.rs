@@ -257,15 +257,20 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Where kern finds the cubins: a directory holding each under its hash, e.g. `codec-<sha12>.cubin`.
+/// Where kern finds the cubins: a per-user cache directory holding each under
+/// its hash, e.g. `codec-<sha12>.cubin`.
 pub fn kernels_dir(cubins: &[(&str, &str, &[u8])]) -> anyhow::Result<PathBuf> {
-    let dir = std::env::temp_dir().join("pega-omni-kernels");
+    let var = |k| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let dir = var("XDG_CACHE_HOME")
+        .or_else(|| var("HOME").map(|h| h.join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("pega-omni/kernels");
     for (name, sha, bytes) in cubins {
         let path = dir.join(format!("{name}-{}.cubin", &sha[..12]));
         if !path.exists() {
-            std::fs::create_dir_all(&dir)?;
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
             let tmp = dir.join(format!(".{name}-{}.{}", &sha[..12], std::process::id()));
-            std::fs::write(&tmp, bytes)?;
+            std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
             std::fs::rename(&tmp, &path).with_context(|| format!("placing {}", path.display()))?;
         }
     }

@@ -206,7 +206,12 @@ impl Engine {
                 Err(Denied::Busy | Denied::Remapping) => break,
                 Err(d) => {
                     let job = self.waiting.pop_front().expect("front exists");
-                    tracing::warn!(id = job.id, "rejected: {d}");
+                    tracing::warn!(
+                        id = job.id,
+                        "rejected: {} prompt tokens and {} frames: {d}",
+                        job.prompt.len(),
+                        job.cap
+                    );
                     abort(&job.sink);
                 }
             }

@@ -100,7 +100,7 @@ pub struct Model {
     pad: Lease,
     limits: Limits,
     max_seqs: usize,
-    /// Entries of the `kv_pages` table: the most pages one call may name.
+    /// The most pages the running sequences may hold.
     pages_max: usize,
 }
 
@@ -120,7 +120,9 @@ impl Model {
         let max_seqs = bucket(limits.max_batch);
         let pages_max = limits.kv_tokens.div_ceil(PAGE) + 1;
         let cubins = [("codec", CODEC), ("talker", TALKER)].map(|(n, b)| (n, hex(&sha2::Sha256::digest(b)), b));
-        let (manifest, tensors) = generate(dir, &config, &cubins, max_seqs, limits.max_tokens, pages_max)?;
+        // Each padding row of a graph call names the pad lease's page once more.
+        let page_table = pages_max + max_seqs;
+        let (manifest, tensors) = generate(dir, &config, &cubins, max_seqs, limits.max_tokens, page_table)?;
         let verified = kern_manifest::verify(kern_manifest::Manifest::from_json(&manifest.to_string())?)
             .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
         let dir = kernels_dir(&cubins.each_ref().map(|(n, sha, b)| (*n, sha.as_str(), *b)))?;
@@ -151,7 +153,8 @@ impl Model {
             Err(e) => return Err(e.into()),
         };
         if self.rt.pages_used() > self.pages_max {
-            return Ok(Err(Denied::Busy));
+            let alone = lease.page_ids().len() + self.pad.page_ids().len();
+            return Ok(Err(if alone > self.pages_max { Denied::ExceedsPool } else { Denied::Busy }));
         }
         Ok(Ok(Seq { lease, prompt, frames: 0 }))
     }
@@ -320,7 +323,7 @@ fn generate(
     cubins: &[(&str, String, &[u8]); 2],
     max_seqs: usize,
     max_tokens: usize,
-    pages_max: usize,
+    page_table: usize,
 ) -> Result<(Value, HostTensors)> {
     let t = &config.model.talker_config;
     let mut g = Gen::default();
@@ -362,7 +365,7 @@ fn generate(
     g.input("t_seq", json!(["tokens"]), min(0));
     g.input("last_row", json!(["seqs"]), min(0));
     g.input("kv_indptr", json!([max_seqs + 1]), json!({"min": 0, "monotone": true}));
-    g.input("kv_pages", json!([pages_max]), json!({"index_into": "kv0", "stride": PAGE}));
+    g.input("kv_pages", json!([page_table]), json!({"index_into": "kv0", "stride": PAGE}));
     g.buffer("codes", "i32", json!(["seqs", GROUPS]), "output");
     g.buffer("wav", "bf16", json!(["seqs", config.samples_per_frame]), "output");
     g.buffer("logits", "bf16", json!(["seqs", vocab]), "output");
