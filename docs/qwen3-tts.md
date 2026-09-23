@@ -63,10 +63,15 @@ control-token suppression on the raw logits, temperature, top-k keeping ties
 request's own uniform in vocabulary order; a `force` input (−1 = draw) takes a
 given code instead, which is how the golden test runs the serving path.
 
-`kernels/codec.cu` is the codec's: RVQ lookup, RMSNorm, RoPE into the K/V
-ring, ring attention, SnakeBeta, causal im2col over a history ring,
-overlap-add carrying the previous row, depthwise conv + LayerNorm, the output
-conv, and the elementwise epilogues.
+`kernels/codec.cu` is the codec's: RVQ lookup, RMSNorm, attention that
+applies RoPE and appends to its 72-frame K/V ring, SnakeBeta (fused into the
+bias epilogue and into the next conv's im2col), causal im2col over a
+double-buffered history, overlap-add carrying the previous frame's row,
+depthwise conv + LayerNorm, and the output conv. Residual GEMMs accumulate in
+place (cuBLASLt with beta = 1) and their biases ride along to the next
+consumer's epilogue, so no kernel exists only to add. Every codec kernel
+launches with programmatic dependent launch and loads its weights before
+waiting on its producer.
 
 GEMMs are kern's cuBLASLt built-in. `build.rs` compiles both files to cubins
 (`OMNI_CUDA_ARCH`, default `103a`, GB300); the manifest pins their sha256.
@@ -111,24 +116,4 @@ Japanese, including 8 concurrent requests in one batch.
 
 ## Performance
 
-[qwen3-tts-vs-vllm-omni.md](qwen3-tts-vs-vllm-omni.md) holds the method, a
-script to reproduce it, and results under vLLM-Omni's own benchmark on one
-GB300, measured before the talker moved onto kern. With the same chunk
-schedule, first audio arrived 5-8x sooner than with vLLM-Omni, and from c=8
-up the engine served 1.3-1.6x the audio per second.
-
-Moving the talker, predictor and sampler into the manifest (one graph launch
-per decode step instead of per-kernel launches for the talker and predictor),
-measured 2026-09-23 in one session on one GB300, server and client pinned to
-separate cores, against the previous commit, two runs each:
-
-| c | audio-s/s, vLLM-Omni's bench | audio-s/s, omni-bench | median RTF (omni-bench) |
-|---:|---:|---:|---:|
-| 1 | 12.6 → 15.8 (+25%) | 12.6 → 15.8 (+25%) | 0.079 → 0.063 |
-| 8 | 86.7 → 102.4 (+18%) | 85.3 → 103.2 (+21%) | 0.088 → 0.074 |
-| 64 | 350 → 465 (+33%) | 355 → 495 (+39%) | 0.156 → 0.116 |
-
-Median time to first audio is unchanged at c=8 (21 ms) and moves by a few ms
-either way at c=64 (vLLM-Omni's bench 44 → 48 ms, omni-bench 37 → 27 ms); a
-step that admits requests runs `prefill` + `first` and `decode` as two calls,
-each waited for.
+PERF_PLACEHOLDER

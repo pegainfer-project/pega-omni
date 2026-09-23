@@ -14,9 +14,11 @@
 //! [`build`] emits the decoder's calls from the checkpoint's config, the tail
 //! of the model's `first` and `decode` programs. Activations are `[rows, C]`;
 //! every dense conv is `im2col` and a GEMM, every transposed conv a GEMM and an
-//! overlap-add. Weight layout transforms and scale folding happen on the host
-//! at load (LayerScale into the projections it scales, ConvNeXt's gamma into
-//! its last linear), then reach kern as named tensors.
+//! overlap-add; a residual branch's last GEMM accumulates into its stream.
+//! Weight layout transforms and scale folding happen on the host at load
+//! (LayerScale into the projections it scales, ConvNeXt's gamma into its last
+//! linear, a bias into the linear op it feeds), then reach kern as named
+//! tensors.
 
 use anyhow::Result;
 use anyhow::ensure;
@@ -24,7 +26,7 @@ use serde_json::json;
 
 use crate::config;
 use crate::manifest::Gen;
-use crate::manifest::THREADS;
+use crate::manifest::f32a;
 use crate::manifest::i32a;
 use crate::manifest::inb;
 use crate::manifest::inf;
@@ -32,7 +34,6 @@ use crate::manifest::ini;
 use crate::manifest::io;
 use crate::manifest::outb;
 use crate::manifest::per_seq;
-use crate::manifest::state_in;
 use crate::manifest::state_io;
 use crate::manifest::stride;
 use crate::weights::File;
@@ -55,56 +56,59 @@ impl Gen {
         ))
     }
 
-    fn bias(&mut self, label: &str, x: &str, b: &str, t: usize, c: usize) {
-        self.each(label, "codec_bias", t * c, vec![io(x), inb(b), i32a(c)]);
-    }
-
-    /// `out = conv(x) + b` for a causal conv of `k` taps, the input's history
-    /// in a ring of its own.
+    /// `out = conv(act(x + bias))` for a causal conv of `k` taps dilated by
+    /// `d`, `act` SnakeBeta when given; the conv's own bias is left to its
+    /// consumer. `act(x + bias)` of the last `(k - 1)·d` rows is its history.
+    #[allow(clippy::too_many_arguments)]
     fn conv(
         &mut self,
         label: &str,
-        (x, out): (&str, &'static str),
-        w: &(String, String),
+        (x, bias, act): (&str, &str, Option<&(String, String)>),
+        (w, out): (&str, &'static str),
         t: usize,
         (cin, cout): (usize, usize),
-        k: usize,
+        (k, d): (usize, usize),
     ) {
-        let h = k - 1;
-        let ring = self.region(h * cin * 2);
+        let h = (k - 1) * d;
+        let history = self.region(2 * h * cin * 2);
         self.need("col", t * k * cin);
-        self.each8(
-            &format!("{label}.im2col"),
-            "codec_im2col",
-            t * k * cin,
-            vec![
-                inb(x),
-                state_in(ring),
-                ini("pos"),
-                ini("lines"),
-                outb("col"),
-                i32a(t),
-                i32a(cin),
-                i32a(k),
-                i32a(1),
-                i32a(h),
-                stride(),
-            ],
-        );
-        self.ring_write(&format!("{label}.history"), x, ring, t, cin, h);
-        self.gemm(&format!("{label}.gemm"), out, "col", &w.0, t, (cout, k * cin));
-        self.bias(&format!("{label}.bias"), out, &w.1, t, cout);
+        let mut args = vec![inb(x), inb(bias)];
+        let entry = match act {
+            Some((a, inv_b)) => {
+                args.extend([inf(a), inf(inv_b)]);
+                "codec_im2col_snake"
+            }
+            None => "codec_im2col",
+        };
+        args.extend([
+            state_io(history),
+            ini("pos"),
+            ini("lines"),
+            outb("col"),
+            i32a(t),
+            i32a(cin),
+            i32a(k),
+            i32a(d),
+            stride(),
+        ]);
+        self.each8(&format!("{label}.im2col"), entry, (h + t) * cin, args);
+        self.gemm(&format!("{label}.gemm"), out, "col", w, t, (cout, k * cin));
     }
+}
 
-    fn ring_write(&mut self, label: &str, x: &str, ring: u64, t: usize, c: usize, h: usize) {
-        let w = t.min(h);
-        self.each(
-            label,
-            "codec_ring_write",
-            w * c,
-            vec![inb(x), state_io(ring), ini("pos"), ini("lines"), i32a(t), i32a(c), i32a(h), i32a(w), stride()],
-        );
-    }
+/// `w[n, k] · v[k]`.
+fn matvec(w: &[f32], v: &[f32]) -> Vec<f32> {
+    w.chunks(v.len()).map(|row| row.iter().zip(v).map(|(a, b)| a * b).sum()).collect()
+}
+
+fn plus(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b).map(|(x, y)| x + y).collect()
+}
+
+/// A `[rows, cols]` matrix as `[cols, rows]`.
+fn transpose(w: &[f32], rows: usize) -> Vec<f32> {
+    let cols = w.len() / rows;
+    (0..cols).flat_map(|j| (0..rows).map(move |r| w[r * cols + j])).collect()
 }
 
 /// Emits the decoder's calls into `g`: `codes` [seqs, 16] in, `wav` [seqs, spf]
@@ -118,6 +122,16 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
     ensure!(
         cfg.upsampling_ratios.iter().chain(&cfg.upsample_rates).product::<usize>() == spf,
         "the upsampling rates do not multiply to {spf} samples per frame"
+    );
+    ensure!(
+        hidden.is_multiple_of(256) && hidden <= 1024,
+        "codec hidden size {hidden} unsupported (the norms need 256 | h ≤ 1024)"
+    );
+    ensure!(latent.is_multiple_of(8) && latent / 8 <= 1024, "codec latent dim {latent} unsupported");
+    let out_dim = cfg.decoder_dim >> cfg.upsample_rates.len();
+    ensure!(
+        out_dim.is_multiple_of(32) && out_dim <= 128,
+        "codec output conv width {out_dim} unsupported (32 | c ≤ 128)"
     );
     g.module = "codec";
 
@@ -148,34 +162,31 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
         "rvq",
         "codec_rvq",
         [json!("seqs"), json!(1), json!(1)],
-        THREADS,
+        (half / 8) as u32,
         vec![ini("codes"), inb(&books), outb("col"), i32a(half), i32a(cb)],
     );
     g.need("col", dim);
     g.gemm("rvq.proj", "a", "col", &rvq_out, 1, (dim, dim));
 
-    let conv_w = |g: &mut Gen, prefix: &str, name: &str, shape: [usize; 3]| -> Result<(String, String)> {
+    let conv_w = |g: &mut Gen, prefix: &str, name: &str, shape: [usize; 3]| -> Result<(String, Vec<f32>)> {
         let w = file.expect(&format!("{prefix}.weight"), &shape)?;
         let b = file.expect(&format!("{prefix}.bias"), &shape[..1])?;
-        Ok((
-            g.weight(&format!("{name}.w"), &[shape[0], shape[2] * shape[1]], &conv_taps(&w)),
-            g.weight(&format!("{name}.b"), &[shape[0]], &b.data),
-        ))
+        Ok((g.weight(&format!("{name}.w"), &[shape[0], shape[2] * shape[1]], &conv_taps(&w)), b.data))
     };
-    let pre = conv_w(g, "decoder.pre_conv.conv", "pre_conv", [latent, dim, 3])?;
-    g.conv("pre_conv", ("a", "b"), &pre, 1, (dim, latent), 3);
+    let zeros = g.weight("zeros", &[dim.max(latent)], &vec![0.0; dim.max(latent)]);
+    let (pre, pre_b) = conv_w(g, "decoder.pre_conv.conv", "pre_conv", [latent, dim, 3])?;
+    g.conv("pre_conv", ("a", &zeros, None), (&pre, "b"), 1, (dim, latent), (3, 1));
 
-    // Transformer over the frames, residual stream in `res`.
+    // Transformer over the frames, residual stream in `res`; pre_conv's bias
+    // goes through input_proj.
     let pt = "decoder.pre_transformer";
-    let linear = |g: &mut Gen, p: &str, name: &str, shape: [usize; 2]| -> Result<(String, String)> {
-        Ok((
-            g.weight(&format!("{name}.w"), &shape, &file.expect(&format!("{p}.weight"), &shape)?.data),
-            g.weight(&format!("{name}.b"), &shape[..1], &file.expect(&format!("{p}.bias"), &shape[..1])?.data),
-        ))
+    let linear = |p: &str, shape: [usize; 2]| -> Result<(Host, Host)> {
+        Ok((file.expect(&format!("{p}.weight"), &shape)?, file.expect(&format!("{p}.bias"), &shape[..1])?))
     };
-    let input_proj = linear(g, &format!("{pt}.input_proj"), "input_proj", [hidden, latent])?;
-    g.gemm("input_proj", "res", "b", &input_proj.0, 1, (hidden, latent));
-    g.bias("input_proj.bias", "res", &input_proj.1, 1, hidden);
+    let (in_w, in_b) = linear(&format!("{pt}.input_proj"), [hidden, latent])?;
+    let in_b = g.weight("input_proj.b", &[hidden], &plus(&in_b.data, &matvec(&in_w.data, &pre_b)));
+    let in_w = g.weight("input_proj.w", &[hidden, latent], &in_w.data);
+    g.gemm("input_proj", "res", "b", &in_w, 1, (hidden, latent));
     let (heads, hd, inter) = (cfg.num_attention_heads, cfg.head_dim, cfg.intermediate_size);
     let qd = heads * hd;
     let norm_w = |g: &mut Gen, name: &str, src: &str| -> Result<String> {
@@ -183,12 +194,13 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
     };
     let ln = norm_w(g, "l0.ln1", &format!("{pt}.layers.0.input_layernorm.weight"))?;
     let eps = cfg.rms_norm_eps;
+    let norm_grid = [json!({"ceil_div": ["seqs", 4]}), json!(1), json!(1)];
     g.launch(
         "l0.norm",
-        "codec_rms_norm",
-        [json!("seqs"), json!(1), json!(1)],
-        THREADS,
-        vec![inb("res"), inb(&ln), outb("x"), i32a(hidden), ("f32", json!({"f32": eps}))],
+        "codec_bias_rms_norm",
+        norm_grid.clone(),
+        128,
+        vec![io("res"), inb(&in_b), inb(&ln), outb("x"), i32a(hidden), f32a(eps), ("i32", json!({"var": "seqs"}))],
     );
     g.need("x", hidden);
     g.need("a", qd.max(inter));
@@ -221,68 +233,61 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
         } else {
             norm_w(g, "norm", &format!("{pt}.norm.weight"))?
         };
+        let add_norm = |g: &mut Gen, label: String, w: &str| {
+            g.launch(
+                &label,
+                "codec_add_rms_norm",
+                norm_grid.clone(),
+                128,
+                vec![io("x"), io("res"), inb(w), i32a(hidden), f32a(eps), ("i32", json!({"var": "seqs"}))],
+            );
+        };
 
         let kv = g.region(2 * 72 * qd * 2);
         g.gemm(&format!("l{i}.qkv"), "col", "x", &qkv, 1, (3 * qd, hidden));
         g.launch(
-            &format!("l{i}.rope"),
-            "codec_rope_kv",
-            [json!("seqs"), json!((3 * heads).div_ceil(8)), json!(1)],
-            THREADS,
+            &format!("l{i}.attn"),
+            "codec_attention",
+            [json!("seqs"), json!(heads), json!(1)],
+            128,
             vec![
-                io("col"),
+                inb("col"),
                 ini("pos"),
                 ini("lines"),
                 state_io(kv),
+                outb("a"),
                 stride(),
                 i32a(heads),
-                ("f32", json!({"f32": cfg.rope_theta})),
+                f32a(cfg.rope_theta),
             ],
         );
-        g.launch(
-            &format!("l{i}.attn"),
-            "codec_ring_attention",
-            [json!("seqs"), json!(heads.div_ceil(8)), json!(1)],
-            THREADS,
-            vec![inb("col"), ini("pos"), ini("lines"), state_in(kv), outb("a"), stride(), i32a(heads)],
-        );
         g.gemm(&format!("l{i}.o"), "x", "a", &o, 1, (hidden, qd));
-        g.launch(
-            &format!("l{i}.post_attn_norm"),
-            "codec_add_rms_norm",
-            [json!("seqs"), json!(1), json!(1)],
-            THREADS,
-            vec![io("x"), io("res"), inb(&ln2), i32a(hidden), ("f32", json!({"f32": eps}))],
-        );
+        add_norm(g, format!("l{i}.post_attn_norm"), &ln2);
         g.gemm(&format!("l{i}.gate_up"), "col", "x", &gate_up, 1, (2 * inter, hidden));
-        g.each(&format!("l{i}.silu_mul"), "codec_silu_mul", inter, vec![inb("col"), outb("a"), i32a(inter)]);
+        g.each8(&format!("l{i}.silu_mul"), "codec_silu_mul", inter, vec![inb("col"), outb("a"), i32a(inter)]);
         g.gemm(&format!("l{i}.down"), "x", "a", &down, 1, (hidden, inter));
-        g.launch(
-            &format!("l{i}.next_norm"),
-            "codec_add_rms_norm",
-            [json!("seqs"), json!(1), json!(1)],
-            THREADS,
-            vec![io("x"), io("res"), inb(&next), i32a(hidden), ("f32", json!({"f32": eps}))],
-        );
+        add_norm(g, format!("l{i}.next_norm"), &next);
     }
-    let output_proj = linear(g, &format!("{pt}.output_proj"), "output_proj", [latent, hidden])?;
-    g.gemm("output_proj", "a", "x", &output_proj.0, 1, (latent, hidden));
-    g.bias("output_proj.bias", "a", &output_proj.1, 1, latent);
+    let (out_w, out_b) = linear(&format!("{pt}.output_proj"), [latent, hidden])?;
+    let out_w = g.weight("output_proj.w", &[latent, hidden], &out_w.data);
+    g.gemm("output_proj", "a", "x", &out_w, 1, (latent, hidden));
 
-    // Upsamplers: transposed conv (kernel = stride, no overlap), then ConvNeXt
-    // with its residual. `cur` holds the stage input, `tmp` is free.
+    // Upsamplers: transposed conv (kernel = stride, no overlap: its GEMM rows
+    // are the output rows), then ConvNeXt, whose residual accumulates into its
+    // input. `cur` holds the stage input and `pending` the bias it still
+    // lacks, which the transposed conv folds into its own (per tap).
     let (mut cur, mut tmp) = ("a", "b");
+    let mut pending = out_b.data;
     let mut t = 1;
     for (i, &r) in cfg.upsampling_ratios.iter().enumerate() {
         let p = format!("decoder.upsample.{i}");
-        let up = file.expect(&format!("{p}.0.conv.weight"), &[latent, latent, r])?;
-        let up_w = g.weight(&format!("up{i}.w"), &[r * latent, latent], &transposed_taps(&up));
-        let up_b = g.weight(&format!("up{i}.b"), &[latent], &file.expect(&format!("{p}.0.conv.bias"), &[latent])?.data);
-        let dw_w = g.weight(
-            &format!("up{i}.dw.w"),
-            &[latent, KERNEL],
-            &file.expect(&format!("{p}.1.dwconv.conv.weight"), &[latent, 1, KERNEL])?.data,
-        );
+        let up = transposed_taps(&file.expect(&format!("{p}.0.conv.weight"), &[latent, latent, r])?);
+        let up_b = file.expect(&format!("{p}.0.conv.bias"), &[latent])?;
+        let zb: Vec<f32> = matvec(&up, &pending).chunks(latent).flat_map(|tap| plus(tap, &up_b.data)).collect();
+        let up_w = g.weight(&format!("up{i}.w"), &[r * latent, latent], &up);
+        let zb = g.weight(&format!("up{i}.b"), &[r, latent], &zb);
+        let dw = file.expect(&format!("{p}.1.dwconv.conv.weight"), &[latent, 1, KERNEL])?;
+        let dw_w = g.weight(&format!("up{i}.dw.w"), &[KERNEL, latent], &transpose(&dw.data, latent));
         let dw_b = g.weight(
             &format!("up{i}.dw.b"),
             &[latent],
@@ -292,86 +297,81 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
             g.weight(&format!("up{i}.ln.w"), &[latent], &file.expect(&format!("{p}.1.norm.weight"), &[latent])?.data);
         let ln_b =
             g.weight(&format!("up{i}.ln.b"), &[latent], &file.expect(&format!("{p}.1.norm.bias"), &[latent])?.data);
-        let pw1 = linear(g, &format!("{p}.1.pwconv1"), &format!("up{i}.pw1"), [4 * latent, latent])?;
+        let (pw1_w, pw1_b) = linear(&format!("{p}.1.pwconv1"), [4 * latent, latent])?;
+        let pw1_w = g.weight(&format!("up{i}.pw1.w"), &[4 * latent, latent], &pw1_w.data);
+        let pw1_b = g.weight(&format!("up{i}.pw1.b"), &[4 * latent], &pw1_b.data);
         let gamma = file.expect(&format!("{p}.1.gamma"), &[latent])?;
         let pw2: Host = file.expect(&format!("{p}.1.pwconv2.weight"), &[latent, 4 * latent])?;
         let pw2_b = file.expect(&format!("{p}.1.pwconv2.bias"), &[latent])?;
         let pw2_w = g.weight(&format!("up{i}.pw2.w"), &[latent, 4 * latent], &scale_rows(&pw2.data, &gamma.data));
-        let pw2_b = g.weight(&format!("up{i}.pw2.b"), &[latent], &scale_rows(&pw2_b.data, &gamma.data));
 
         g.gemm(&format!("up{i}.gemm"), "col", cur, &up_w, t, (r * latent, latent));
         t *= r;
-        g.each(
-            &format!("up{i}.unfold"),
-            "codec_unfold",
-            t * latent,
-            vec![inb("col"), inb(&up_b), outb(tmp), i32a(latent)],
-        );
-        let h = KERNEL - 1;
-        let ring = g.region(h * latent * 2);
+        let history = g.region(2 * (KERNEL - 1) * latent * 2);
         g.launch(
             &format!("up{i}.dwconv_ln"),
             "codec_dwconv_ln",
             [per_seq(t), json!(1), json!(1)],
-            THREADS,
+            (latent / 8) as u32,
             vec![
-                inb(tmp),
+                inb("col"),
+                inb(&zb),
                 inb(&dw_w),
                 inb(&dw_b),
                 inb(&ln_w),
                 inb(&ln_b),
-                state_in(ring),
+                state_io(history),
                 ini("pos"),
                 ini("lines"),
+                outb(tmp),
                 outb("x"),
                 i32a(t),
+                i32a(r),
                 i32a(latent),
-                i32a(KERNEL),
                 stride(),
-                ("f32", json!({"f32": 1e-6f32})),
+                f32a(1e-6),
             ],
         );
-        g.ring_write(&format!("up{i}.history"), tmp, ring, t, latent, h);
-        g.gemm(&format!("up{i}.pw1"), "col", "x", &pw1.0, t, (4 * latent, latent));
-        g.each(
+        g.gemm(&format!("up{i}.pw1"), "col", "x", &pw1_w, t, (4 * latent, latent));
+        g.each8(
             &format!("up{i}.pw1.bias"),
             "codec_bias_gelu",
             t * 4 * latent,
-            vec![io("col"), inb(&pw1.1), i32a(4 * latent)],
+            vec![io("col"), inb(&pw1_b), i32a(4 * latent)],
         );
-        g.gemm(&format!("up{i}.pw2"), "x", "col", &pw2_w, t, (latent, 4 * latent));
-        g.each(
-            &format!("up{i}.residual"),
-            "codec_bias_residual",
-            t * latent,
-            vec![inb("x"), inb(&pw2_b), io(tmp), i32a(latent)],
-        );
-        g.need(tmp, t * latent);
+        g.gemm_acc(&format!("up{i}.pw2"), tmp, "col", &pw2_w, t, (latent, 4 * latent));
+        pending = scale_rows(&pw2_b.data, &gamma.data);
         g.need("x", t * latent);
         (cur, tmp) = (tmp, cur);
     }
 
-    let conv_in = conv_w(g, "decoder.decoder.0.conv", "conv_in", [cfg.decoder_dim, latent, KERNEL])?;
-    g.conv("conv_in", (cur, tmp), &conv_in, t, (latent, cfg.decoder_dim), KERNEL);
+    let pending_w = g.weight("conv_in.in_b", &[latent], &pending);
+    let (conv_in, conv_in_b) = conv_w(g, "decoder.decoder.0.conv", "conv_in", [cfg.decoder_dim, latent, KERNEL])?;
+    g.conv("conv_in", (cur, &pending_w, None), (&conv_in, tmp), t, (latent, cfg.decoder_dim), (KERNEL, 1));
     (cur, tmp) = (tmp, cur);
+    let mut pending = conv_in_b;
 
+    // Decoder blocks: SnakeBeta, transposed conv (overlap-add into `cur`),
+    // then residual units whose second conv accumulates into `cur`, its bias
+    // carried to the next consumer.
     for (i, &rate) in cfg.upsample_rates.iter().enumerate() {
         let p = format!("decoder.decoder.{}.block", i + 1);
         let (cin, cout) = (cfg.decoder_dim >> i, cfg.decoder_dim >> (i + 1));
         let snake = g.snake(file, &format!("{p}.0"), cin)?;
+        let in_b = g.weight(&format!("b{i}.in_b"), &[cin], &pending);
         let up = file.expect(&format!("{p}.1.conv.weight"), &[cin, cout, 2 * rate])?;
         let up_w = g.weight(&format!("b{i}.up.w"), &[2 * rate * cout, cin], &transposed_taps(&up));
         let up_b = g.weight(&format!("b{i}.up.b"), &[cout], &file.expect(&format!("{p}.1.conv.bias"), &[cout])?.data);
 
         g.each8(
             &format!("b{i}.snake"),
-            "codec_snake",
+            "codec_bias_snake",
             t * cin,
-            vec![inb(cur), inf(&snake.0), inf(&snake.1), outb(tmp), i32a(cin)],
+            vec![inb(cur), inb(&in_b), inf(&snake.0), inf(&snake.1), outb(tmp), i32a(cin)],
         );
         g.gemm(&format!("b{i}.up"), "col", tmp, &up_w, t, (2 * rate * cout, cin));
         let prev = g.region(rate * cout * 2);
-        g.each(
+        g.each8(
             &format!("b{i}.col2im"),
             "codec_col2im",
             t * rate * cout,
@@ -391,89 +391,59 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
         t *= rate;
         g.need(cur, t * cout);
         g.need("x", t * cout);
+        pending = vec![0.0; cout];
         for (u, dilation) in [1, 3, 9].into_iter().enumerate() {
             let q = format!("{p}.{}", u + 2);
-            let s1 = g.snake(file, &format!("{q}.act1"), cout)?;
-            let c1 = conv_w(g, &format!("{q}.conv1.conv"), &format!("b{i}.u{u}.conv1"), [cout, cout, KERNEL])?;
-            let s2 = g.snake(file, &format!("{q}.act2"), cout)?;
-            let c2 = conv_w(g, &format!("{q}.conv2.conv"), &format!("b{i}.u{u}.conv2"), [cout, cout, 1])?;
             let label = format!("b{i}.u{u}");
-            let h = (KERNEL - 1) * dilation;
-            let ring = g.region(h * cout * 2);
-            g.need("col", t * KERNEL * cout);
+            let s1 = g.snake(file, &format!("{q}.act1"), cout)?;
+            let (c1, c1_b) = conv_w(g, &format!("{q}.conv1.conv"), &format!("{label}.conv1"), [cout, cout, KERNEL])?;
+            let c1_b = g.weight(&format!("{label}.conv1.b"), &[cout], &c1_b);
+            let s2 = g.snake(file, &format!("{q}.act2"), cout)?;
+            let (c2, c2_b) = conv_w(g, &format!("{q}.conv2.conv"), &format!("{label}.conv2"), [cout, cout, 1])?;
+            let in_b = g.weight(&format!("{label}.in_b"), &[cout], &pending);
+
+            g.conv(&label, (cur, &in_b, Some(&s1)), (&c1, tmp), t, (cout, cout), (KERNEL, dilation));
             g.each8(
-                &format!("{label}.snake1"),
-                "codec_snake",
-                t * cout,
-                vec![inb(cur), inf(&s1.0), inf(&s1.1), outb("x"), i32a(cout)],
-            );
-            g.each8(
-                &format!("{label}.im2col"),
-                "codec_im2col",
-                t * KERNEL * cout,
-                vec![
-                    inb("x"),
-                    state_in(ring),
-                    ini("pos"),
-                    ini("lines"),
-                    outb("col"),
-                    i32a(t),
-                    i32a(cout),
-                    i32a(KERNEL),
-                    i32a(dilation),
-                    i32a(h),
-                    stride(),
-                ],
-            );
-            g.ring_write(&format!("{label}.history"), "x", ring, t, cout, h);
-            g.gemm(&format!("{label}.conv1"), tmp, "col", &c1.0, t, (cout, KERNEL * cout));
-            g.each(
                 &format!("{label}.snake2"),
                 "codec_bias_snake",
                 t * cout,
-                vec![inb(tmp), inb(&c1.1), inf(&s2.0), inf(&s2.1), outb("x"), i32a(cout)],
+                vec![inb(tmp), inb(&c1_b), inf(&s2.0), inf(&s2.1), outb("x"), i32a(cout)],
             );
-            g.gemm(&format!("{label}.conv2"), tmp, "x", &c2.0, t, (cout, cout));
-            g.each(
-                &format!("{label}.residual"),
-                "codec_bias_residual",
-                t * cout,
-                vec![inb(tmp), inb(&c2.1), io(cur), i32a(cout)],
-            );
+            g.gemm_acc(&format!("{label}.conv2"), cur, "x", &c2, t, (cout, cout));
+            pending = plus(&pending, &c2_b);
         }
     }
 
     let n = cfg.upsample_rates.len() + 1;
-    let out_dim = cfg.decoder_dim >> cfg.upsample_rates.len();
     let snake_out = g.snake(file, &format!("decoder.decoder.{n}"), out_dim)?;
-    let conv_out = conv_w(g, &format!("decoder.decoder.{}.conv", n + 1), "conv_out", [1, out_dim, KERNEL])?;
-    let h = KERNEL - 1;
-    let ring = g.region(h * out_dim * 2);
+    let in_b = g.weight("conv_out.in_b", &[out_dim], &pending);
+    let (conv_out, conv_out_b) =
+        conv_w(g, &format!("decoder.decoder.{}.conv", n + 1), "conv_out", [1, out_dim, KERNEL])?;
+    let conv_out_b = g.weight("conv_out.b", &[1], &conv_out_b);
+    ensure!(t.is_multiple_of(64), "the output conv needs whole 64-row tiles, got {t} rows per frame");
+    let history = g.region(2 * (KERNEL - 1) * out_dim * 2);
     g.launch(
         "conv_out",
         "codec_conv_out",
-        [json!({"ceil_div": [per_seq(t), 8]}), json!(1), json!(1)],
-        THREADS,
+        [json!(t.div_ceil(64)), json!("seqs"), json!(1)],
+        256,
         vec![
             inb(cur),
+            inb(&in_b),
             inf(&snake_out.0),
             inf(&snake_out.1),
-            inb(&conv_out.0),
-            inb(&conv_out.1),
-            state_in(ring),
+            inb(&conv_out),
+            inb(&conv_out_b),
+            state_io(history),
             ini("pos"),
             ini("lines"),
             outb("wav"),
             i32a(t),
             i32a(out_dim),
-            i32a(KERNEL),
             stride(),
-            ("i32", json!({"expr": per_seq(t)})),
         ],
     );
-    g.ring_write("conv_out.history", cur, ring, t, out_dim, h);
     debug_assert_eq!(t, spf);
-
     g.need("res", hidden);
     Ok(())
 }

@@ -4,7 +4,7 @@
 //! [`Gen`] collects everything a generator emits. A launch's geometry lives in
 //! its op, and almost every call here has its own shape, so every kernel call
 //! is an op of its own, named by its label; every GEMM calls the one
-//! `extern:cublaslt_bf16_tn` op. Calls accumulate until [`Gen::take`] cuts them
+//! `extern:cublaslt_bf16_tn` op (`..._acc` when it accumulates). Calls accumulate until [`Gen::take`] cuts them
 //! into a segment; programs are concatenations of segments.
 //!
 //! Per-sequence state is one `seq` state; generators carve it into regions
@@ -43,7 +43,9 @@ pub struct Gen {
     pub state_bytes: u64,
     /// Per-sequence width of each `seqs`-shaped workspace: the widest thing written into it.
     pub widths: BTreeMap<String, usize>,
-    /// The module `launch` takes its kernels from.
+    /// The module `launch` takes its kernels from. The codec's kernels are
+    /// written for programmatic dependent launch (each waits on the grid
+    /// before touching what an earlier launch produced); the talker's are not.
     pub module: &'static str,
 }
 
@@ -90,7 +92,8 @@ impl Gen {
         self.ops.insert(
             label.into(),
             json!({"params": params, "impl": {"launches": [
-                {"module": self.module, "entry": entry, "block": [block, 1, 1], "grid": grid}
+                {"module": self.module, "entry": entry, "block": [block, 1, 1], "grid": grid,
+                 "pdl": self.module == "codec"}
             ]}}),
         );
         let args: Vec<Value> = args.into_iter().map(|(_, v)| v).collect();
@@ -113,6 +116,14 @@ impl Gen {
     pub fn gemm(&mut self, label: &str, y: &'static str, x: &str, w: &str, t: usize, (n, k): (usize, usize)) {
         self.need(y, t * n);
         self.gemm_rows(label, (buf(y), buf(x), buf(w)), rows_arg(t), (n, k));
+    }
+
+    /// `y[rows, n] += x[rows, k] · w[n, k]ᵀ` over `t` rows per stream.
+    pub fn gemm_acc(&mut self, label: &str, y: &'static str, x: &str, w: &str, t: usize, (n, k): (usize, usize)) {
+        self.need(y, t * n);
+        self.calls.push(json!({"label": label, "op": "gemm_acc", "args": [
+            buf(x), buf(w), buf(y), rows_arg(t), {"i32": n}, {"i32": k}
+        ]}));
     }
 
     /// `y = x · wᵀ` over `rows` rows, every operand a call argument (a buffer, maybe at an offset).
@@ -144,11 +155,12 @@ impl Gen {
         for (name, w) in &self.widths {
             self.buffers.insert(name.clone(), json!({"dtype": "bf16", "shape": ["seqs", w], "kind": "workspace"}));
         }
-        self.ops.insert(
-            "gemm".into(),
-            json!({"params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
-                   "impl": {"launches": [{"entry": "extern:cublaslt_bf16_tn"}]}}),
-        );
+        let gemm = |entry: &str, y: &str| {
+            json!({"params": ["in buffer<bf16>", "in buffer<bf16>", y, "i32", "i32", "i32"],
+                   "impl": {"launches": [{"entry": entry}]}})
+        };
+        self.ops.insert("gemm".into(), gemm("extern:cublaslt_bf16_tn", "out buffer<bf16>"));
+        self.ops.insert("gemm_acc".into(), gemm("extern:cublaslt_bf16_tn_acc", "inout buffer<bf16>"));
         s
     }
 }
