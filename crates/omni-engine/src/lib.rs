@@ -15,7 +15,7 @@
 //! request. No cancel message exists.
 //!
 //! A [`Speech`] only exists after [`EngineInfo::check`] accepted it, so an
-//! engine never re-validates the voice, the speed range or the extension keys.
+//! engine never re-validates the voice, the speed or the extension values.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -37,9 +37,32 @@ pub struct EngineInfo {
     pub model: String,
     pub sample_rate: u32,
     pub voices: BTreeSet<String>,
-    /// Keys the engine accepts inside a request's `extra` object.
-    pub extra_keys: BTreeSet<String>,
+    /// Keys the engine accepts inside a request's `extra` object, and their values.
+    pub extra: BTreeMap<String, Extra>,
+    pub speeds: std::ops::RangeInclusive<f32>,
     pub max_input_chars: usize,
+}
+
+/// The values an `extra` key accepts.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Extra {
+    Integer(std::ops::RangeInclusive<i64>),
+    OneOf(BTreeSet<String>),
+}
+
+impl Extra {
+    fn check(&self, value: &Value) -> Result<(), String> {
+        match self {
+            Self::Integer(range) => match value.as_i64() {
+                Some(x) if range.contains(&x) => Ok(()),
+                _ => Err(format!("expected an integer in {}..={}, got {value}", range.start(), range.end())),
+            },
+            Self::OneOf(names) => match value.as_str() {
+                Some(x) if names.contains(x) => Ok(()),
+                _ => Err(format!("expected one of {names:?}, got {value}")),
+            },
+        }
+    }
 }
 
 /// A request the engine can run as is.
@@ -71,8 +94,6 @@ pub struct Invalid {
     pub message: String,
 }
 
-pub const SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.25..=4.0;
-
 impl EngineInfo {
     /// Accepts a draft this engine can serve, or names the first field it cannot.
     pub fn check(&self, draft: Draft) -> Result<Speech, Invalid> {
@@ -88,11 +109,16 @@ impl EngineInfo {
             return invalid("voice", format!("unknown voice `{}`; see GET /v1/audio/voices", draft.voice));
         }
         let speed = draft.speed.unwrap_or(1.0);
-        if !SPEED_RANGE.contains(&speed) {
-            return invalid("speed", format!("{speed} is outside {}..={}", SPEED_RANGE.start(), SPEED_RANGE.end()));
+        if !self.speeds.contains(&speed) {
+            return invalid("speed", format!("{speed} is outside {}..={}", self.speeds.start(), self.speeds.end()));
         }
-        if let Some(key) = draft.extra.keys().find(|k| !self.extra_keys.contains(*k)) {
-            return invalid("extra", format!("`{key}` is not an extension of model `{}`", self.model));
+        for (key, value) in &draft.extra {
+            match self.extra.get(key) {
+                None => return invalid("extra", format!("`{key}` is not an extension of model `{}`", self.model)),
+                Some(spec) => {
+                    spec.check(value).map_err(|m| Invalid { param: "extra", message: format!("`{key}`: {m}") })?
+                }
+            }
         }
         Ok(Speech {
             id: 0,

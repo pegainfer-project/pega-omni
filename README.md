@@ -6,6 +6,10 @@
 
 <p align="center">OpenAI-compatible speech serving in Rust, from the <a href="https://github.com/pegainfer-project/pegainfer">pegainfer</a> project.</p>
 
+<p align="center">
+  <a href="docs/qwen3-tts-vs-vllm-omni.md"><img src="assets/qwen3-tts-vs-vllm-omni.png" width="800" alt="pega-omni vs vLLM-Omni: 8x faster first audio, 1.6x the throughput"></a>
+</p>
+
 ---
 
 Speech models are not text models with an audio suffix. A codec-frame TTS model
@@ -15,9 +19,9 @@ stalls**, not tokens per second. pega-omni is built around those two numbers:
 one process, one engine loop, audio handed to the HTTP layer by reference, no
 stage-to-stage IPC.
 
-Today the repository holds the serving front end, the engine contract, and a
-CPU-only simulated engine used to load-test the front end. The first GPU
-engine targets Qwen3-TTS-12Hz-1.7B.
+The repository holds the serving front end, the engine contract, a CPU-only
+simulated engine used to load-test the front end, and the first GPU engine,
+Qwen3-TTS-12Hz-1.7B-CustomVoice ([docs/qwen3-tts.md](docs/qwen3-tts.md)).
 
 ## Quick start
 
@@ -27,6 +31,17 @@ target/release/pega-omni sim --listen 127.0.0.1:8000
 
 curl -s localhost:8000/v1/audio/speech -H 'content-type: application/json' \
   -d '{"model":"pega-omni-sim","input":"Hello from pega-omni.","voice":"alloy"}' -o hello.wav
+```
+
+Qwen3-TTS needs the CUDA toolkit (13.x) to build:
+
+```bash
+cargo build --release -p omni-server --features qwen3-tts
+target/release/pega-omni qwen3-tts --model-path Qwen3-TTS-12Hz-1.7B-CustomVoice
+
+curl -s localhost:8000/v1/audio/speech -H 'content-type: application/json' \
+  -d '{"model":"Qwen3-TTS-12Hz-1.7B-CustomVoice","input":"Hello from pega-omni.","voice":"ryan",
+       "extra":{"language":"english"}}' -o hello.wav
 ```
 
 Any OpenAI client works unchanged:
@@ -59,7 +74,10 @@ differs from OpenAI, it says so instead of guessing:
   `mp3` / `opus` / `aac` / `flac` are refused by name.
 - A streaming `wav` carries `0xFFFFFFFF` in both size fields.
 - Model-specific options go in one `extra` object that the engine declares
-  (the simulator accepts `{"frames": N}`); unknown top-level fields are a `400`.
+  (the simulator accepts `{"frames": N}`, Qwen3-TTS `language` and `seed`);
+  unknown top-level fields are a `400`.
+- `stream` (not OpenAI's; vLLM clients such as `vllm bench serve` send it) is
+  accepted and changes nothing: every response streams.
 - A full engine queue is an immediate `429`, never a wait in the front end.
 
 ## Layout
@@ -69,6 +87,8 @@ differs from OpenAI, it says so instead of guessing:
 | `omni-engine` | the contract: `Speech`, `Event`, `Handle` / `Inbox`; no trait, a channel |
 | `omni-frontend` | axum routes, request parsing, wav / pcm / SSE framing, metrics |
 | `omni-sim` | the simulated engine: a pure scheduling core plus a thread shell |
+| `omni-cuda` | CUDA kernels (FlashInfer attention, fused transformer, sampling, conv) and the GPU layer |
+| `omni-qwen3-tts` | Qwen3-TTS: weights, prompt, talker + code predictor, codec decoder, engine |
 | `omni-server` | the `pega-omni` binary |
 | `omni-bench` | open-loop load generator: TTFP, E2E, RTF, playback underrun |
 

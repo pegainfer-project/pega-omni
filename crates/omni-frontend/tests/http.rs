@@ -54,6 +54,15 @@ async fn pcm_accepts_a_voice_object_and_scales_with_speed() {
 }
 
 #[tokio::test]
+async fn vllm_bench_requests_are_served() {
+    let app = app();
+    let body = json!({ "model": "sim", "input": "hello", "voice": "alloy", "stream": true, "stream_format": "audio",
+                       "response_format": "pcm", "extra": { "frames": 3 } });
+    let (status, mime, bytes) = post(&app, body).await;
+    assert_eq!((status, mime.as_deref(), bytes.len()), (StatusCode::OK, Some("audio/pcm"), 3 * 3840));
+}
+
+#[tokio::test]
 async fn sse_carries_base64_deltas_then_usage() {
     let app = app();
     let body = json!({ "model": "sim", "input": "hello", "voice": "alloy", "response_format": "pcm",

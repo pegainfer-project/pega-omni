@@ -4,6 +4,8 @@ The SDK is the executable form of OpenAI's API reference: if its stock calls
 work unchanged against the server, a client written for OpenAI works too.
 
     uv run --with openai tools/openai_sdk_check.py --base-url http://127.0.0.1:8000/v1 --model pega-omni-sim
+
+Any engine: voices come from `GET /v1/audio/voices`, `--extra` is passed through.
 """
 
 import argparse
@@ -18,28 +20,30 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     ap.add_argument("--model", default="pega-omni-sim")
+    ap.add_argument("--extra", type=json.loads, default={}, help="the request's `extra` object, as JSON")
     args = ap.parse_args()
     client = openai.OpenAI(base_url=args.base_url, api_key="unused")
-    frames = {"extra": {"frames": 10}}
-    frame_bytes = 1920 * 2
+    voice = client.get("/audio/voices", cast_to=object)["voices"][0]
+    extra = {"extra": args.extra}
 
-    wav = client.audio.speech.create(model=args.model, voice="alloy", input="Hello from the SDK.", extra_body=frames)
+    wav = client.audio.speech.create(model=args.model, voice=voice, input="Hello from the SDK.", extra_body=extra)
     data = wav.read()
     riff, _, wave = struct.unpack("<4sI4s", data[:12])
-    assert (riff, wave, len(data)) == (b"RIFF", b"WAVE", 44 + 10 * frame_bytes), (riff, wave, len(data))
+    assert (riff, wave) == (b"RIFF", b"WAVE") and len(data) > 44, (riff, wave, len(data))
 
     with client.audio.speech.with_streaming_response.create(
-        model=args.model, voice="nova", input="Streaming.", response_format="pcm", extra_body=frames
+        model=args.model, voice=voice, input="Streaming.", response_format="pcm", extra_body=extra
     ) as resp:
-        chunks = [c for c in resp.iter_bytes() if c]
-    assert sum(map(len, chunks)) == 10 * frame_bytes, sum(map(len, chunks))
+        pcm = sum(len(c) for c in resp.iter_bytes())
+    assert pcm > 0 and pcm % 2 == 0, pcm
 
     with client.audio.speech.with_streaming_response.create(
-        model=args.model, voice="coral", input="Events.", response_format="pcm", stream_format="sse", extra_body=frames
+        model=args.model, voice=voice, input="Events.", response_format="pcm", stream_format="sse", extra_body=extra
     ) as resp:
         events = [json.loads(line[6:]) for line in resp.iter_lines() if line.startswith("data: ")]
     audio = sum(len(base64.b64decode(e["audio"])) for e in events if e["type"] == "speech.audio.delta")
-    assert (audio, events[-1]["type"], events[-1]["usage"]["output_tokens"]) == (10 * frame_bytes, "speech.audio.done", 10)
+    done = events[-1]
+    assert audio > 0 and done["type"] == "speech.audio.done" and done["usage"]["output_tokens"] > 0, (audio, done)
 
     try:
         client.audio.speech.create(model=args.model, voice="nobody", input="x")

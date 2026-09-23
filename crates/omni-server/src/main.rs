@@ -21,6 +21,9 @@ struct Cli {
 enum Command {
     /// Serve the CPU-only simulated engine.
     Sim(SimArgs),
+    /// Serve Qwen3-TTS (12Hz CustomVoice) on one GPU.
+    #[cfg(feature = "qwen3-tts")]
+    Qwen3Tts(Qwen3TtsArgs),
 }
 
 #[derive(Args)]
@@ -73,6 +76,63 @@ struct SimArgs {
     prefill_per_char_us: u64,
 }
 
+#[cfg(feature = "qwen3-tts")]
+#[derive(Args)]
+struct Qwen3TtsArgs {
+    #[command(flatten)]
+    serve: Serve,
+    /// Checkpoint directory (config.json, model.safetensors, speech_tokenizer/).
+    #[arg(long)]
+    model_path: std::path::PathBuf,
+    /// The model name clients send; defaults to the checkpoint directory's name.
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    device: usize,
+    #[arg(long, default_value_t = 64)]
+    max_batch: usize,
+    /// Talker tokens per step, prompts included.
+    #[arg(long, default_value_t = 8192)]
+    max_step_tokens: usize,
+    /// Talker KV cache size.
+    #[arg(long, default_value_t = 16.0)]
+    kv_gib: f64,
+    #[arg(long, default_value_t = 2)]
+    first_chunk_frames: usize,
+    #[arg(long, default_value_t = 8)]
+    chunk_frames: usize,
+    /// Frames of left context each audio chunk is decoded with.
+    #[arg(long, default_value_t = 72)]
+    context_frames: usize,
+    #[arg(long, default_value_t = 4096)]
+    max_input_chars: usize,
+}
+
+#[cfg(feature = "qwen3-tts")]
+impl Qwen3TtsArgs {
+    fn start(&self) -> anyhow::Result<(omni_engine::Handle, std::thread::JoinHandle<()>, String)> {
+        use omni_qwen3_tts::engine;
+        let opts = engine::Options {
+            max_batch: self.max_batch,
+            max_step_tokens: self.max_step_tokens,
+            kv_gib: self.kv_gib,
+            first_chunk_frames: self.first_chunk_frames,
+            chunk_frames: self.chunk_frames,
+            context_frames: self.context_frames,
+            ..engine::Options::default()
+        };
+        let name = self.model.clone().unwrap_or_else(|| {
+            self.model_path.file_name().map_or("qwen3-tts".into(), |n| n.to_string_lossy().into_owned())
+        });
+        let gpu = omni_cuda::Gpu::new(self.device)?;
+        gpu.bind()?;
+        let model = engine::Model::load(&gpu, &self.model_path, &opts)
+            .with_context(|| format!("load {}", self.model_path.display()))?;
+        let (handle, inbox) = omni_engine::channel(model.info(&name, self.max_input_chars), self.serve.queue);
+        Ok((handle, engine::spawn(inbox, engine::Engine::new(gpu, model, opts)), name))
+    }
+}
+
 impl SimArgs {
     fn profile(&self) -> anyhow::Result<Profile> {
         Profile {
@@ -94,12 +154,19 @@ impl SimArgs {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
-    let Command::Sim(args) = Cli::parse().command;
-    let profile = args.profile()?;
-    let (handle, inbox) = omni_engine::channel(profile.info(&args.model), args.serve.queue);
-    let engine = omni_sim::spawn(inbox, profile);
-
-    let serve = &args.serve;
+    let (serve, (handle, engine, model)) = match Cli::parse().command {
+        Command::Sim(args) => {
+            let profile = args.profile()?;
+            let (handle, inbox) = omni_engine::channel(profile.info(&args.model), args.serve.queue);
+            (args.serve, (handle, omni_sim::spawn(inbox, profile), args.model))
+        }
+        #[cfg(feature = "qwen3-tts")]
+        Command::Qwen3Tts(args) => {
+            let started = args.start()?;
+            (args.serve, started)
+        }
+    };
+    let serve = &serve;
     #[cfg(feature = "cpu-profile")]
     let sampler = serve
         .cpu_profile
@@ -120,7 +187,7 @@ fn main() -> anyhow::Result<()> {
         let app = omni_frontend::router(handle, prometheus);
         let listener =
             tokio::net::TcpListener::bind(serve.listen).await.with_context(|| format!("bind {}", serve.listen))?;
-        tracing::info!("serving `{}` on http://{}", args.model, serve.listen);
+        tracing::info!("serving `{model}` on http://{}", serve.listen);
         omni_frontend::serve(listener, app, shutdown()).await?;
         anyhow::Ok(())
     })?;

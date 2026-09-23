@@ -55,6 +55,11 @@ struct Body {
     speed: Option<f32>,
     #[serde(default)]
     stream_format: Option<String>,
+    /// Not OpenAI's: vLLM's speech clients (`vllm bench serve`) always send it.
+    /// Every response streams, and a streamed body read whole is the same audio,
+    /// so either value is accepted.
+    #[serde(default, rename = "stream")]
+    _stream: Option<bool>,
     #[serde(default)]
     extra: BTreeMap<String, Value>,
 }
