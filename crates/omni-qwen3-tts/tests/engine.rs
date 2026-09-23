@@ -1,6 +1,5 @@
 use omni_qwen3_tts::engine::chunk_due;
 use omni_qwen3_tts::engine::frame_cap;
-use omni_qwen3_tts::engine::pages_for;
 use proptest::prelude::*;
 
 /// Chunks a request emits as its frames arrive one per step, then as it finishes.
@@ -36,11 +35,5 @@ proptest! {
     #[test]
     fn frame_cap_respects_the_model(chars in 0usize..10_000, max in 1usize..10_000) {
         prop_assert!(frame_cap(chars, max) <= max);
-    }
-
-    #[test]
-    fn pages_cover_the_tokens(tokens in 0usize..100_000, page in 1usize..64) {
-        let p = pages_for(tokens, page);
-        prop_assert!(p * page >= tokens && p * page < tokens + page);
     }
 }

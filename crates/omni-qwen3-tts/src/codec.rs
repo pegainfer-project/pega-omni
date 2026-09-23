@@ -1,5 +1,5 @@
 //! The codec decoder, streamed: every call turns one new frame of each of up
-//! to `max_seqs` streams into 1920 samples, with nothing recomputed.
+//! to `seqs` streams into 1920 samples, with nothing recomputed.
 //!
 //! RVQ lookup → causal conv → sliding-window transformer → two ×2 upsamplers
 //! (transposed conv + ConvNeXt) → four SnakeBeta/transposed-conv blocks
@@ -7,37 +7,34 @@
 //! Every layer is causal, so what a frame needs from the past is small and
 //! fixed: each conv's last `(k - 1) · dilation` input rows, each overlapping
 //! transposed conv's last GEMM row, each attention layer's last 72 frames of K
-//! and V. A [`Stream`] owns a slot of kern per-sequence state holding exactly
-//! that, and a call reads and advances it (`kernels/codec.cu` has the layout).
-//! The output is the whole-utterance decode's, frame by frame.
+//! and V. A sequence's slot of the per-sequence state holds exactly that, and a
+//! call reads and advances it (`kernels/codec.cu` has the layout). The output
+//! is the whole-utterance decode's, frame by frame.
 //!
-//! The decoder is a kern manifest this module generates from the checkpoint's
-//! config: one `decode` program over a `seqs` var, captured as a CUDA graph per
-//! batch bucket, executed by `kern-runtime` on its own stream. Activations are
-//! `[rows, C]`; every dense conv is `im2col` and a GEMM, every transposed conv
-//! a GEMM and an overlap-add. Weight layout transforms and scale folding happen
-//! on the host at load (LayerScale into the projections it scales, ConvNeXt's
-//! gamma into its last linear), then reach kern as named tensors.
+//! [`build`] emits the decoder's calls from the checkpoint's config, the tail
+//! of the model's `first` and `decode` programs. Activations are `[rows, C]`;
+//! every dense conv is `im2col` and a GEMM, every transposed conv a GEMM and an
+//! overlap-add. Weight layout transforms and scale folding happen on the host
+//! at load (LayerScale into the projections it scales, ConvNeXt's gamma into
+//! its last linear), then reach kern as named tensors.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-
-use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
-use half::bf16;
-use kern_manifest::types::DType;
-use kern_pool::Lease;
-use kern_runtime::Blob;
-use kern_runtime::Capacity;
-use kern_runtime::Runtime;
-use kern_runtime::Tensor;
-use kern_runtime::Tensors;
-use serde_json::Value;
 use serde_json::json;
-use sha2::Digest;
 
 use crate::config;
+use crate::manifest::Gen;
+use crate::manifest::THREADS;
+use crate::manifest::i32a;
+use crate::manifest::inb;
+use crate::manifest::inf;
+use crate::manifest::ini;
+use crate::manifest::io;
+use crate::manifest::outb;
+use crate::manifest::per_seq;
+use crate::manifest::state_in;
+use crate::manifest::state_io;
+use crate::manifest::stride;
 use crate::weights::File;
 use crate::weights::Host;
 use crate::weights::concat_rows;
@@ -47,172 +44,8 @@ use crate::weights::transposed_taps;
 
 const GROUPS: usize = 16;
 const KERNEL: usize = 7;
-const CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/codec.cubin"));
-/// Batch sizes a graph is captured at; a call pads up to the next one.
-const BUCKETS: [usize; 12] = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128];
-
-/// One stream's decoder state; dropping it frees the slot.
-pub struct Stream {
-    lease: Lease,
-    frames: usize,
-}
-
-pub struct Codec {
-    rt: Runtime,
-    max_seqs: usize,
-    samples_per_frame: usize,
-    /// The slot padding rows decode into.
-    pad: Lease,
-}
-
-impl Codec {
-    /// Loads `speech_tokenizer/model.safetensors` onto `gpu` for up to `max_seqs` streams.
-    pub fn load(
-        gpu: usize,
-        file: &File,
-        cfg: &config::Codec,
-        samples_per_frame: usize,
-        max_seqs: usize,
-    ) -> Result<Self> {
-        let max_seqs = BUCKETS.iter().copied().find(|&b| b >= max_seqs).unwrap_or(max_seqs);
-        let sha = hex(&sha2::Sha256::digest(CUBIN));
-        let (manifest, tensors) = generate(file, cfg, samples_per_frame, max_seqs, &sha)?;
-        let verified = kern_manifest::verify(kern_manifest::Manifest::from_json(&manifest.to_string())?)
-            .map_err(|e| anyhow::anyhow!("codec manifest: {e}"))?;
-        let dir = kernels_dir(&sha)?;
-        let capacity = Capacity { tokens: Some(1), seqs: max_seqs as u64 + 1 };
-        let mut rt = Runtime::load(&verified, Some(&dir), gpu, Some(capacity), None)?;
-        rt.load_weights(&tensors)?;
-        let pad = rt.lease_slot()?;
-        Ok(Self { rt, max_seqs, samples_per_frame, pad })
-    }
-
-    /// A fresh stream: the utterance starts at its next frame.
-    pub fn open(&mut self) -> Result<Stream> {
-        Ok(Stream { lease: self.rt.lease_slot()?, frames: 0 })
-    }
-
-    /// Decodes the next frame of each stream: `samples_per_frame` samples in
-    /// [-1, 1] per stream, concatenated in order.
-    pub fn decode(&mut self, frames: &mut [(&mut Stream, [i32; GROUPS])]) -> Result<Vec<f32>> {
-        let n = frames.len();
-        if n == 0 {
-            return Ok(vec![]);
-        }
-        ensure!(n <= self.max_seqs, "{n} streams exceed the decoder's {}", self.max_seqs);
-        let seqs = BUCKETS.iter().copied().find(|&b| b >= n).unwrap_or(self.max_seqs);
-        let pad_line = self.pad.seq_line("lines", 0)?;
-        let mut codes = Vec::with_capacity(seqs * GROUPS);
-        let mut pos = Vec::with_capacity(seqs);
-        let mut lines = Vec::with_capacity(seqs);
-        for (s, c) in frames.iter_mut() {
-            codes.extend_from_slice(c);
-            pos.push(s.frames as i32);
-            lines.push(s.lease.seq_line("lines", 0)?);
-            s.frames += 1;
-        }
-        codes.resize(seqs * GROUPS, 0);
-        pos.resize(seqs, 0);
-        lines.resize(seqs, pad_line);
-        let vars = BTreeMap::from([("seqs".to_string(), seqs as u64)]);
-        self.rt.write_input_at("codes", bytes_of(&codes), &vars)?;
-        self.rt.write_input_at("pos", bytes_of(&pos), &vars)?;
-        self.rt.write_input_at("lines", bytes_of(&lines), &vars)?;
-        self.rt.issue("decode", &vars)?;
-        let wav = self.rt.read_output("wav")?;
-        Ok(wav[..n * self.samples_per_frame * 2]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&b| bf16::from_le_bytes(b).to_f32())
-            .collect())
-    }
-}
-
-fn bytes_of(v: &[i32]) -> &[u8] {
-    // SAFETY: i32 has no padding and u8 no alignment requirement.
-    unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), std::mem::size_of_val(v)) }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Where kern finds the cubin: a directory holding it under its hash.
-fn kernels_dir(sha: &str) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join("pega-omni-kernels");
-    let path = dir.join(format!("codec-{}.cubin", &sha[..12]));
-    if !path.exists() {
-        std::fs::create_dir_all(&dir)?;
-        let tmp = dir.join(format!(".codec-{}.{}", &sha[..12], std::process::id()));
-        std::fs::write(&tmp, CUBIN)?;
-        std::fs::rename(&tmp, &path).with_context(|| format!("placing {}", path.display()))?;
-    }
-    Ok(dir)
-}
-
-/// The decoder's weights after the load-time transforms, by buffer name.
-struct HostTensors(BTreeMap<String, (DType, Vec<u64>, Vec<u8>)>);
-
-impl Tensors for HostTensors {
-    fn find(&self, name: &str) -> kern_runtime::Result<Tensor<'_>> {
-        let (dtype, shape, data) =
-            self.0.get(name).ok_or_else(|| kern_runtime::Error::WeightArtifact(format!("no tensor `{name}`")))?;
-        Ok(Tensor { dtype: *dtype, shape: shape.clone(), data: Blob::Host(data) })
-    }
-}
-
-/// The manifest under construction: one op per call, since a launch's
-/// geometry lives in its op and every call here has its own shape.
-struct Gen {
-    buffers: serde_json::Map<String, Value>,
-    ops: serde_json::Map<String, Value>,
-    calls: Vec<Value>,
-    tensors: BTreeMap<String, (DType, Vec<u64>, Vec<u8>)>,
-    state_bytes: u64,
-    /// Per-stream width of each workspace: the widest thing written into it.
-    widths: BTreeMap<&'static str, usize>,
-}
-
-const THREADS: u32 = 256;
-
-/// `seqs · n`, as a var expression.
-fn per_seq(n: usize) -> Value {
-    if n == 1 { json!("seqs") } else { json!({"mul": ["seqs", n]}) }
-}
-
-fn rows_arg(n: usize) -> Value {
-    if n == 1 { json!({"var": "seqs"}) } else { json!({"expr": {"mul": ["seqs", n]}}) }
-}
-
-fn blocks(n: usize) -> Value {
-    json!({"ceil_div": [per_seq(n), THREADS]})
-}
-
-fn i32a(v: usize) -> (&'static str, Value) {
-    ("i32", json!({"i32": v as i32}))
-}
 
 impl Gen {
-    fn weight(&mut self, name: &str, shape: &[usize], data: &[f32]) -> String {
-        debug_assert_eq!(shape.iter().product::<usize>(), data.len(), "{name}");
-        let bytes = data.iter().flat_map(|&x| bf16::from_f32(x).to_le_bytes()).collect();
-        self.add_weight(name, DType::Bf16, shape, bytes)
-    }
-
-    fn weight_f32(&mut self, name: &str, data: Vec<f32>) -> String {
-        let bytes = data.iter().flat_map(|x| x.to_le_bytes()).collect();
-        self.add_weight(name, DType::F32, &[data.len()], bytes)
-    }
-
-    fn add_weight(&mut self, name: &str, dtype: DType, shape: &[usize], bytes: Vec<u8>) -> String {
-        let dt = if dtype == DType::F32 { "f32" } else { "bf16" };
-        self.buffers
-            .insert(name.into(), json!({"dtype": dt, "shape": shape, "kind": "weight", "bind": [{"tensor": name}]}));
-        self.tensors.insert(name.into(), (dtype, shape.iter().map(|&d| d as u64).collect(), bytes));
-        name.into()
-    }
-
     fn snake(&mut self, file: &File, prefix: &str, c: usize) -> Result<(String, String)> {
         let alpha = file.expect(&format!("{prefix}.alpha"), &[c])?;
         let beta = file.expect(&format!("{prefix}.beta"), &[c])?;
@@ -220,51 +53,6 @@ impl Gen {
             self.weight_f32(&format!("{prefix}.a"), alpha.data.iter().map(|x| x.exp()).collect()),
             self.weight_f32(&format!("{prefix}.inv_b"), beta.data.iter().map(|x| 1.0 / (x.exp() + 1e-9)).collect()),
         ))
-    }
-
-    /// A per-stream state region of `bytes`, 256-aligned; returns its offset.
-    fn region(&mut self, bytes: usize) -> u64 {
-        let at = self.state_bytes;
-        self.state_bytes += (bytes as u64).div_ceil(256) * 256;
-        at
-    }
-
-    /// One kernel launch as its own op, `args` typed by param.
-    fn launch(&mut self, label: &str, entry: &str, grid: [Value; 3], block: u32, args: Vec<(&str, Value)>) {
-        let params: Vec<&str> = args.iter().map(|(t, _)| *t).collect();
-        self.ops.insert(
-            label.into(),
-            json!({"params": params, "impl": {"launches": [
-                {"module": "codec", "entry": entry, "block": [block, 1, 1], "grid": grid}
-            ]}}),
-        );
-        let args: Vec<Value> = args.into_iter().map(|(_, v)| v).collect();
-        self.calls.push(json!({"label": label, "op": label, "args": args}));
-    }
-
-    /// Elementwise over `n` values per stream.
-    fn each(&mut self, label: &str, entry: &str, n: usize, mut args: Vec<(&str, Value)>) {
-        args.push(("i32", json!({"expr": per_seq(n)})));
-        self.launch(label, entry, [blocks(n), json!(1), json!(1)], THREADS, args);
-    }
-
-    /// Elementwise over `n` values per stream, eight (16 bytes) per thread.
-    fn each8(&mut self, label: &str, entry: &str, n: usize, args: Vec<(&str, Value)>) {
-        assert_eq!(n % 8, 0, "{label}: {n} values do not split into 16-byte groups");
-        self.each(label, entry, n / 8, args);
-    }
-
-    /// `y[rows, n] = x[rows, k] · w[n, k]ᵀ` over `t` rows per stream.
-    fn gemm(&mut self, label: &str, y: &'static str, x: &str, w: &str, t: usize, (n, k): (usize, usize)) {
-        self.need(y, t * n);
-        self.calls.push(json!({"label": label, "op": "gemm", "args": [
-            {"buf": x}, {"buf": w}, {"buf": y}, rows_arg(t), {"i32": n}, {"i32": k}
-        ]}));
-    }
-
-    fn need(&mut self, workspace: &'static str, width: usize) {
-        let w = self.widths.entry(workspace).or_default();
-        *w = (*w).max(width);
     }
 
     fn bias(&mut self, label: &str, x: &str, b: &str, t: usize, c: usize) {
@@ -319,43 +107,9 @@ impl Gen {
     }
 }
 
-fn inb(name: &str) -> (&'static str, Value) {
-    ("in buffer<bf16>", json!({"buf": name}))
-}
-
-fn ini(name: &str) -> (&'static str, Value) {
-    ("in buffer<i32>", json!({"buf": name}))
-}
-
-fn inf(name: &str) -> (&'static str, Value) {
-    ("in buffer<f32>", json!({"buf": name}))
-}
-
-fn io(name: &str) -> (&'static str, Value) {
-    ("inout buffer<bf16>", json!({"buf": name}))
-}
-
-fn outb(name: &str) -> (&'static str, Value) {
-    ("out buffer<bf16>", json!({"buf": name}))
-}
-
-fn state_in(offset: u64) -> (&'static str, Value) {
-    ("in state", json!({"state": "codec", "offset": offset}))
-}
-
-fn state_io(offset: u64) -> (&'static str, Value) {
-    ("inout state", json!({"state": "codec", "offset": offset}))
-}
-
-/// Placeholder for the per-stream state size, patched once every region exists.
-const STRIDE: i64 = -1;
-
-fn stride() -> (&'static str, Value) {
-    ("i64", json!({"i64": STRIDE}))
-}
-
-/// The manifest (JSON) and the tensors its weight buffers bind.
-fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: &str) -> Result<(Value, HostTensors)> {
+/// Emits the decoder's calls into `g`: `codes` [seqs, 16] in, `wav` [seqs, spf]
+/// out, each sequence at frame `pos` of the stream its `lines` slot holds.
+pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Result<()> {
     let (dim, cb, latent, hidden) = (cfg.codebook_dim, cfg.codebook_size, cfg.latent_dim, cfg.hidden_size);
     let half = dim / 2;
     ensure!(cfg.num_quantizers == GROUPS, "{} quantizers, the decoder is built for {GROUPS}", cfg.num_quantizers);
@@ -365,14 +119,7 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
         cfg.upsampling_ratios.iter().chain(&cfg.upsample_rates).product::<usize>() == spf,
         "the upsampling rates do not multiply to {spf} samples per frame"
     );
-    let mut g = Gen {
-        buffers: serde_json::Map::new(),
-        ops: serde_json::Map::new(),
-        calls: vec![],
-        tensors: BTreeMap::new(),
-        state_bytes: 0,
-        widths: BTreeMap::new(),
-    };
+    g.module = "codec";
 
     // RVQ: [first | Σ rest] → one projection.
     let codebook = |p: &str| -> Result<Vec<f32>> {
@@ -415,7 +162,7 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
             g.weight(&format!("{name}.b"), &[shape[0]], &b.data),
         ))
     };
-    let pre = conv_w(&mut g, "decoder.pre_conv.conv", "pre_conv", [latent, dim, 3])?;
+    let pre = conv_w(g, "decoder.pre_conv.conv", "pre_conv", [latent, dim, 3])?;
     g.conv("pre_conv", ("a", "b"), &pre, 1, (dim, latent), 3);
 
     // Transformer over the frames, residual stream in `res`.
@@ -426,7 +173,7 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
             g.weight(&format!("{name}.b"), &shape[..1], &file.expect(&format!("{p}.bias"), &shape[..1])?.data),
         ))
     };
-    let input_proj = linear(&mut g, &format!("{pt}.input_proj"), "input_proj", [hidden, latent])?;
+    let input_proj = linear(g, &format!("{pt}.input_proj"), "input_proj", [hidden, latent])?;
     g.gemm("input_proj", "res", "b", &input_proj.0, 1, (hidden, latent));
     g.bias("input_proj.bias", "res", &input_proj.1, 1, hidden);
     let (heads, hd, inter) = (cfg.num_attention_heads, cfg.head_dim, cfg.intermediate_size);
@@ -434,7 +181,7 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
     let norm_w = |g: &mut Gen, name: &str, src: &str| -> Result<String> {
         Ok(g.weight(name, &[hidden], &file.expect(src, &[hidden])?.data))
     };
-    let ln = norm_w(&mut g, "l0.ln1", &format!("{pt}.layers.0.input_layernorm.weight"))?;
+    let ln = norm_w(g, "l0.ln1", &format!("{pt}.layers.0.input_layernorm.weight"))?;
     let eps = cfg.rms_norm_eps;
     g.launch(
         "l0.norm",
@@ -460,7 +207,7 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
             &[hidden, qd],
             &scale_rows(&w("self_attn.o_proj.weight", &[hidden, qd])?.data, &attn_scale.data),
         );
-        let ln2 = norm_w(&mut g, &format!("l{i}.ln2"), &format!("{pt}.layers.{i}.post_attention_layernorm.weight"))?;
+        let ln2 = norm_w(g, &format!("l{i}.ln2"), &format!("{pt}.layers.{i}.post_attention_layernorm.weight"))?;
         let gate_up =
             concat_rows(&[w("mlp.gate_proj.weight", &[inter, hidden])?, w("mlp.up_proj.weight", &[inter, hidden])?]);
         let gate_up = g.weight(&format!("l{i}.gate_up"), &[2 * inter, hidden], &gate_up);
@@ -470,9 +217,9 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
             &scale_rows(&w("mlp.down_proj.weight", &[hidden, inter])?.data, &mlp_scale.data),
         );
         let next = if i + 1 < cfg.num_hidden_layers {
-            norm_w(&mut g, &format!("l{}.ln1", i + 1), &format!("{pt}.layers.{}.input_layernorm.weight", i + 1))?
+            norm_w(g, &format!("l{}.ln1", i + 1), &format!("{pt}.layers.{}.input_layernorm.weight", i + 1))?
         } else {
-            norm_w(&mut g, "norm", &format!("{pt}.norm.weight"))?
+            norm_w(g, "norm", &format!("{pt}.norm.weight"))?
         };
 
         let kv = g.region(2 * 72 * qd * 2);
@@ -518,7 +265,7 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
             vec![io("x"), io("res"), inb(&next), i32a(hidden), ("f32", json!({"f32": eps}))],
         );
     }
-    let output_proj = linear(&mut g, &format!("{pt}.output_proj"), "output_proj", [latent, hidden])?;
+    let output_proj = linear(g, &format!("{pt}.output_proj"), "output_proj", [latent, hidden])?;
     g.gemm("output_proj", "a", "x", &output_proj.0, 1, (latent, hidden));
     g.bias("output_proj.bias", "a", &output_proj.1, 1, latent);
 
@@ -545,7 +292,7 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
             g.weight(&format!("up{i}.ln.w"), &[latent], &file.expect(&format!("{p}.1.norm.weight"), &[latent])?.data);
         let ln_b =
             g.weight(&format!("up{i}.ln.b"), &[latent], &file.expect(&format!("{p}.1.norm.bias"), &[latent])?.data);
-        let pw1 = linear(&mut g, &format!("{p}.1.pwconv1"), &format!("up{i}.pw1"), [4 * latent, latent])?;
+        let pw1 = linear(g, &format!("{p}.1.pwconv1"), &format!("up{i}.pw1"), [4 * latent, latent])?;
         let gamma = file.expect(&format!("{p}.1.gamma"), &[latent])?;
         let pw2: Host = file.expect(&format!("{p}.1.pwconv2.weight"), &[latent, 4 * latent])?;
         let pw2_b = file.expect(&format!("{p}.1.pwconv2.bias"), &[latent])?;
@@ -604,7 +351,7 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
         (cur, tmp) = (tmp, cur);
     }
 
-    let conv_in = conv_w(&mut g, "decoder.decoder.0.conv", "conv_in", [cfg.decoder_dim, latent, KERNEL])?;
+    let conv_in = conv_w(g, "decoder.decoder.0.conv", "conv_in", [cfg.decoder_dim, latent, KERNEL])?;
     g.conv("conv_in", (cur, tmp), &conv_in, t, (latent, cfg.decoder_dim), KERNEL);
     (cur, tmp) = (tmp, cur);
 
@@ -647,9 +394,9 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
         for (u, dilation) in [1, 3, 9].into_iter().enumerate() {
             let q = format!("{p}.{}", u + 2);
             let s1 = g.snake(file, &format!("{q}.act1"), cout)?;
-            let c1 = conv_w(&mut g, &format!("{q}.conv1.conv"), &format!("b{i}.u{u}.conv1"), [cout, cout, KERNEL])?;
+            let c1 = conv_w(g, &format!("{q}.conv1.conv"), &format!("b{i}.u{u}.conv1"), [cout, cout, KERNEL])?;
             let s2 = g.snake(file, &format!("{q}.act2"), cout)?;
-            let c2 = conv_w(&mut g, &format!("{q}.conv2.conv"), &format!("b{i}.u{u}.conv2"), [cout, cout, 1])?;
+            let c2 = conv_w(g, &format!("{q}.conv2.conv"), &format!("b{i}.u{u}.conv2"), [cout, cout, 1])?;
             let label = format!("b{i}.u{u}");
             let h = (KERNEL - 1) * dilation;
             let ring = g.region(h * cout * 2);
@@ -699,7 +446,7 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
     let n = cfg.upsample_rates.len() + 1;
     let out_dim = cfg.decoder_dim >> cfg.upsample_rates.len();
     let snake_out = g.snake(file, &format!("decoder.decoder.{n}"), out_dim)?;
-    let conv_out = conv_w(&mut g, &format!("decoder.decoder.{}.conv", n + 1), "conv_out", [1, out_dim, KERNEL])?;
+    let conv_out = conv_w(g, &format!("decoder.decoder.{}.conv", n + 1), "conv_out", [1, out_dim, KERNEL])?;
     let h = KERNEL - 1;
     let ring = g.region(h * out_dim * 2);
     g.launch(
@@ -727,51 +474,6 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
     g.ring_write("conv_out.history", cur, ring, t, out_dim, h);
     debug_assert_eq!(t, spf);
 
-    let s = g.state_bytes;
-    let calls: Vec<Value> = g
-        .calls
-        .into_iter()
-        .map(|mut c| {
-            for a in c["args"].as_array_mut().into_iter().flatten() {
-                if a == &json!({"i64": STRIDE}) {
-                    *a = json!({"i64": s});
-                }
-            }
-            c
-        })
-        .collect();
-    let widths = g.widths;
-    let mut buffers = g.buffers;
-    let work = |w: usize| json!({"dtype": "bf16", "shape": ["seqs", w], "kind": "workspace"});
-    buffers.insert(
-        "codes".into(),
-        json!({"dtype": "i32", "shape": ["seqs", GROUPS], "kind": "input", "domain": {"min": 0, "max": cb - 1}}),
-    );
-    buffers.insert("pos".into(), json!({"dtype": "i32", "shape": ["seqs"], "kind": "input", "domain": {"min": 0}}));
-    buffers.insert(
-        "lines".into(),
-        json!({"dtype": "i32", "shape": [1, "seqs"], "kind": "input", "domain": {"index_into": "codec", "stride": s}}),
-    );
-    buffers.insert("wav".into(), json!({"dtype": "bf16", "shape": ["seqs", spf], "kind": "output"}));
-    buffers.insert("res".into(), work(hidden));
-    for (name, w) in widths {
-        buffers.insert(name.into(), work(w));
-    }
-    let mut ops = g.ops;
-    ops.insert(
-        "gemm".into(),
-        json!({"params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
-               "impl": {"launches": [{"entry": "extern:cublaslt_bf16_tn"}]}}),
-    );
-    let manifest = json!({
-        "schema_version": 5,
-        "model": "qwen3-tts-12hz-codec",
-        "vars": {"seqs": {"max": max_seqs}},
-        "states": {"codec": {"bytes_per_seq": s}},
-        "buffers": buffers,
-        "modules": {"codec": {"source": format!("codec-{}.cubin", &sha[..12]), "sha256": sha}},
-        "ops": ops,
-        "programs": {"decode": {"batch": {"groups": max_seqs, "rows": 1}, "graph": true, "calls": calls}},
-    });
-    Ok((manifest, HostTensors(g.tensors)))
+    g.need("res", hidden);
+    Ok(())
 }

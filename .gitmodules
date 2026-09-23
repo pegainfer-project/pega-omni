@@ -1,3 +1,0 @@
-[submodule "crates/omni-cuda/third_party/flashinfer"]
-	path = crates/omni-cuda/third_party/flashinfer
-	url = https://github.com/flashinfer-ai/flashinfer

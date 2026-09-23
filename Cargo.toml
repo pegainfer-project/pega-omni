@@ -6,7 +6,6 @@ members = [
     "crates/omni-frontend",
     "crates/omni-server",
     "crates/omni-bench",
-    "crates/omni-cuda",
     "crates/omni-qwen3-tts",
 ]
 # A plain `cargo build` needs no CUDA toolkit; `--workspace` builds the GPU crates too.
@@ -28,7 +27,6 @@ repository = "https://github.com/pegainfer-project/pega-omni"
 omni-engine = { path = "crates/omni-engine" }
 omni-sim = { path = "crates/omni-sim" }
 omni-frontend = { path = "crates/omni-frontend" }
-omni-cuda = { path = "crates/omni-cuda" }
 omni-qwen3-tts = { path = "crates/omni-qwen3-tts" }
 
 anyhow = "1"
@@ -37,12 +35,11 @@ base64 = "0.22"
 bytes = "1"
 cc = "1"
 clap = { version = "4", features = ["derive"] }
-cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "cublas", "f16", "dynamic-loading", "cuda-13000"] }
 futures-util = "0.3"
 half = "2"
-# The codec decoder runs as a kern manifest: kern-manifest is its schema and
-# verifier, kern-runtime executes it (graphs per batch bucket, per-stream state
-# slots from kern-pool).
+# The model runs as a kern manifest: kern-manifest is its schema and verifier,
+# kern-runtime executes it (graphs per batch bucket, paged KV and per-sequence
+# state slots from kern-pool).
 kern-manifest = { git = "https://github.com/pegainfer-project/kern", rev = "78c73047bb4f8981ff6aa8fc44ccaf1dab43a3a9" }
 kern-pool = { git = "https://github.com/pegainfer-project/kern", rev = "78c73047bb4f8981ff6aa8fc44ccaf1dab43a3a9" }
 kern-runtime = { git = "https://github.com/pegainfer-project/kern", rev = "78c73047bb4f8981ff6aa8fc44ccaf1dab43a3a9" }

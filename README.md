@@ -87,8 +87,7 @@ differs from OpenAI, it says so instead of guessing:
 | `omni-engine` | the contract: `Speech`, `Event`, `Handle` / `Inbox`; no trait, a channel |
 | `omni-frontend` | axum routes, request parsing, wav / pcm / SSE framing, metrics |
 | `omni-sim` | the simulated engine: a pure scheduling core plus a thread shell |
-| `omni-cuda` | CUDA kernels (FlashInfer attention, fused transformer, sampling) and the GPU layer |
-| `omni-qwen3-tts` | Qwen3-TTS: weights, prompt, talker + code predictor, streaming codec decoder (a kern manifest), engine |
+| `omni-qwen3-tts` | Qwen3-TTS as one kern manifest (talker, code predictor, sampler, streaming codec decoder, own CUDA kernels), prompt, engine |
 | `omni-server` | the `pega-omni` binary |
 | `omni-bench` | open-loop load generator: TTFP, E2E, RTF, playback underrun |
 

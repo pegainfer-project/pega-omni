@@ -1,9 +1,8 @@
-//! Reading checkpoint tensors into device buffers.
+//! Reading checkpoint tensors, and the layout transforms they get at load.
 //!
-//! Tensors arrive as bf16 or f32 and all leave as bf16, except parameters that
-//! a kernel reads in f32 (SnakeBeta's). Layout transforms (fusing projections,
-//! permuting conv kernels, folding scales) happen on the host at load, so the
-//! forward pass never pays for them.
+//! Tensors arrive as bf16 or f32 and are read as f32; layout transforms
+//! (fusing projections, permuting conv kernels, folding scales) happen on the
+//! host at load, so the forward pass never pays for them.
 
 use std::path::Path;
 
@@ -11,10 +10,8 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
+use half::bf16;
 use memmap2::Mmap;
-use omni_cuda::Buf;
-use omni_cuda::Gpu;
-use omni_cuda::bf16;
 use safetensors::Dtype;
 use safetensors::SafeTensors;
 use safetensors::tensor::Metadata;
@@ -75,10 +72,6 @@ impl File {
         ensure!(t.shape == shape, "tensor {name}: expected shape {shape:?}, got {:?}", t.shape);
         Ok(t)
     }
-}
-
-pub fn upload(gpu: &Gpu, data: &[f32]) -> Result<Buf<bf16>> {
-    gpu.upload(&data.iter().map(|&x| bf16::from_f32(x)).collect::<Vec<_>>())
 }
 
 /// Row-concatenation of `[out_i, in]` matrices sharing `in`.

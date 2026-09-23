@@ -1,24 +1,20 @@
 //! The model against the official implementation's recorded run
 //! (`tools/qwen3_tts/golden.py`): tokenizer ids, prompt embeddings,
-//! teacher-forced talker and code-predictor logits, and the decoded waveform.
+//! teacher-forced talker and code-predictor logits, and the decoded waveform,
+//! all through the serving path (`prefill`, `first`, `decode`) with the
+//! recorded frames forced in place of the draws.
 //!
 //! Needs a GPU, `OMNI_QWEN3_TTS_MODEL` (checkpoint directory) and
 //! `OMNI_QWEN3_TTS_GOLDEN` (the golden file); skipped when either is unset.
 
 use std::path::PathBuf;
 
-use omni_cuda::Gpu;
-use omni_qwen3_tts::codec::Codec;
-use omni_qwen3_tts::config::Config;
+use omni_qwen3_tts::model::Draw;
+use omni_qwen3_tts::model::Limits;
+use omni_qwen3_tts::model::Model;
+use omni_qwen3_tts::model::Seq;
 use omni_qwen3_tts::prompt;
-use omni_qwen3_tts::prompt::Tokenizer;
-use omni_qwen3_tts::talker::Frame;
 use omni_qwen3_tts::talker::GROUPS;
-use omni_qwen3_tts::talker::Input;
-use omni_qwen3_tts::talker::Limits;
-use omni_qwen3_tts::talker::Probe;
-use omni_qwen3_tts::talker::Row;
-use omni_qwen3_tts::talker::Talker;
 use omni_qwen3_tts::weights::File;
 
 fn paths() -> Option<(PathBuf, PathBuf)> {
@@ -78,62 +74,75 @@ fn agreement(ours: &[f32], theirs: &[f32], width: usize) -> (f64, f64) {
     (worst, agree)
 }
 
+/// Three streams of the same prompt and frames: `a` and `b` in lockstep
+/// (their audio must be identical), `c` starting `LAG` steps later, so it
+/// is prefilled next to running rows and shares calls of other sizes.
+const LAG: usize = 7;
+
 #[test]
 fn matches_the_official_run() {
-    let Some((model, golden)) = paths() else { return };
+    let Some((dir, golden)) = paths() else { return };
     let golden = Golden::open(&golden);
-    let config = Config::load(&model).unwrap();
-    let tokenizer = Tokenizer::load(&model).unwrap();
+    let limits = Limits { max_batch: 3, max_tokens: 1024, kv_tokens: 4096 };
+    let mut model = Model::load(0, &dir, limits).unwrap();
+    let config = model.config.clone();
 
-    let text_ids = tokenizer.assistant(&golden.text);
+    let text_ids = model.tokenizer.assistant(&golden.text);
     assert_eq!(text_ids, golden.i32("text_ids"), "tokenizer ids");
-
     let voice = prompt::voice(&config.model, &golden.speaker, &golden.language).unwrap();
     let prompt = prompt::assemble(&config.model, voice, &text_ids, None);
     let (embed_shape, embeds) = golden.f32("prefill_embeds");
     assert_eq!(prompt.len(), embed_shape[0], "prompt length");
 
-    let gpu = Gpu::new(0).unwrap();
-    gpu.bind().unwrap();
-    let limits = Limits { max_batch: 1, max_tokens: 256, pages: 64, page_size: 16 };
-    let mut talker = Talker::load(
-        &gpu,
-        &File::open(&model.join("model.safetensors")).unwrap(),
-        &config.model,
-        &config.generation,
-        limits,
-    )
-    .unwrap();
-    let codes = golden.i32("codes");
-    let frames: Vec<[i32; GROUPS]> = codes.chunks(GROUPS).map(|c| c.try_into().unwrap()).collect();
+    let frames: Vec<[i32; GROUPS]> = golden.i32("codes").chunks(GROUPS).map(|c| c.try_into().unwrap()).collect();
+    let n = frames.len();
     let (_, talker_logits) = golden.f32("talker_logits");
     let (_, predictor_logits) = golden.f32("predictor_logits");
-    let (vocab, p_vocab) = (config.model.talker_config.stack.vocab_size, 2048);
+    let (h, vocab, p_vocab) =
+        (config.model.talker_config.stack.hidden_size, config.model.talker_config.stack.vocab_size, 2048);
+    let spf = config.samples_per_frame;
 
-    let pages: Vec<i32> = (0..64).collect();
-    let seen = vec![0u32; talker.seen_words()];
+    let mut seqs: Vec<Seq> = (0..3).map(|_| model.open(prompt.len(), n + 1).unwrap().unwrap()).collect();
+    let starts = [0, 0, LAG];
+    let draw = |t: usize| Draw { uniforms: [0.5; GROUPS], force: frames.get(t).copied() };
     let mut ours_talker = Vec::new();
     let mut ours_predictor = Vec::new();
-    let mut cached = 0;
-    for t in 0..=frames.len() {
-        let input = match t {
-            0 => Input::Prompt(&prompt),
-            _ => Input::Frame(&frames[t - 1]),
-        };
-        let row = Row { pages: &pages, cached, input, seen: &seen, generated: t, uniforms: [0.5; GROUPS] };
-        let mut probe = Probe { force: frames.get(t).map(|f| vec![*f]).unwrap_or_default(), ..Probe::default() };
-        let out = talker.step(&gpu, &[row], Some(&mut probe)).unwrap();
-        if t == 0 {
-            let (worst, _) = agreement(&probe.inputs, &embeds, config.model.talker_config.stack.hidden_size);
-            eprintln!("prompt embeddings: worst cosine {worst:.6}");
-            assert!(worst > 0.999, "prompt embeddings diverge: worst cosine {worst}");
-        }
-        cached += prompt.len() * (t == 0) as usize + (t > 0) as usize;
-        ours_talker.extend(probe.talker_logits);
-        if t < frames.len() {
-            ours_predictor.extend(probe.predictor_logits.into_iter().flatten());
-        } else {
-            assert_eq!(out, vec![Frame::End], "the recorded run ends after {} frames", frames.len());
+    let mut wav = vec![Vec::new(); 3];
+    for step in 0..=n + LAG {
+        let at: Vec<Option<usize>> = starts.iter().map(|&s| step.checked_sub(s).filter(|&t| t <= n)).collect();
+        for fresh in [true, false] {
+            let who: Vec<usize> = (0..3).filter(|&k| at[k].is_some_and(|t| (t == 0) == fresh)).collect();
+            if who.is_empty() {
+                continue;
+            }
+            let picked = seqs.iter_mut().enumerate().filter(|(k, _)| who.contains(k)).map(|(_, s)| s);
+            let out = if fresh {
+                model.start(&mut picked.map(|s| (s, &prompt, draw(0))).collect::<Vec<_>>()).unwrap()
+            } else {
+                let rows = picked.zip(&who).map(|(s, &k)| (s, draw(at[k].unwrap())));
+                model.step(&mut rows.collect::<Vec<_>>()).unwrap()
+            };
+            for (i, &k) in who.iter().enumerate() {
+                match at[k].unwrap() {
+                    t if t < n => {
+                        assert_eq!(out.codes[i], frames[t], "stream {k} frame {t} is not the forced one");
+                        wav[k].extend_from_slice(&out.wav[i * spf..(i + 1) * spf]);
+                    }
+                    _ => assert!(model.is_end(&out.codes[i]), "the recorded run ends after {n} frames"),
+                }
+            }
+            if who[0] == 0 {
+                let t = at[0].unwrap();
+                if t == 0 {
+                    let (worst, _) = agreement(&model.embeds(prompt.len()).unwrap(), &embeds, h);
+                    eprintln!("prompt embeddings: worst cosine {worst:.6}");
+                    assert!(worst > 0.999, "prompt embeddings diverge: worst cosine {worst}");
+                }
+                ours_talker.extend(model.talker_logits(0).unwrap());
+                if t < n {
+                    ours_predictor.extend(model.predictor_logits(0).unwrap());
+                }
+            }
         }
     }
 
@@ -144,34 +153,10 @@ fn matches_the_official_run() {
     eprintln!("predictor logits: worst cosine {worst:.5}, argmax agreement {agree:.3}");
     assert!(worst > 0.998 && agree > 0.9, "predictor logits diverge");
 
-    // Three streams through one decoder: `a` and `b` in lockstep (their
-    // audio must be identical), `c` starting `LAG` frames later, so it shares
-    // calls of every batch size and its positions differ from theirs.
-    const LAG: usize = 7;
-    let (_, wav) = golden.f32("wav");
-    let file = File::open(&model.join("speech_tokenizer/model.safetensors")).unwrap();
-    let mut codec = Codec::load(0, &file, &config.codec, config.samples_per_frame, 3).unwrap();
-    let mut streams: Vec<_> = (0..3).map(|_| codec.open().unwrap()).collect();
-    let spf = config.samples_per_frame;
-    let mut out = vec![Vec::new(); 3];
-    for step in 0..frames.len() + LAG {
-        let mut batch = Vec::new();
-        let mut who = Vec::new();
-        for (k, s) in streams.iter_mut().enumerate() {
-            let at = if k == 2 { step.checked_sub(LAG) } else { Some(step) };
-            if let Some(f) = at.and_then(|t| frames.get(t)) {
-                batch.push((s, *f));
-                who.push(k);
-            }
-        }
-        let wav = codec.decode(&mut batch).unwrap();
-        for (k, samples) in who.into_iter().zip(wav.chunks(spf)) {
-            out[k].extend_from_slice(samples);
-        }
-    }
-    assert_eq!(out[0], out[1], "two streams of the same frames in one batch decode differently");
-    for (name, audio) in [("streamed waveform", &out[0]), ("lagging stream", &out[2])] {
-        let snr = snr(audio, &wav);
+    let (_, reference) = golden.f32("wav");
+    assert_eq!(wav[0], wav[1], "two streams of the same frames in one batch decode differently");
+    for (name, audio) in [("streamed waveform", &wav[0]), ("lagging stream", &wav[2])] {
+        let snr = snr(audio, &reference);
         eprintln!("{name}: snr {snr:.2} dB");
         assert!(snr > 30.0, "{name} snr {snr:.2} dB");
     }

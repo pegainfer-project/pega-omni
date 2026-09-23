@@ -1,5 +1,5 @@
 // The streaming codec decoder's kernels, compiled to one cubin that the kern
-// runtime launches from the manifest `codec::manifest` generates.
+// runtime launches from the calls `codec::build` generates.
 //
 // A call decodes one frame for each of `seqs` sequences. At a stage running
 // `T` rows per frame, global row `g` is row `t = g % T` of sequence `s = g / T`,
@@ -52,12 +52,14 @@ __device__ __forceinline__ bf16* slot(void* state, const int32_t* lines, int s, 
   for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < (total); i += (int64_t)gridDim.x * blockDim.x)
 
 // Row r: [codebook 0 | Σ codebooks 1..15], each `half` wide; `books` is
-// [16 * rows_per_book, half].
+// [16 * rows_per_book, half]. A codebook-0 code past the book (the talker's end
+// of speech, whose audio is dropped) reads as 0.
 extern "C" __global__ void codec_rvq(const int32_t* codes, const bf16* books, bf16* out, int half, int rows_per_book) {
   const int r = blockIdx.x;
   const int32_t* c = codes + r * 16;
+  const int64_t c0 = c[0] < rows_per_book ? c[0] : 0;
   for (int i = threadIdx.x; i < half; i += blockDim.x) {
-    out[(int64_t)r * 2 * half + i] = books[(int64_t)c[0] * half + i];
+    out[(int64_t)r * 2 * half + i] = books[c0 * half + i];
     float acc = 0.f;
     for (int g = 1; g < 16; ++g) acc += f32(books[((int64_t)g * rows_per_book + c[g]) * half + i]);
     out[(int64_t)r * 2 * half + half + i] = to_bf16(acc);

@@ -1,256 +1,276 @@
-//! A Qwen3 decoder stack over a paged KV cache: the talker and the code
-//! predictor are both one of these.
+//! A Qwen3 decoder stack as manifest calls: the talker and the code predictor
+//! are both one of these.
 //!
-//! A forward pass takes a ragged batch, rows of any query length appended to
-//! KV they already own, so one call serves admissions and decode rows alike.
-//! [`Batch`] is the host-side description (pure, built from each row's pages
-//! and lengths); [`Meta`] holds its device copy.
+//! [`Stack::forward`] emits one pass over `rows` token rows: from an input
+//! embedding buffer to the final norm's output, the residual stream alongside.
+//! Where a row's K and V go, and which keys it attends to, is its [`Kv`]: the
+//! talker's paged state, or the code predictor's per-call workspace.
 
 use anyhow::Result;
 use anyhow::ensure;
-use omni_cuda::Buf;
-use omni_cuda::Gpu;
-use omni_cuda::PagedKv;
-use omni_cuda::PlanBufs;
-use omni_cuda::PrefillPlan;
-use omni_cuda::bf16;
+use serde_json::Value;
+use serde_json::json;
 
 use crate::config;
+use crate::manifest::Gen;
+use crate::manifest::buf;
+use crate::manifest::count;
+use crate::manifest::f32a;
+use crate::manifest::i32a;
+use crate::manifest::inb;
+use crate::manifest::ini;
+use crate::manifest::io;
+use crate::manifest::outb;
 use crate::weights::File;
 use crate::weights::concat_rows;
-use crate::weights::upload;
 
-pub struct Layer {
-    ln1: Buf<bf16>,
-    qkv: Buf<bf16>,
-    q_norm: Buf<bf16>,
-    k_norm: Buf<bf16>,
-    o: Buf<bf16>,
-    ln2: Buf<bf16>,
-    gate_up: Buf<bf16>,
-    down: Buf<bf16>,
+pub const HEAD_DIM: usize = 128;
+/// Tokens per page of the talker's paged KV.
+pub const PAGE: usize = 16;
+
+struct Layer {
+    ln1: String,
+    qkv: String,
+    q_norm: String,
+    k_norm: String,
+    o: String,
+    ln2: String,
+    gate_up: String,
+    down: String,
 }
 
 pub struct Stack {
     pub cfg: config::Stack,
     layers: Vec<Layer>,
-    norm: Buf<bf16>,
+    norm: String,
+}
+
+/// Where a pass's K and V live.
+#[derive(Clone, Copy)]
+pub enum Kv<'a> {
+    /// Layer `i` in state `{prefix}{i}` at each row's `t_slot`, the row at
+    /// `t_pos`, its sequence `t_seq[n]` when `ragged` (else row `n` is
+    /// sequence `n`) with its pages in `kv_indptr` / `kv_pages`.
+    Paged { prefix: &'a str, ragged: bool },
+    /// Layer `i` in workspace `{prefix}{i}`: `per` rows per sequence at
+    /// positions `base..base + per`, `span` slots per sequence.
+    Dense { prefix: &'a str, per: usize, base: usize, span: usize },
+}
+
+/// A pass's output: the final norm's rows `n % every == which`, compacted into `out`.
+pub struct Out<'a> {
+    pub out: &'a str,
+    pub every: usize,
+    pub which: usize,
+}
+
+/// One pass: its calls labelled `{label}.*`, over `rows` rows (a var
+/// expression, e.g. `"seqs"` or `{"mul": ["seqs", 2]}`) of the embeddings in
+/// `input`.
+pub struct Pass<'a> {
+    pub label: &'a str,
+    pub rows: Value,
+    pub input: &'a str,
+    pub kv: Kv<'a>,
+    pub out: Out<'a>,
+}
+
+/// Workspace names of a stack's activations, each `rows` wide at most.
+pub struct Scratch {
+    pub x: &'static str,
+    pub res: &'static str,
+    pub qkv: &'static str,
+    pub attn: &'static str,
+    pub gate_up: &'static str,
+    pub act: &'static str,
 }
 
 impl Stack {
-    /// Loads `{prefix}.layers.*` and `{prefix}.norm`, fusing Q|K|V and gate|up.
-    pub fn load(gpu: &Gpu, file: &File, prefix: &str, cfg: &config::Stack) -> Result<Self> {
-        ensure!(cfg.head_dim == 128, "{prefix}: head_dim {} unsupported (attention is built for 128)", cfg.head_dim);
+    /// Registers `{prefix}.layers.*` and `{prefix}.norm` as weights named `{name}.*`,
+    /// Q|K|V and gate|up fused.
+    pub fn load(g: &mut Gen, file: &File, prefix: &str, name: &str, cfg: &config::Stack) -> Result<Self> {
+        ensure!(
+            cfg.head_dim == HEAD_DIM,
+            "{prefix}: head_dim {} unsupported (attention is built for 128)",
+            cfg.head_dim
+        );
+        ensure!(cfg.hidden_size.is_multiple_of(256) && cfg.hidden_size <= 8192, "{prefix}: hidden {}", cfg.hidden_size);
         let (h, d) = (cfg.hidden_size, cfg.head_dim);
         let (q, kv, inter) = (cfg.num_attention_heads * d, cfg.num_key_value_heads * d, cfg.intermediate_size);
         let layers = (0..cfg.num_hidden_layers)
             .map(|i| {
                 let p = format!("{prefix}.layers.{i}");
                 let w = |n: &str, shape: &[usize]| file.expect(&format!("{p}.{n}"), shape);
+                let n = |s: &str| format!("{name}.l{i}.{s}");
                 Ok(Layer {
-                    ln1: upload(gpu, &w("input_layernorm.weight", &[h])?.data)?,
-                    qkv: upload(
-                        gpu,
+                    ln1: g.weight(&n("ln1"), &[h], &w("input_layernorm.weight", &[h])?.data),
+                    qkv: g.weight(
+                        &n("qkv"),
+                        &[q + 2 * kv, h],
                         &concat_rows(&[
                             w("self_attn.q_proj.weight", &[q, h])?,
                             w("self_attn.k_proj.weight", &[kv, h])?,
                             w("self_attn.v_proj.weight", &[kv, h])?,
                         ]),
-                    )?,
-                    q_norm: upload(gpu, &w("self_attn.q_norm.weight", &[d])?.data)?,
-                    k_norm: upload(gpu, &w("self_attn.k_norm.weight", &[d])?.data)?,
-                    o: upload(gpu, &w("self_attn.o_proj.weight", &[h, q])?.data)?,
-                    ln2: upload(gpu, &w("post_attention_layernorm.weight", &[h])?.data)?,
-                    gate_up: upload(
-                        gpu,
+                    ),
+                    q_norm: g.weight(&n("q_norm"), &[d], &w("self_attn.q_norm.weight", &[d])?.data),
+                    k_norm: g.weight(&n("k_norm"), &[d], &w("self_attn.k_norm.weight", &[d])?.data),
+                    o: g.weight(&n("o"), &[h, q], &w("self_attn.o_proj.weight", &[h, q])?.data),
+                    ln2: g.weight(&n("ln2"), &[h], &w("post_attention_layernorm.weight", &[h])?.data),
+                    gate_up: g.weight(
+                        &n("gate_up"),
+                        &[2 * inter, h],
                         &concat_rows(&[w("mlp.gate_proj.weight", &[inter, h])?, w("mlp.up_proj.weight", &[inter, h])?]),
-                    )?,
-                    down: upload(gpu, &w("mlp.down_proj.weight", &[h, inter])?.data)?,
+                    ),
+                    down: g.weight(&n("down"), &[h, inter], &w("mlp.down_proj.weight", &[h, inter])?.data),
                 })
             })
             .collect::<Result<_>>()?;
-        let norm = upload(gpu, &file.expect(&format!("{prefix}.norm.weight"), &[h])?.data)?;
+        let norm = g.weight(&format!("{name}.norm"), &[h], &file.expect(&format!("{prefix}.norm.weight"), &[h])?.data);
         Ok(Self { cfg: cfg.clone(), layers, norm })
     }
 
-    fn qkv_width(&self) -> usize {
+    pub fn qkv_width(&self) -> usize {
         (self.cfg.num_attention_heads + 2 * self.cfg.num_key_value_heads) * self.cfg.head_dim
     }
 
-    /// Runs `rows` tokens: embeddings in `s.h`, final normed hidden states out in `s.h`.
-    pub fn forward(&self, gpu: &Gpu, s: &Scratch, kv: &KvPool, meta: &Meta) -> Result<()> {
+    /// Bytes of K and V one token takes in one layer.
+    pub fn kv_bytes(cfg: &config::Stack) -> usize {
+        2 * cfg.num_key_value_heads * cfg.head_dim * 2
+    }
+
+    pub fn forward(&self, g: &mut Gen, pass: Pass, s: &Scratch) {
+        let Pass { label, rows, input, kv, out } = pass;
+        let rows = &rows;
         let c = &self.cfg;
-        let (rows, batch) = (meta.rows, meta.batch);
-        let (h, d, hq, hk, inter) =
-            (c.hidden_size, c.head_dim, c.num_attention_heads, c.num_key_value_heads, c.intermediate_size);
-        let (qkv_w, eps) = (self.qkv_width(), c.rms_norm_eps);
-        gpu.copy(s.residual.ptr(), s.h.ptr(), rows * h * 2)?;
-        gpu.rms_norm(s.h.ptr(), self.layers[0].ln1.ptr(), s.h.ptr(), rows, h, eps)?;
-        for (i, l) in self.layers.iter().enumerate() {
-            gpu.linear(s.qkv.ptr(), s.h.ptr(), l.qkv.ptr(), rows, qkv_w, h)?;
-            gpu.qk_norm_rope(
-                s.qkv.ptr(),
-                qkv_w,
-                rows,
-                (hq, hk, d),
-                (l.q_norm.ptr(), l.k_norm.ptr(), eps),
-                meta.positions.ptr(),
-                (meta.slots.ptr(), kv.k[i].ptr(), kv.v[i].ptr()),
-                c.rope_theta,
-            )?;
-            let paged = PagedKv {
-                k_pool: kv.k[i].ptr(),
-                v_pool: kv.v[i].ptr(),
-                page_size: kv.page_size as u32,
-                page_indices: meta.page_indices.ptr(),
-                page_indptr: meta.page_indptr.ptr(),
-                last_page_len: meta.last_page_len.ptr(),
-            };
-            gpu.paged_prefill((s.qkv.ptr(), qkv_w), s.attn.ptr(), &paged, &meta.plan, (rows, batch), (hq, hk))?;
-            gpu.linear(s.h.ptr(), s.attn.ptr(), l.o.ptr(), rows, h, hq * d)?;
-            gpu.add_rms_norm(s.h.ptr(), s.residual.ptr(), l.ln2.ptr(), rows, h, eps)?;
-            gpu.linear(s.gate_up.ptr(), s.h.ptr(), l.gate_up.ptr(), rows, 2 * inter, h)?;
-            gpu.silu_mul(s.gate_up.ptr(), s.act.ptr(), rows, inter)?;
-            gpu.linear(s.h.ptr(), s.act.ptr(), l.down.ptr(), rows, h, inter)?;
-            let next = self.layers.get(i + 1).map_or(&self.norm, |n| &n.ln1);
-            gpu.add_rms_norm(s.h.ptr(), s.residual.ptr(), next.ptr(), rows, h, eps)?;
-        }
-        Ok(())
-    }
-}
-
-/// Paged K and V for every layer: `pages` pages of `page_size` tokens.
-pub struct KvPool {
-    k: Vec<Buf<bf16>>,
-    v: Vec<Buf<bf16>>,
-    pub page_size: usize,
-    pub pages: usize,
-}
-
-impl KvPool {
-    pub fn new(gpu: &Gpu, cfg: &config::Stack, page_size: usize, pages: usize) -> Result<Self> {
-        let len = pages * page_size * cfg.num_key_value_heads * cfg.head_dim;
-        let pool = || (0..cfg.num_hidden_layers).map(|_| gpu.alloc::<bf16>(len)).collect::<Result<Vec<_>>>();
-        Ok(Self { k: pool()?, v: pool()?, page_size, pages })
-    }
-
-    /// Bytes one page takes across all layers, K and V.
-    pub fn page_bytes(cfg: &config::Stack, page_size: usize) -> usize {
-        2 * cfg.num_hidden_layers * page_size * cfg.num_key_value_heads * cfg.head_dim * 2
-    }
-}
-
-/// Activations for up to `rows` tokens of one stack.
-pub struct Scratch {
-    pub h: Buf<bf16>,
-    residual: Buf<bf16>,
-    qkv: Buf<bf16>,
-    attn: Buf<bf16>,
-    gate_up: Buf<bf16>,
-    act: Buf<bf16>,
-}
-
-impl Scratch {
-    pub fn new(gpu: &Gpu, cfg: &config::Stack, rows: usize) -> Result<Self> {
-        let q = cfg.num_attention_heads * cfg.head_dim;
-        let qkv = q + 2 * cfg.num_key_value_heads * cfg.head_dim;
-        Ok(Self {
-            h: gpu.alloc(rows * cfg.hidden_size)?,
-            residual: gpu.alloc(rows * cfg.hidden_size)?,
-            qkv: gpu.alloc(rows * qkv)?,
-            attn: gpu.alloc(rows * q)?,
-            gate_up: gpu.alloc(rows * 2 * cfg.intermediate_size)?,
-            act: gpu.alloc(rows * cfg.intermediate_size)?,
-        })
-    }
-}
-
-/// One row of a forward: the pages it owns, how many tokens they already hold,
-/// and how many it appends.
-#[derive(Clone, Debug)]
-pub struct RowKv<'a> {
-    pub pages: &'a [i32],
-    pub cached: usize,
-    pub new: usize,
-}
-
-/// A ragged batch, host side: per token its position and KV slot, per row its
-/// page table after the append.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Batch {
-    pub positions: Vec<i32>,
-    pub slots: Vec<i32>,
-    pub q_indptr: Vec<i32>,
-    pub page_indices: Vec<i32>,
-    pub page_indptr: Vec<i32>,
-    pub last_page_len: Vec<i32>,
-    pub qo_lens: Vec<u32>,
-}
-
-impl Batch {
-    pub fn new(rows: &[RowKv], page_size: usize) -> Self {
-        let mut b = Batch { q_indptr: vec![0], page_indptr: vec![0], ..Default::default() };
-        for r in rows {
-            let total = r.cached + r.new;
-            let used = total.div_ceil(page_size);
-            assert!(used <= r.pages.len(), "row holds {} pages, needs {used}", r.pages.len());
-            for pos in r.cached..total {
-                b.positions.push(pos as i32);
-                b.slots.push(r.pages[pos / page_size] * page_size as i32 + (pos % page_size) as i32);
-            }
-            b.q_indptr.push(b.positions.len() as i32);
-            b.page_indices.extend_from_slice(&r.pages[..used]);
-            b.page_indptr.push(b.page_indices.len() as i32);
-            b.last_page_len.push((total - (used - 1) * page_size) as i32);
-            b.qo_lens.push(r.new as u32);
-        }
-        b
-    }
-}
-
-/// Device copies of a [`Batch`], sized for the largest batch a stack runs.
-pub struct Meta {
-    positions: Buf<i32>,
-    slots: Buf<i32>,
-    page_indices: Buf<i32>,
-    page_indptr: Buf<i32>,
-    last_page_len: Buf<i32>,
-    plan: PlanBufs,
-    rows: usize,
-    batch: usize,
-}
-
-impl Meta {
-    pub fn new(gpu: &Gpu, max_rows: usize, max_batch: usize, max_pages: usize, group: usize) -> Result<Self> {
-        let max_tiles = max_rows * group + max_batch;
-        Ok(Self {
-            positions: gpu.alloc(max_rows)?,
-            slots: gpu.alloc(max_rows)?,
-            page_indices: gpu.alloc(max_pages)?,
-            page_indptr: gpu.alloc(max_batch + 1)?,
-            last_page_len: gpu.alloc(max_batch)?,
-            plan: PlanBufs::new(gpu, max_batch, max_tiles)?,
-            rows: 0,
-            batch: 0,
-        })
-    }
-
-    /// Uploads `b` and its tile plan.
-    pub fn set(&mut self, gpu: &Gpu, b: &Batch, cfg: &config::Stack) -> Result<()> {
-        let group = (cfg.num_attention_heads / cfg.num_key_value_heads) as u32;
-        ensure!(
-            b.positions.len() <= self.positions.len(),
-            "batch of {} tokens exceeds the stack's scratch",
-            b.positions.len()
+        let (h, hq, hk, inter) = (c.hidden_size, c.num_attention_heads, c.num_key_value_heads, c.intermediate_size);
+        let (eps, qkv_w) = (c.rms_norm_eps, self.qkv_width());
+        let n_arg = count(rows);
+        let norm_block = (h / 8) as u32;
+        let per_row = [rows.clone(), json!(1), json!(1)];
+        let scale = f32a(1.0 / (HEAD_DIM as f32).sqrt());
+        g.launch(
+            &format!("{label}.embed_norm"),
+            "talker_norm_copy",
+            per_row.clone(),
+            norm_block,
+            vec![inb(input), inb(&self.layers[0].ln1), outb(s.x), outb(s.res), i32a(h), f32a(eps)],
         );
-        self.plan.set(gpu, &PrefillPlan::new(&b.qo_lens, group, cfg.head_dim as u32), &b.q_indptr)?;
-        gpu.write(&mut self.positions, 0, &b.positions)?;
-        gpu.write(&mut self.slots, 0, &b.slots)?;
-        gpu.write(&mut self.page_indices, 0, &b.page_indices)?;
-        gpu.write(&mut self.page_indptr, 0, &b.page_indptr)?;
-        gpu.write(&mut self.last_page_len, 0, &b.last_page_len)?;
-        self.rows = b.positions.len();
-        self.batch = b.qo_lens.len();
-        Ok(())
+        for (i, l) in self.layers.iter().enumerate() {
+            let at = |s: &str| format!("{label}.l{i}.{s}");
+            g.gemm_rows(&at("qkv"), (buf(s.qkv), buf(s.x), buf(&l.qkv)), n_arg.clone(), (qkv_w, h));
+            let heads = json!((hq + 2 * hk).div_ceil(8));
+            let (hq_a, hk_a) = (i32a(hq), i32a(hk));
+            match kv {
+                Kv::Paged { prefix, ragged } => {
+                    let state = json!({"state": format!("{prefix}{i}")});
+                    g.launch(
+                        &at("rope"),
+                        "talker_rope",
+                        [rows.clone(), heads, json!(1)],
+                        256,
+                        vec![
+                            io(s.qkv),
+                            inb(&l.q_norm),
+                            inb(&l.k_norm),
+                            ini("t_pos"),
+                            ini("t_slot"),
+                            ("inout state", state.clone()),
+                            hq_a.clone(),
+                            hk_a.clone(),
+                            f32a(eps),
+                            f32a(c.rope_theta),
+                        ],
+                    );
+                    g.launch(
+                        &at("attn"),
+                        "talker_attend",
+                        [rows.clone(), json!(hk), json!(1)],
+                        128,
+                        vec![
+                            inb(s.qkv),
+                            ("in state", state),
+                            ini("t_pos"),
+                            ini("t_seq"),
+                            i32a(ragged as usize),
+                            ini("kv_indptr"),
+                            ini("kv_pages"),
+                            outb(s.attn),
+                            hq_a,
+                            hk_a,
+                            i32a(PAGE),
+                            scale.clone(),
+                        ],
+                    );
+                }
+                Kv::Dense { prefix, per, base, span } => {
+                    let ws = format!("{prefix}{i}");
+                    g.launch(
+                        &at("rope"),
+                        "talker_rope_dense",
+                        [rows.clone(), heads, json!(1)],
+                        256,
+                        vec![
+                            io(s.qkv),
+                            inb(&l.q_norm),
+                            inb(&l.k_norm),
+                            outb(&ws),
+                            i32a(per),
+                            i32a(base),
+                            i32a(span),
+                            hq_a.clone(),
+                            hk_a.clone(),
+                            f32a(eps),
+                            f32a(c.rope_theta),
+                        ],
+                    );
+                    g.launch(
+                        &at("attn"),
+                        "talker_attend_dense",
+                        [rows.clone(), json!(hk), json!(1)],
+                        128,
+                        vec![
+                            inb(s.qkv),
+                            inb(&ws),
+                            outb(s.attn),
+                            i32a(per),
+                            i32a(base),
+                            i32a(span),
+                            hq_a,
+                            hk_a,
+                            scale.clone(),
+                        ],
+                    );
+                }
+            }
+            g.gemm_rows(&at("o"), (buf(s.x), buf(s.attn), buf(&l.o)), n_arg.clone(), (h, hq * HEAD_DIM));
+            g.launch(
+                &at("post_attn_norm"),
+                "talker_add_norm",
+                per_row.clone(),
+                norm_block,
+                vec![inb(s.x), io(s.res), inb(&l.ln2), outb(s.x), i32a(h), f32a(eps), i32a(1), i32a(0)],
+            );
+            g.gemm_rows(&at("gate_up"), (buf(s.gate_up), buf(s.x), buf(&l.gate_up)), n_arg.clone(), (2 * inter, h));
+            g.launch(
+                &at("silu_mul"),
+                "talker_silu_mul",
+                [json!({"ceil_div": [{"mul": [rows, inter / 8]}, 256]}), json!(1), json!(1)],
+                256,
+                vec![inb(s.gate_up), outb(s.act), i32a(inter), ("i32", json!({"expr": {"mul": [rows, inter / 8]}}))],
+            );
+            g.gemm_rows(&at("down"), (buf(s.x), buf(s.act), buf(&l.down)), n_arg.clone(), (h, inter));
+            let (next, dst, every, which) = match self.layers.get(i + 1) {
+                Some(n) => (&n.ln1, s.x, 1, 0),
+                None => (&self.norm, out.out, out.every, out.which),
+            };
+            g.launch(
+                &at("next_norm"),
+                "talker_add_norm",
+                per_row.clone(),
+                norm_block,
+                vec![inb(s.x), io(s.res), inb(next), outb(dst), i32a(h), f32a(eps), i32a(every), i32a(which)],
+            );
+        }
     }
 }

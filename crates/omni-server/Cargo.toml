@@ -12,13 +12,12 @@ path = "src/main.rs"
 # pprof's sampler (SIGPROF, no perf_event access needed) behind `--cpu-profile`.
 cpu-profile = ["dep:pprof"]
 # The Qwen3-TTS engine; needs the CUDA toolkit to build.
-qwen3-tts = ["dep:omni-qwen3-tts", "dep:omni-cuda"]
+qwen3-tts = ["dep:omni-qwen3-tts"]
 
 [dependencies]
 omni-engine.workspace = true
 omni-frontend.workspace = true
 omni-sim.workspace = true
-omni-cuda = { workspace = true, optional = true }
 omni-qwen3-tts = { workspace = true, optional = true }
 
 anyhow.workspace = true

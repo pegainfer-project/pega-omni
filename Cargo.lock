@@ -1547,16 +1547,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "omni-cuda"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cc",
- "cudarc",
- "half",
-]
-
-[[package]]
 name = "omni-engine"
 version = "0.1.0"
 dependencies = [
@@ -1598,7 +1588,6 @@ dependencies = [
  "kern-pool",
  "kern-runtime",
  "memmap2",
- "omni-cuda",
  "omni-engine",
  "proptest",
  "rand 0.10.3",
@@ -1618,7 +1607,6 @@ dependencies = [
  "anyhow",
  "clap",
  "metrics-exporter-prometheus",
- "omni-cuda",
  "omni-engine",
  "omni-frontend",
  "omni-qwen3-tts",

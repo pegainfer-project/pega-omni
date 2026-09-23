@@ -115,7 +115,6 @@ impl Qwen3TtsArgs {
             kv_gib: self.kv_gib,
             first_chunk_frames: self.first_chunk_frames,
             chunk_frames: self.chunk_frames,
-            ..engine::Options::default()
         };
         let name = self.model.clone().unwrap_or_else(|| {
             self.model_path.file_name().map_or("qwen3-tts".into(), |n| n.to_string_lossy().into_owned())
