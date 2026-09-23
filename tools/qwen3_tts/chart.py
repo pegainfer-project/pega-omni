@@ -2,7 +2,7 @@
 concurrency, pega-omni against vLLM-Omni, from two `vs_vllm_omni.sh bench`
 result directories. The headline ratios are computed, never typed.
 
-    chart.py <vllm-omni results> <pega-omni results> <out.png>
+    chart.py <vllm-omni results> <pega-omni results> <out.png> <vllm-omni version>
 """
 
 import json
@@ -51,7 +51,7 @@ def panel(x0: int, title: str, pega: list, vllm: list, ratio) -> list:
     return out
 
 
-def svg(vllm: dict, pega: dict) -> str:
+def svg(vllm: dict, pega: dict, version: str) -> str:
     faster = max(v / p for p, v in zip(pega["ttfp"], vllm["ttfp"]))
     more = pega["tput"][-1] / vllm["tput"][-1]
     out = [
@@ -65,7 +65,7 @@ def svg(vllm: dict, pega: dict) -> str:
     ]
     out += panel(48, "Time to first audio, ms ↓", pega["ttfp"], vllm["ttfp"], lambda p, v: v / p)
     out += panel(512, "Audio seconds per second ↑", pega["tput"], vllm["tput"], lambda p, v: p / v)
-    for x, col, name in ((48, PEGA, "pega-omni"), (178, VLLM, "vLLM-Omni 0.30.0rc1")):
+    for x, col, name in ((48, PEGA, "pega-omni"), (178, VLLM, f"vLLM-Omni {version}")):
         out.append(f'<rect x="{x}" y="{H - 40}" width="14" height="14" rx="3" fill="{col}"/>')
         out.append(f'<text x="{x + 22}" y="{H - 28}" fill="{FG}" font-size="14">{name}</text>')
     return "\n".join(out + ["</svg>"]) + "\n"
@@ -73,5 +73,6 @@ def svg(vllm: dict, pega: dict) -> str:
 
 if __name__ == "__main__":
     vllm_dir, pega_dir, png = map(Path, sys.argv[1:4])
-    cairosvg.svg2png(bytestring=svg(load(vllm_dir), load(pega_dir)).encode(), write_to=str(png), scale=2)
+    chart = svg(load(vllm_dir), load(pega_dir), sys.argv[4])
+    cairosvg.svg2png(bytestring=chart.encode(), write_to=str(png), scale=2)
     print(png)

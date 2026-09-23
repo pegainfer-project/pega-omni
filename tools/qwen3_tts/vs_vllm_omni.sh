@@ -95,7 +95,7 @@ bench() {
 }
 
 chart() {
-  uv run -q --with cairosvg python "$HERE/chart.py" "$WORK/results/${1:?vllm label}" "$WORK/results/${2:?pega label}" "${3:?png}"
+  uv run -q --with cairosvg python "$HERE/chart.py" "$WORK/results/${1:?vllm label}" "$WORK/results/${2:?pega label}" "${3:?png}" "$VLLM_OMNI"
 }
 
 # One engine at a time on the GPU: start, wait for health, bench, stop.
