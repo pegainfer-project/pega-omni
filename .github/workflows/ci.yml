@@ -74,6 +74,13 @@ jobs:
           cat server.log; exit 1
       - name: Official openai SDK conforms
         run: uv run --with openai tools/openai_sdk_check.py --base-url http://127.0.0.1:8000/v1
+      - name: Start the simulated image engine
+        run: |
+          target/release/pega-omni sim-image --listen 127.0.0.1:8002 > server-image.log 2>&1 &
+          for _ in $(seq 50); do curl -sf localhost:8002/health && exit 0; sleep 0.2; done
+          cat server-image.log; exit 1
+      - name: Official openai SDK conforms on images
+        run: uv run --with openai tools/openai_images_check.py --base-url http://127.0.0.1:8002/v1
       - name: Load smoke, raw audio
         run: target/release/omni-bench --num-requests 20000 --max-concurrency 256 --extra '{"frames":13}' --warmup 256
       - name: Load smoke, SSE wav

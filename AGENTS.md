@@ -1,10 +1,11 @@
 # pega-omni
 
-OpenAI-compatible speech serving. The front end knows no model: it parses a
-request against the engine's `EngineInfo`, hands a checked `Speech` through a
-channel, and streams back the PCM the engine emits. Anything that knows a
-model's name, codec, frame rate or voices belongs in an engine crate, never in
-`omni-frontend`.
+OpenAI-compatible speech and image serving. The front end knows no model: it
+parses a request against the engine's `EngineInfo` (`ImageInfo` for an image
+engine), hands a checked `Speech` (`Generation`) through a channel, and sends
+back what the engine emits: PCM as it streams, pictures once they are done.
+Anything that knows a model's name, codec, frame rate or voices belongs in an
+engine crate, never in `omni-frontend`.
 
 `docs/` is the design and measurement record; code, comments and commit
 messages are English. Only judgment lives in this file; anything a machine can
@@ -14,6 +15,8 @@ check belongs in CI.
 
 - `crates/omni-engine`: the contract. An engine is whatever drains an
   `Inbox`; cancellation is the dropped event receiver. Keep it tiny.
+  `image.rs` is the image contract, the same shape; pictures cross it as raw
+  RGB, PNG is the front end's.
 - `crates/omni-frontend`: routes, protocol parsing (`protocol.rs`), response
   framing (`audio.rs`). Serve through `omni_frontend::serve` so accepted
   sockets get `TCP_NODELAY` (without it every packet waits ~40 ms).
@@ -32,8 +35,9 @@ check belongs in CI.
   oracle.
 - `crates/omni-server`: the `pega-omni` binary; one subcommand per engine.
 - `crates/omni-bench`: the load generator; `playback.rs` is the underrun model.
-- `tools/openai_sdk_check.py`: the official SDK against a live server; it is
-  the compatibility oracle, not our reading of the docs.
+- `tools/openai_sdk_check.py` (`openai_images_check.py` for images): the
+  official SDK against a live server; it is the compatibility oracle, not our
+  reading of the docs.
 - `tools/live_check.py`: the GPT-Live oracle, like the SDK check for speech.
 - `tools/personaplex/golden.py`: records the reference run
   `omni-personaplex`'s golden test compares against.

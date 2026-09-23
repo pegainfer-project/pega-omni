@@ -108,6 +108,21 @@ impl ApiError {
     pub fn unavailable(message: String) -> Self {
         Self { status: StatusCode::SERVICE_UNAVAILABLE, kind: "server_error", code: None, param: None, message }
     }
+
+    pub fn internal(message: String) -> Self {
+        Self { status: StatusCode::INTERNAL_SERVER_ERROR, kind: "server_error", code: None, param: None, message }
+    }
+
+    /// A request for a model this server does not serve.
+    pub fn model_not_found(asked: &str, served: &str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            kind: "invalid_request_error",
+            code: Some("model_not_found"),
+            param: Some("model"),
+            message: format!("model `{asked}` is not served here; this server serves `{served}`"),
+        }
+    }
 }
 
 impl From<Invalid> for ApiError {
@@ -147,14 +162,7 @@ fn framing(name: Option<&str>) -> Result<Framing, ApiError> {
 pub fn parse(bytes: &[u8], info: &EngineInfo) -> Result<(Speech, Delivery), ApiError> {
     let body: Body = serde_json::from_slice(bytes).map_err(|e| ApiError::invalid(None, e.to_string()))?;
     if body.model != info.model {
-        let message = format!("model `{}` is not served here; this server serves `{}`", body.model, info.model);
-        return Err(ApiError {
-            status: StatusCode::NOT_FOUND,
-            kind: "invalid_request_error",
-            code: Some("model_not_found"),
-            param: Some("model"),
-            message,
-        });
+        return Err(ApiError::model_not_found(&body.model, &info.model));
     }
     let delivery =
         Delivery { format: format(body.response_format.as_deref())?, framing: framing(body.stream_format.as_deref())? };
