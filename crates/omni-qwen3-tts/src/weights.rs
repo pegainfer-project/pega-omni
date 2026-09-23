@@ -52,8 +52,8 @@ impl File {
     pub fn host(&self, name: &str) -> Result<Host> {
         let (dtype, shape, bytes) = self.raw(name)?;
         let data = match dtype {
-            Dtype::F32 => bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
-            Dtype::BF16 => bytes.chunks_exact(2).map(|b| bf16::from_le_bytes([b[0], b[1]]).to_f32()).collect(),
+            Dtype::F32 => bytes.as_chunks().0.iter().map(|&b| f32::from_le_bytes(b)).collect(),
+            Dtype::BF16 => bytes.as_chunks().0.iter().map(|&b| bf16::from_le_bytes(b).to_f32()).collect(),
             other => bail!("tensor {name}: unsupported dtype {other:?}"),
         };
         Ok(Host { shape, data })
@@ -63,8 +63,8 @@ impl File {
     pub fn ints(&self, name: &str) -> Result<Vec<i32>> {
         let (dtype, _, bytes) = self.raw(name)?;
         match dtype {
-            Dtype::I64 => Ok(bytes.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap()) as i32).collect()),
-            Dtype::I32 => Ok(bytes.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect()),
+            Dtype::I64 => Ok(bytes.as_chunks().0.iter().map(|&b| i64::from_le_bytes(b) as i32).collect()),
+            Dtype::I32 => Ok(bytes.as_chunks().0.iter().map(|&b| i32::from_le_bytes(b)).collect()),
             other => bail!("tensor {name}: expected integers, got {other:?}"),
         }
     }
