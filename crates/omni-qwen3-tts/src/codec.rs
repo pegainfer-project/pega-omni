@@ -478,26 +478,20 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
         let kv = g.region(2 * 72 * qd * 2);
         g.gemm(&format!("l{i}.qkv"), "col", "x", &qkv, 1, (3 * qd, hidden));
         g.launch(
-            &format!("l{i}.rope"),
-            "codec_rope_kv",
-            [json!("seqs"), json!((3 * heads).div_ceil(8)), json!(1)],
-            THREADS,
+            &format!("l{i}.attn"),
+            "codec_attention",
+            [json!("seqs"), json!(heads), json!(1)],
+            128,
             vec![
-                io("col"),
+                inb("col"),
                 ini("pos"),
                 ini("lines"),
                 state_io(kv),
+                outb("a"),
                 stride(),
                 i32a(heads),
                 ("f32", json!({"f32": cfg.rope_theta})),
             ],
-        );
-        g.launch(
-            &format!("l{i}.attn"),
-            "codec_ring_attention",
-            [json!("seqs"), json!(heads.div_ceil(8)), json!(1)],
-            THREADS,
-            vec![inb("col"), ini("pos"), ini("lines"), state_in(kv), outb("a"), stride(), i32a(heads)],
         );
         g.gemm(&format!("l{i}.o"), "x", "a", &o, 1, (hidden, qd));
         g.launch(

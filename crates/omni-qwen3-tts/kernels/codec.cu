@@ -148,65 +148,105 @@ extern "C" __global__ void codec_add_rms_norm(bf16* x, bf16* res, const bf16* w,
 constexpr int kHead = 64;
 constexpr int kWindow = 72;
 
-// qkv rows are [q | k | v], `heads` heads of 64 each. Q is rotated in place;
-// rotated K and V go to the layer's ring (`kv` = K[72][heads*64], V after it)
-// at frame `pos % 72`. One warp per (row, head of q, k or v).
-extern "C" __global__ void codec_rope_kv(bf16* qkv, const int32_t* pos, const int32_t* lines, void* kv,
-                                         int64_t stride, int heads, float theta) {
-  const int r = blockIdx.x;
-  const int head = blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5);
-  const int lane = threadIdx.x & 31;
-  if (head >= 3 * heads) return;
-  const int width = heads * kHead;
-  bf16* row = qkv + (int64_t)r * 3 * width + head * kHead;
-  bf16* ring = slot(kv, lines, r, stride);
-  const int p = pos[r];
-  const int64_t at = (int64_t)(p % kWindow) * width;
-  if (head >= 2 * heads) {
-    bf16* dst = ring + (int64_t)kWindow * width + at + (head - 2 * heads) * kHead;
-    dst[lane] = row[lane];
-    dst[lane + 32] = row[lane + 32];
-    return;
-  }
-  const float lo = f32(row[lane]), hi = f32(row[lane + 32]);
-  const float inv_freq = 1.f / powf(theta, (float)(2 * lane) / kHead);
-  float s, c;
-  sincosf((float)p * inv_freq, &s, &c);
-  bf16* dst = head < heads ? row : ring + at + (head - heads) * kHead;
-  dst[lane] = to_bf16(lo * c - hi * s);
-  dst[lane + 32] = to_bf16(hi * c + lo * s);
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+  return v;
 }
 
-// Each row's query against the last min(pos + 1, 72) frames of its ring,
-// one warp per (row, head), online softmax in f32.
-extern "C" __global__ void codec_ring_attention(const bf16* qkv, const int32_t* pos, const int32_t* lines,
-                                                const void* kv, bf16* out, int64_t stride, int heads) {
-  const int r = blockIdx.x;
-  const int head = blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5);
-  const int lane = threadIdx.x & 31;
-  if (head >= heads) return;
+// qkv rows are [q | k | v], `heads` heads of 64 each; the layer's ring (`kv`)
+// is K[72][heads*64] then V, frame `p` at `p % 72`. Per (row, head): RoPE on q
+// and k, k and v into the ring, then q against the last min(p + 1, 72) frames,
+// softmax in f32. One block of 128 per (row, head), every phase one load deep:
+// a frame per thread for the scores, then sixteen 8-lane groups each summing
+// every sixteenth frame's V.
+extern "C" __global__ void __launch_bounds__(128)
+    codec_attention(const bf16* qkv, const int32_t* pos, const int32_t* lines, void* kv, bf16* out, int64_t stride,
+                    int heads, float theta) {
+  __shared__ float sq[kHead];
+  __shared__ float ss[kWindow + 8];
+  __shared__ float sacc[4][kHead];
+  const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+  const int r = blockIdx.x, head = blockIdx.y;
   const int width = heads * kHead;
-  const bf16* q = qkv + (int64_t)r * 3 * width + head * kHead;
-  const bf16* ring = slot(const_cast<void*>(kv), lines, r, stride);
-  const float q0 = f32(q[lane]), q1 = f32(q[lane + 32]);
-  const float scale = rsqrtf((float)kHead);
+  const bf16* row = qkv + (int64_t)r * 3 * width + head * kHead;
+  bf16* ring = slot(kv, lines, r, stride);
   const int p = pos[r];
-  const int n = p + 1 < kWindow ? p + 1 : kWindow;
-  float m = -INFINITY, l = 0.f, a0 = 0.f, a1 = 0.f;
-  for (int j = p - n + 1; j <= p; ++j) {
-    const bf16* k = ring + (int64_t)(j % kWindow) * width + head * kHead;
-    const bf16* v = k + (int64_t)kWindow * width;
-    const float score = warp_sum(q0 * f32(k[lane]) + q1 * f32(k[lane + 32])) * scale;
-    const float m2 = fmaxf(m, score);
-    const float corr = __expf(m - m2), e = __expf(score - m2);
-    l = l * corr + e;
-    a0 = a0 * corr + e * f32(v[lane]);
-    a1 = a1 * corr + e * f32(v[lane + 32]);
-    m = m2;
+  const int64_t at = (int64_t)(p % kWindow) * width + head * kHead;
+  const int64_t vofs = (int64_t)kWindow * width;
+  if (w < 2) {
+    const float inv_freq = 1.f / powf(theta, (float)(2 * lane) / kHead);
+    float s, c;
+    sincosf((float)p * inv_freq, &s, &c);
+    const bf16* src = row + w * width;
+    const float lo = f32(src[lane]), hi = f32(src[lane + 32]);
+    const bf16 a = to_bf16(lo * c - hi * s), b = to_bf16(hi * c + lo * s);
+    if (w == 0) {
+      sq[lane] = f32(a);
+      sq[lane + 32] = f32(b);
+    } else {
+      ring[at + lane] = a;
+      ring[at + lane + 32] = b;
+    }
+  } else if (w == 2) {
+    reinterpret_cast<uint32_t*>(ring + vofs + at)[lane] = reinterpret_cast<const uint32_t*>(row + 2 * width)[lane];
   }
-  bf16* o = out + (int64_t)r * width + head * kHead;
-  o[lane] = to_bf16(a0 / l);
-  o[lane + 32] = to_bf16(a1 / l);
+  __syncthreads();
+  const int n = p + 1 < kWindow ? p + 1 : kWindow;
+  const int j0 = p - n + 1;
+  if (tid < n) {
+    const uint4* k = reinterpret_cast<const uint4*>(ring + (int64_t)((j0 + tid) % kWindow) * width + head * kHead);
+    uint4 u[8];
+#pragma unroll
+    for (int q = 0; q < 8; ++q) u[q] = k[q];
+    float dot = 0.f;
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+      const bf16* e = reinterpret_cast<const bf16*>(&u[q]);
+#pragma unroll
+      for (int x = 0; x < 8; ++x) dot += sq[q * 8 + x] * f32(e[x]);
+    }
+    ss[tid] = dot * rsqrtf((float)kHead);
+  }
+  __syncthreads();
+  float m = -INFINITY;
+  for (int j = lane; j < n; j += 32) m = fmaxf(m, ss[j]);
+  m = warp_max(m);
+  float l = 0.f;
+  for (int j = lane; j < n; j += 32) l += __expf(ss[j] - m);
+  l = warp_sum(l);
+  const int grp = tid >> 3, sub = tid & 7;
+  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  const bf16* vbase = ring + vofs + head * kHead + sub * 8;
+  uint4 u[5];
+#pragma unroll
+  for (int i = 0; i < 5; ++i) {
+    const int jj = grp + 16 * i;
+    if (jj < n) u[i] = *reinterpret_cast<const uint4*>(vbase + (int64_t)((j0 + jj) % kWindow) * width);
+  }
+#pragma unroll
+  for (int i = 0; i < 5; ++i) {
+    const int jj = grp + 16 * i;
+    if (jj >= n) continue;
+    const float pj = __expf(ss[jj] - m);
+    const bf16* e = reinterpret_cast<const bf16*>(&u[i]);
+#pragma unroll
+    for (int x = 0; x < 8; ++x) acc[x] += pj * f32(e[x]);
+  }
+#pragma unroll
+  for (int x = 0; x < 8; ++x) {
+    acc[x] += __shfl_xor_sync(0xffffffffu, acc[x], 8);
+    acc[x] += __shfl_xor_sync(0xffffffffu, acc[x], 16);
+  }
+  if (lane < 8) {
+#pragma unroll
+    for (int x = 0; x < 8; ++x) sacc[w][sub * 8 + x] = acc[x];
+  }
+  __syncthreads();
+  if (tid < kHead) {
+    const float o = (sacc[0][tid] + sacc[1][tid] + sacc[2][tid] + sacc[3][tid]) / l;
+    out[(int64_t)r * width + head * kHead + tid] = to_bf16(o);
+  }
 }
 
 __device__ __forceinline__ bool causal_row(const bf16* x, const bf16* ring, int64_t g, int t, int src, int p, int T,
