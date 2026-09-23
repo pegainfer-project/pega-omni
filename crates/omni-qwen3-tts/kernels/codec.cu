@@ -75,8 +75,16 @@ __device__ __forceinline__ float block_sum(float v) {
   return v;
 }
 
+// sin by the hardware approximation after a two-step reduction to [-π, π]
+// (absolute error ~4e-7 there): the accurate sinf's instruction count, not
+// memory, bounds every kernel that applies SnakeBeta.
+__device__ __forceinline__ float fast_sin(float y) {
+  const float k = rintf(y * 0.159154943091895336f);
+  return __sinf(fmaf(-k, -1.74845553e-7f, fmaf(-k, 6.28318548202514648f, y)));
+}
+
 __device__ __forceinline__ float snake(float x, float a, float inv_b) {
-  const float s = sinf(a * x);
+  const float s = fast_sin(a * x);
   return x + inv_b * s * s;
 }
 
