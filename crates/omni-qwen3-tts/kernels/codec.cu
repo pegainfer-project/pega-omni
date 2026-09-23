@@ -231,14 +231,17 @@ __device__ __forceinline__ float warp_max(float v) {
 // qkv rows are [q | k | v], `heads` heads of 64 each; the layer's ring (`kv`)
 // is K[72][heads*64] then V, frame `p` at `p % 72`. Per (row, head): RoPE on q
 // and k, k and v into the ring, then q against the last min(p + 1, 72) frames,
-// softmax in f32. One block of 128 per (row, head), every phase one load deep:
-// a frame per thread for the scores, then sixteen 8-lane groups each summing
-// every sixteenth frame's V.
+// softmax in f32. One block of 128 per (row, head), one memory round trip
+// deep: every thread loads its earlier frames' K (a frame per thread, for the
+// scores) and V (sixteen 8-lane groups, every sixteenth frame) while the first
+// warps rotate q and k; the current frame's K and V come from shared memory.
 extern "C" __global__ void __launch_bounds__(128)
     codec_attention(const bf16* qkv, const int32_t* pos, const int32_t* lines, void* kv, bf16* out, int64_t stride,
                     int heads, float theta) {
   pdl();
   __shared__ float sq[kHead];
+  __shared__ __align__(16) bf16 sk[kHead];
+  __shared__ __align__(16) bf16 sv[kHead];
   __shared__ float ss[kWindow + 8];
   __shared__ float sacc[4][kHead];
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
@@ -247,8 +250,23 @@ extern "C" __global__ void __launch_bounds__(128)
   const bf16* row = qkv + (int64_t)r * 3 * width + head * kHead;
   bf16* ring = slot(kv, lines, r, stride);
   const int p = pos[r];
-  const int64_t at = (int64_t)(p % kWindow) * width + head * kHead;
+  const int n = p + 1 < kWindow ? p + 1 : kWindow;
+  const int j0 = p - n + 1;
   const int64_t vofs = (int64_t)kWindow * width;
+  const bf16* kbase = ring + head * kHead;
+  const int grp = tid >> 3, sub = tid & 7;
+  uint4 ku[8], vu[5];
+  if (tid < n - 1) {
+    const uint4* k = reinterpret_cast<const uint4*>(kbase + (int64_t)((j0 + tid) % kWindow) * width);
+#pragma unroll
+    for (int q = 0; q < 8; ++q) ku[q] = k[q];
+  }
+#pragma unroll
+  for (int i = 0; i < 5; ++i) {
+    const int jj = grp + 16 * i;
+    if (jj < n - 1) vu[i] = *reinterpret_cast<const uint4*>(kbase + vofs + (int64_t)((j0 + jj) % kWindow) * width + sub * 8);
+  }
+  const int64_t at = (int64_t)(p % kWindow) * width + head * kHead;
   if (w < 2) {
     const float inv_freq = 1.f / powf(theta, (float)(2 * lane) / kHead);
     float s, c;
@@ -260,24 +278,26 @@ extern "C" __global__ void __launch_bounds__(128)
       sq[lane] = f32(a);
       sq[lane + 32] = f32(b);
     } else {
+      sk[lane] = a;
+      sk[lane + 32] = b;
       ring[at + lane] = a;
       ring[at + lane + 32] = b;
     }
   } else if (w == 2) {
-    reinterpret_cast<uint32_t*>(ring + vofs + at)[lane] = reinterpret_cast<const uint32_t*>(row + 2 * width)[lane];
+    const uint32_t v = reinterpret_cast<const uint32_t*>(row + 2 * width)[lane];
+    reinterpret_cast<uint32_t*>(sv)[lane] = v;
+    reinterpret_cast<uint32_t*>(ring + vofs + at)[lane] = v;
   }
   __syncthreads();
-  const int n = p + 1 < kWindow ? p + 1 : kWindow;
-  const int j0 = p - n + 1;
   if (tid < n) {
-    const uint4* k = reinterpret_cast<const uint4*>(ring + (int64_t)((j0 + tid) % kWindow) * width + head * kHead);
-    uint4 u[8];
+    if (tid == n - 1) {
 #pragma unroll
-    for (int q = 0; q < 8; ++q) u[q] = k[q];
+      for (int q = 0; q < 8; ++q) ku[q] = reinterpret_cast<const uint4*>(sk)[q];
+    }
     float dot = 0.f;
 #pragma unroll
     for (int q = 0; q < 8; ++q) {
-      const bf16* e = reinterpret_cast<const bf16*>(&u[q]);
+      const bf16* e = reinterpret_cast<const bf16*>(&ku[q]);
 #pragma unroll
       for (int x = 0; x < 8; ++x) dot += sq[q * 8 + x] * f32(e[x]);
     }
@@ -290,21 +310,14 @@ extern "C" __global__ void __launch_bounds__(128)
   float l = 0.f;
   for (int j = lane; j < n; j += 32) l += __expf(ss[j] - m);
   l = warp_sum(l);
-  const int grp = tid >> 3, sub = tid & 7;
   float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  const bf16* vbase = ring + vofs + head * kHead + sub * 8;
-  uint4 u[5];
-#pragma unroll
-  for (int i = 0; i < 5; ++i) {
-    const int jj = grp + 16 * i;
-    if (jj < n) u[i] = *reinterpret_cast<const uint4*>(vbase + (int64_t)((j0 + jj) % kWindow) * width);
-  }
 #pragma unroll
   for (int i = 0; i < 5; ++i) {
     const int jj = grp + 16 * i;
     if (jj >= n) continue;
+    if (jj == n - 1) vu[i] = reinterpret_cast<const uint4*>(sv)[sub];
     const float pj = __expf(ss[jj] - m);
-    const bf16* e = reinterpret_cast<const bf16*>(&u[i]);
+    const bf16* e = reinterpret_cast<const bf16*>(&vu[i]);
 #pragma unroll
     for (int x = 0; x < 8; ++x) acc[x] += pj * f32(e[x]);
   }
