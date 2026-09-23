@@ -36,19 +36,6 @@ unsafe extern "C" {
         stream: Stream,
     ) -> i32;
 
-    pub fn omni_window_prefill_hd64(
-        q: Ptr,
-        k: Ptr,
-        v: Ptr,
-        out: Ptr,
-        len: u32,
-        num_heads: u32,
-        stride_n: u32,
-        window_left: i32,
-        sm_scale: f32,
-        stream: Stream,
-    ) -> i32;
-
     pub fn omni_rms_norm(x: Ptr, w: Ptr, out: Ptr, rows: u32, dim: u32, eps: f32, stream: Stream) -> i32;
 
     pub fn omni_add_rms_norm(x: Ptr, residual: Ptr, w: Ptr, rows: u32, dim: u32, eps: f32, stream: Stream) -> i32;
@@ -113,57 +100,6 @@ unsafe extern "C" {
         block_exempt: Ptr,
         uniform: Ptr,
         out: Ptr,
-        stream: Stream,
-    ) -> i32;
-
-    pub fn omni_im2col(
-        x: Ptr,
-        bias: Ptr,
-        a: Ptr,
-        inv_b: Ptr,
-        col: Ptr,
-        t_len: u32,
-        c_len: u32,
-        k_len: u32,
-        dilation: u32,
-        stream: Stream,
-    ) -> i32;
-
-    pub fn omni_col2im(
-        z: Ptr,
-        bias: Ptr,
-        out: Ptr,
-        l_len: u32,
-        c_len: u32,
-        k_len: u32,
-        stride: u32,
-        stream: Stream,
-    ) -> i32;
-
-    pub fn omni_dwconv_layernorm(
-        x: Ptr,
-        w: Ptr,
-        b: Ptr,
-        ln_w: Ptr,
-        ln_b: Ptr,
-        out: Ptr,
-        t_len: u32,
-        c_len: u32,
-        k_len: u32,
-        eps: f32,
-        stream: Stream,
-    ) -> i32;
-
-    pub fn omni_conv_out(
-        x: Ptr,
-        a: Ptr,
-        inv_b: Ptr,
-        w: Ptr,
-        bias: Ptr,
-        out: Ptr,
-        t_len: u32,
-        c_len: u32,
-        k_len: u32,
         stream: Stream,
     ) -> i32;
 }

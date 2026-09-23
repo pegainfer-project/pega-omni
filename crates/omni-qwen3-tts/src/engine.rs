@@ -3,13 +3,16 @@
 //!
 //! One engine thread runs steps back to back. A step admits waiting requests
 //! (FIFO, while batch slots, the per-step token budget and KV pages allow),
-//! advances every running request by one frame through the [`Talker`], then
-//! decodes whichever requests have a chunk due. Serial on purpose: talker and
-//! codec share the stream; overlapping them is a measured change for later.
+//! advances every running request by one frame through the [`Talker`], decodes
+//! every new frame to audio in one batched [`Codec`] call, and sends whichever
+//! requests have a chunk due. The codec streams (each request keeps its
+//! decoder state), so a chunk's size decides only when audio leaves, not what
+//! it costs. Serial on purpose; overlapping talker and codec is a measured
+//! change for later.
 //!
-//! Admission reserves a request's whole KV up front, sized by its frame cap
-//! (proportional to the input length), so a running request never waits for
-//! pages and nothing is ever preempted.
+//! Admission reserves a request's whole KV and its codec state up front, the
+//! KV sized by its frame cap (proportional to the input length), so a running
+//! request never waits for memory and nothing is ever preempted.
 //!
 //! The decisions are pure functions ([`chunk_due`], [`frame_cap`],
 //! [`pages_for`]); [`Engine`] is the shell around them.
@@ -17,10 +20,12 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::TryRecvError;
 use std::thread::JoinHandle;
 
+use anyhow::Context;
 use anyhow::Result;
 use bytes::Bytes;
 use omni_cuda::Gpu;
@@ -29,6 +34,7 @@ use omni_engine::EngineInfo;
 use omni_engine::Event;
 use omni_engine::Extra;
 use omni_engine::Finish;
+use omni_engine::Handle;
 use omni_engine::Inbox;
 use omni_engine::Speech;
 use rand::RngExt;
@@ -37,6 +43,7 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::codec::Codec;
+use crate::codec::Stream;
 use crate::config::Config;
 use crate::prompt;
 use crate::prompt::Prompt;
@@ -59,11 +66,6 @@ pub struct Options {
     pub page_size: usize,
     pub first_chunk_frames: usize,
     pub chunk_frames: usize,
-    /// Frames of left context each chunk is decoded with. The decoder's
-    /// attention window (72) keeps streamed audio within bf16 noise of a
-    /// whole-utterance decode (37 dB against the official run); the official
-    /// `chunked_decode`'s 25 drops that to 22 dB over 8-frame chunks.
-    pub context_frames: usize,
 }
 
 impl Default for Options {
@@ -75,7 +77,6 @@ impl Default for Options {
             page_size: 16,
             first_chunk_frames: 2,
             chunk_frames: 8,
-            context_frames: 72,
         }
     }
 }
@@ -121,13 +122,12 @@ impl Model {
         };
         let weights = File::open(&dir.join("model.safetensors"))?;
         let talker = Talker::load(gpu, &weights, &config.model, &config.generation, limits)?;
-        let codec_frames = opts.context_frames + opts.first_chunk_frames.max(opts.chunk_frames);
         let codec = Codec::load(
-            gpu,
+            gpu.ordinal(),
             &File::open(&dir.join("speech_tokenizer/model.safetensors"))?,
             &config.codec,
             config.samples_per_frame,
-            codec_frames,
+            opts.max_batch,
         )?;
         Ok(Self { config, tokenizer, talker, codec })
     }
@@ -156,7 +156,11 @@ struct Job {
     prompt: Prompt,
     pages: Vec<i32>,
     cached: usize,
-    frames: Vec<[i32; GROUPS]>,
+    codec: Option<Stream>,
+    last: Option<[i32; GROUPS]>,
+    frames: usize,
+    /// Decoded audio not yet sent, s16le.
+    pcm: Vec<u8>,
     emitted: usize,
     seen: Vec<u32>,
     rng: StdRng,
@@ -170,7 +174,7 @@ impl Job {
     }
 
     fn done(&self) -> bool {
-        self.ended || self.frames.len() >= self.cap
+        self.ended || self.frames >= self.cap
     }
 }
 
@@ -203,7 +207,10 @@ impl Engine {
             prompt,
             pages: vec![],
             cached: 0,
-            frames: vec![],
+            codec: None,
+            last: None,
+            frames: 0,
+            pcm: vec![],
             emitted: 0,
             seen: vec![0; m.talker.seen_words()],
             rng: StdRng::seed_from_u64(seed),
@@ -222,7 +229,7 @@ impl Engine {
         }
     }
 
-    fn admit(&mut self) {
+    fn admit(&mut self) -> Result<()> {
         let mut tokens: usize = self.running.len();
         while let Some(job) = self.waiting.front() {
             let need = pages_for(job.prompt.len() + job.cap, self.opts.page_size);
@@ -235,13 +242,15 @@ impl Engine {
             let mut job = self.waiting.pop_front().expect("front exists");
             tokens += job.prompt.len();
             job.pages = self.free.split_off(self.free.len() - need);
+            job.codec = Some(self.model.codec.open()?);
             self.running.push(job);
         }
+        Ok(())
     }
 
     /// One step: admit, one frame for every running request, due chunks out.
     pub fn step(&mut self) -> Result<()> {
-        self.admit();
+        self.admit()?;
         if self.running.is_empty() {
             return Ok(());
         }
@@ -259,17 +268,19 @@ impl Engine {
                 Row {
                     pages: &j.pages,
                     cached: j.cached,
-                    input: match j.frames.last() {
+                    input: match &j.last {
                         Some(f) if j.prefilled() => Input::Frame(f),
                         _ => Input::Prompt(&j.prompt),
                     },
                     seen: &j.seen,
-                    generated: j.frames.len(),
+                    generated: j.frames,
                     uniforms: u,
                 }
             })
             .collect();
         let frames = self.model.talker.step(&self.gpu, &rows, None)?;
+
+        let mut fresh = Vec::with_capacity(order.len());
 
         for (&i, frame) in order.iter().zip(frames) {
             let j = &mut self.running[i];
@@ -278,31 +289,44 @@ impl Engine {
                 Frame::End => j.ended = true,
                 Frame::Codes(c) => {
                     j.seen[c[0] as usize / 32] |= 1 << (c[0] % 32);
-                    j.frames.push(c);
+                    j.frames += 1;
+                    j.last = Some(c);
+                    fresh.push(i);
                 }
             }
         }
+        fresh.sort_unstable();
+        self.decode(&fresh)?;
         self.emit()
     }
 
+    /// The frame each of `fresh` (ascending) produced this step, decoded in one call.
+    fn decode(&mut self, fresh: &[usize]) -> Result<()> {
+        let mut batch: Vec<(&mut Stream, [i32; GROUPS])> = self
+            .running
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, _)| fresh.binary_search(i).is_ok())
+            .map(|(_, j)| (j.codec.as_mut().expect("admitted"), j.last.expect("a frame")))
+            .collect();
+        let wav = self.model.codec.decode(&mut batch)?;
+        let spf = self.model.config.samples_per_frame;
+        for (i, samples) in fresh.iter().zip(wav.chunks(spf)) {
+            let pcm = samples.iter().flat_map(|&x| ((x * 32767.0).round() as i16).to_le_bytes());
+            self.running[*i].pcm.extend(pcm);
+        }
+        Ok(())
+    }
+
     fn emit(&mut self) -> Result<()> {
-        let (first, steady, ctx, spf) = (
-            self.opts.first_chunk_frames,
-            self.opts.chunk_frames,
-            self.opts.context_frames,
-            self.model.config.samples_per_frame,
-        );
+        let (first, steady, spf) =
+            (self.opts.first_chunk_frames, self.opts.chunk_frames, self.model.config.samples_per_frame);
         let mut keep = Vec::with_capacity(self.running.len());
         for mut j in std::mem::take(&mut self.running) {
             let mut alive = true;
-            while let Some(n) = chunk_due(j.frames.len(), j.emitted, j.done(), first, steady) {
-                let start = j.emitted.saturating_sub(ctx);
-                let codes: Vec<i32> = j.frames[start..j.emitted + n].iter().flatten().copied().collect();
-                let wav = self.model.codec.decode(&self.gpu, &codes)?;
-                let pcm: Vec<u8> = wav[(j.emitted - start) * spf..]
-                    .iter()
-                    .flat_map(|&x| ((x * 32767.0).round() as i16).to_le_bytes())
-                    .collect();
+            while let Some(n) = chunk_due(j.frames, j.emitted, j.done(), first, steady) {
+                let rest = j.pcm.split_off(n * spf * 2);
+                let pcm = std::mem::replace(&mut j.pcm, rest);
                 j.emitted += n;
                 if j.sink.send(Event::Audio(Bytes::from(pcm))).is_err() {
                     tracing::debug!(id = j.id, "client gone");
@@ -311,11 +335,8 @@ impl Engine {
                 }
             }
             if alive && j.done() {
-                let done = Done {
-                    finish: Finish::Complete,
-                    input_units: j.prompt.len() as u32,
-                    frames: j.frames.len() as u32,
-                };
+                let done =
+                    Done { finish: Finish::Complete, input_units: j.prompt.len() as u32, frames: j.frames as u32 };
                 let _ = j.sink.send(Event::Done(done));
                 alive = false;
             }
@@ -334,17 +355,41 @@ impl Engine {
     }
 }
 
-/// Runs `engine` on its own thread until every [`omni_engine::Handle`] is
-/// dropped and the admitted work is done.
-pub fn spawn(inbox: Inbox, engine: Engine) -> JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("omni-qwen3-tts".into())
-        .spawn(move || {
-            if let Err(e) = run(inbox, engine) {
-                tracing::error!("engine stopped: {e:#}");
+/// Loads the checkpoint at `dir` on a thread of its own and serves from it
+/// until every [`omni_engine::Handle`] is dropped and the admitted work is
+/// done. The model is loaded where it runs: the codec's kern runtime is bound
+/// to the thread that made it.
+pub fn start(
+    device: usize,
+    dir: PathBuf,
+    opts: Options,
+    name: String,
+    max_input_chars: usize,
+    queue: usize,
+) -> Result<(Handle, JoinHandle<()>)> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::Builder::new().name("omni-qwen3-tts".into()).spawn(move || {
+        let loaded = (|| {
+            let gpu = Gpu::new(device)?;
+            gpu.bind()?;
+            let model = Model::load(&gpu, &dir, &opts).with_context(|| format!("load {}", dir.display()))?;
+            let (handle, inbox) = omni_engine::channel(model.info(&name, max_input_chars), queue);
+            anyhow::Ok((handle, inbox, Engine::new(gpu, model, opts)))
+        })();
+        match loaded {
+            Ok((handle, inbox, engine)) => {
+                let _ = tx.send(Ok(handle));
+                if let Err(e) = run(inbox, engine) {
+                    tracing::error!("engine stopped: {e:#}");
+                }
             }
-        })
-        .expect("spawn omni-qwen3-tts")
+            Err(e) => {
+                let _ = tx.send(Err(e));
+            }
+        }
+    })?;
+    let handle = rx.recv().context("the engine thread died while loading")??;
+    Ok((handle, thread))
 }
 
 fn run(inbox: Inbox, mut engine: Engine) -> Result<()> {

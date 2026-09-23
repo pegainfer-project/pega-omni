@@ -65,7 +65,6 @@ impl<T> Buf<T> {
 pub enum Act {
     None = 0,
     Silu = 1,
-    Gelu = 2,
 }
 
 /// The draw of [`Gpu::sample`]: one setting for every row, per-row device
@@ -189,6 +188,10 @@ impl Gpu {
         let stream = ctx.new_stream()?;
         let blas = CudaBlas::new(stream.clone())?;
         Ok(Self { stream, blas })
+    }
+
+    pub fn ordinal(&self) -> usize {
+        self.stream.context().ordinal()
     }
 
     /// Makes this device current on the calling thread; kernels launch through
@@ -442,37 +445,6 @@ impl Gpu {
         check(code, "paged_prefill")
     }
 
-    /// Causal self-attention of one sequence with a `window`-key sliding window
-    /// (head_dim 64); `q`, `k`, `v` rows share stride `stride`.
-    pub fn window_prefill(
-        &self,
-        (q, k, v): (Ptr, Ptr, Ptr),
-        stride: usize,
-        out: Ptr,
-        len: usize,
-        heads: usize,
-        window: usize,
-    ) -> Result<()> {
-        if len == 0 {
-            return Ok(());
-        }
-        let code = unsafe {
-            ffi::omni_window_prefill_hd64(
-                q,
-                k,
-                v,
-                out,
-                len as u32,
-                heads as u32,
-                stride as u32,
-                window as i32 - 1,
-                (64f32).powf(-0.5),
-                self.s(),
-            )
-        };
-        check(code, "window_prefill")
-    }
-
     /// Picks one token per row from bf16 logits (`rows × vocab`, row stride `ld`).
     pub fn sample(
         &self,
@@ -502,60 +474,5 @@ impl Gpu {
             )
         };
         check(code, "sample")
-    }
-
-    /// `col[t, j·C + c] = snake(x[t − (K−1−j)·dilation, c] + bias[c])`, zero before
-    /// the start; `bias` and the snake parameters (`a`, `inv_b`, f32) may be 0.
-    pub fn im2col(
-        &self,
-        x: Ptr,
-        bias: Ptr,
-        (a, inv_b): (Ptr, Ptr),
-        col: Ptr,
-        (t, c): (usize, usize),
-        k: usize,
-        dilation: usize,
-    ) -> Result<()> {
-        let code = unsafe {
-            ffi::omni_im2col(x, bias, a, inv_b, col, t as u32, c as u32, k as u32, dilation as u32, self.s())
-        };
-        check(code, "im2col")
-    }
-
-    /// Transposed-conv overlap-add: `z` is `[l, K·C]` tap-major, `out` is `[l·stride, C]`.
-    pub fn col2im(&self, z: Ptr, bias: Ptr, out: Ptr, (l, c): (usize, usize), k: usize, stride: usize) -> Result<()> {
-        let code = unsafe { ffi::omni_col2im(z, bias, out, l as u32, c as u32, k as u32, stride as u32, self.s()) };
-        check(code, "col2im")
-    }
-
-    /// Depthwise causal conv (`w` `[C, K]`, bias `b`) then LayerNorm (`ln_w`, `ln_b`).
-    pub fn dwconv_layernorm(
-        &self,
-        x: Ptr,
-        (w, b): (Ptr, Ptr),
-        (ln_w, ln_b): (Ptr, Ptr),
-        out: Ptr,
-        (t, c): (usize, usize),
-        k: usize,
-        eps: f32,
-    ) -> Result<()> {
-        let code = unsafe {
-            ffi::omni_dwconv_layernorm(x, w, b, ln_w, ln_b, out, t as u32, c as u32, k as u32, eps, self.s())
-        };
-        check(code, "dwconv_layernorm")
-    }
-
-    /// SnakeBeta, the `C → 1` causal conv (`w` `[K, C]` tap-major) and a clamp to `[-1, 1]`, into f32 samples.
-    pub fn conv_out(
-        &self,
-        x: Ptr,
-        (a, inv_b): (Ptr, Ptr),
-        (w, bias): (Ptr, Ptr),
-        out: Ptr,
-        (t, c): (usize, usize),
-        k: usize,
-    ) -> Result<()> {
-        let code = unsafe { ffi::omni_conv_out(x, a, inv_b, w, bias, out, t as u32, c as u32, k as u32, self.s()) };
-        check(code, "conv_out")
     }
 }

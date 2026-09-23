@@ -1,11 +1,8 @@
-// Attention, all of it FlashInfer FA2 with bf16 Q/KV/O and NHD layout.
-//
-// - Paged batch prefill at head_dim 128: every Qwen3-shaped transformer
-//   (talker, code predictor). Decode rows are prefill rows of length one, so a
-//   step with admissions and running rows is one call. The host builds the tile
-//   plan (`request_indices`, `qo_tile_indices`) for the CTA tile it passes.
-// - Single-sequence prefill at head_dim 64 with a sliding window: the codec
-//   decoder's transformer, which reads K/V straight out of its fused QKV rows.
+// Attention: FlashInfer FA2's paged batch prefill at head_dim 128, bf16 Q/KV/O,
+// NHD layout, for every Qwen3-shaped transformer (talker, code predictor).
+// Decode rows are prefill rows of length one, so a step with admissions and
+// running rows is one call. The host builds the tile plan (`request_indices`,
+// `qo_tile_indices`) for the CTA tile it passes.
 #include "common.cuh"
 
 #include <flashinfer/attention/default_prefill_params.cuh>
@@ -17,7 +14,6 @@
 using namespace flashinfer;
 
 using Full = DefaultAttention</*custom_mask=*/false, /*sliding_window=*/false, /*soft_cap=*/false, /*alibi=*/false>;
-using Window = DefaultAttention<false, true, false, false>;
 
 extern "C" {
 
@@ -55,21 +51,6 @@ int omni_paged_prefill_hd128(bf16* q, uint32_t q_stride_n, bf16* out, bf16* k_po
                                                             Full, Params>(p, nullptr, nullptr, false, stream);
     if (e != cudaSuccess) return (int)e;
   }))
-}
-
-// `window_left` counts keys before the query that stay visible: an N-key
-// window passes N - 1.
-int omni_window_prefill_hd64(bf16* q, bf16* k, bf16* v, bf16* out, uint32_t len, uint32_t num_heads,
-                             uint32_t stride_n, int32_t window_left, float sm_scale, cudaStream_t stream) {
-  constexpr uint32_t D = 64;
-  using Params = SinglePrefillParams<bf16, bf16, bf16>;
-  Params p(q, k, v, /*custom_mask=*/nullptr, out, /*lse=*/nullptr, /*alibi=*/nullptr, num_heads, num_heads, len,
-           len, stride_n, D, stride_n, D, D, window_left, /*soft_cap=*/0.f, sm_scale, 1.f, 1e4f);
-  OMNI_TRY({
-    cudaError_t e = SinglePrefillWithKVCacheDispatched<D, D, PosEncodingMode::kNone, false, MaskMode::kCausal,
-                                                       Window, Params>(p, nullptr, stream);
-    if (e != cudaSuccess) return (int)e;
-  })
 }
 
 }  // extern "C"

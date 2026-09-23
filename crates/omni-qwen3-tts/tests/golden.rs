@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use omni_cuda::Gpu;
 use omni_qwen3_tts::codec::Codec;
 use omni_qwen3_tts::config::Config;
-use omni_qwen3_tts::engine::chunk_due;
 use omni_qwen3_tts::prompt;
 use omni_qwen3_tts::prompt::Tokenizer;
 use omni_qwen3_tts::talker::Frame;
@@ -145,26 +144,37 @@ fn matches_the_official_run() {
     eprintln!("predictor logits: worst cosine {worst:.5}, argmax agreement {agree:.3}");
     assert!(worst > 0.998 && agree > 0.9, "predictor logits diverge");
 
+    // Three streams through one decoder: `a` and `b` in lockstep (their
+    // audio must be identical), `c` starting `LAG` frames later, so it shares
+    // calls of every batch size and its positions differ from theirs.
+    const LAG: usize = 7;
     let (_, wav) = golden.f32("wav");
     let file = File::open(&model.join("speech_tokenizer/model.safetensors")).unwrap();
-    let mut codec = Codec::load(&gpu, &file, &config.codec, config.samples_per_frame, frames.len()).unwrap();
-    let whole = codec.decode(&gpu, &codes).unwrap();
-    let snr = snr(&whole, &wav);
-    eprintln!("waveform: snr {snr:.2} dB");
-    assert!(snr > 30.0, "waveform snr {snr:.2} dB");
-
-    let (spf, ctx) = (config.samples_per_frame, config.codec.sliding_window);
-    let mut streamed = Vec::new();
-    let mut emitted = 0;
-    while let Some(n) = chunk_due(frames.len(), emitted, true, 2, 8) {
-        let start = emitted.saturating_sub(ctx);
-        let wav = codec.decode(&gpu, &codes[start * GROUPS..(emitted + n) * GROUPS]).unwrap();
-        streamed.extend_from_slice(&wav[(emitted - start) * spf..]);
-        emitted += n;
+    let mut codec = Codec::load(0, &file, &config.codec, config.samples_per_frame, 3).unwrap();
+    let mut streams: Vec<_> = (0..3).map(|_| codec.open().unwrap()).collect();
+    let spf = config.samples_per_frame;
+    let mut out = vec![Vec::new(); 3];
+    for step in 0..frames.len() + LAG {
+        let mut batch = Vec::new();
+        let mut who = Vec::new();
+        for (k, s) in streams.iter_mut().enumerate() {
+            let at = if k == 2 { step.checked_sub(LAG) } else { Some(step) };
+            if let Some(f) = at.and_then(|t| frames.get(t)) {
+                batch.push((s, *f));
+                who.push(k);
+            }
+        }
+        let wav = codec.decode(&mut batch).unwrap();
+        for (k, samples) in who.into_iter().zip(wav.chunks(spf)) {
+            out[k].extend_from_slice(samples);
+        }
     }
-    let chunked = self::snr(&streamed, &wav);
-    eprintln!("streamed waveform: snr {chunked:.2} dB");
-    assert!(chunked > 30.0, "streamed waveform snr {chunked:.2} dB");
+    assert_eq!(out[0], out[1], "two streams of the same frames in one batch decode differently");
+    for (name, audio) in [("streamed waveform", &out[0]), ("lagging stream", &out[2])] {
+        let snr = snr(audio, &wav);
+        eprintln!("{name}: snr {snr:.2} dB");
+        assert!(snr > 30.0, "{name} snr {snr:.2} dB");
+    }
 }
 
 fn snr(ours: &[f32], theirs: &[f32]) -> f64 {

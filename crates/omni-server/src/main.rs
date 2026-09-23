@@ -101,9 +101,6 @@ struct Qwen3TtsArgs {
     first_chunk_frames: usize,
     #[arg(long, default_value_t = 8)]
     chunk_frames: usize,
-    /// Frames of left context each audio chunk is decoded with.
-    #[arg(long, default_value_t = 72)]
-    context_frames: usize,
     #[arg(long, default_value_t = 4096)]
     max_input_chars: usize,
 }
@@ -118,18 +115,20 @@ impl Qwen3TtsArgs {
             kv_gib: self.kv_gib,
             first_chunk_frames: self.first_chunk_frames,
             chunk_frames: self.chunk_frames,
-            context_frames: self.context_frames,
             ..engine::Options::default()
         };
         let name = self.model.clone().unwrap_or_else(|| {
             self.model_path.file_name().map_or("qwen3-tts".into(), |n| n.to_string_lossy().into_owned())
         });
-        let gpu = omni_cuda::Gpu::new(self.device)?;
-        gpu.bind()?;
-        let model = engine::Model::load(&gpu, &self.model_path, &opts)
-            .with_context(|| format!("load {}", self.model_path.display()))?;
-        let (handle, inbox) = omni_engine::channel(model.info(&name, self.max_input_chars), self.serve.queue);
-        Ok((handle, engine::spawn(inbox, engine::Engine::new(gpu, model, opts)), name))
+        let (handle, thread) = engine::start(
+            self.device,
+            self.model_path.clone(),
+            opts,
+            name.clone(),
+            self.max_input_chars,
+            self.serve.queue,
+        )?;
+        Ok((handle, thread, name))
     }
 }
 

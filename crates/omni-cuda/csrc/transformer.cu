@@ -118,7 +118,6 @@ __global__ void gather_sum_kernel(bf16* out, uint32_t ld_out, bool accumulate, c
 __device__ __forceinline__ float activate(float x, int act) {
   switch (act) {
     case 1: return x / (1.f + __expf(-x));
-    case 2: return 0.5f * x * (1.f + erff(x * 0.70710678118654752f));
     default: return x;
   }
 }
@@ -181,7 +180,7 @@ int omni_gather_sum(bf16* out, uint32_t ld_out, bool accumulate, const bf16* bia
   return (int)cudaGetLastError();
 }
 
-// act: 0 identity, 1 SiLU, 2 exact GELU. `out` may alias `x`.
+// act: 0 identity, 1 SiLU. `out` may alias `x`.
 int omni_bias_act(const bf16* x, const bf16* bias, const bf16* residual, bf16* out, int act, uint32_t rows,
                   uint32_t cols, cudaStream_t stream) {
   const size_t total = (size_t)rows * cols;

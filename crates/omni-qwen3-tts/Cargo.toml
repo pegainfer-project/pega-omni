@@ -11,14 +11,21 @@ omni-engine.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 half.workspace = true
+kern-manifest.workspace = true
+kern-pool.workspace = true
+kern-runtime.workspace = true
 memmap2.workspace = true
 rand.workspace = true
 safetensors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokenizers.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[build-dependencies]
+cc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
