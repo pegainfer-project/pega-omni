@@ -77,12 +77,8 @@ impl File {
     }
 }
 
-pub fn to_bf16(data: &[f32]) -> Vec<bf16> {
-    data.iter().map(|&x| bf16::from_f32(x)).collect()
-}
-
 pub fn upload(gpu: &Gpu, data: &[f32]) -> Result<Buf<bf16>> {
-    gpu.upload(&to_bf16(data))
+    gpu.upload(&data.iter().map(|&x| bf16::from_f32(x)).collect::<Vec<_>>())
 }
 
 /// Row-concatenation of `[out_i, in]` matrices sharing `in`.

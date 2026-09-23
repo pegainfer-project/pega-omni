@@ -47,13 +47,11 @@ use crate::talker::GROUPS;
 use crate::talker::Input;
 use crate::talker::Limits;
 use crate::talker::Row;
-use crate::talker::Sampling;
 use crate::talker::Talker;
 use crate::weights::File;
 
 #[derive(Clone, Debug)]
 pub struct Options {
-    pub device: usize,
     pub max_batch: usize,
     /// Talker tokens per step, prompts included.
     pub max_step_tokens: usize,
@@ -66,13 +64,11 @@ pub struct Options {
     /// whole-utterance decode (37 dB against the official run); the official
     /// `chunked_decode`'s 25 drops that to 22 dB over 8-frame chunks.
     pub context_frames: usize,
-    pub max_input_chars: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
-            device: 0,
             max_batch: 64,
             max_step_tokens: 8192,
             kv_gib: 16.0,
@@ -80,7 +76,6 @@ impl Default for Options {
             first_chunk_frames: 2,
             chunk_frames: 8,
             context_frames: 72,
-            max_input_chars: 4096,
         }
     }
 }
@@ -124,7 +119,8 @@ impl Model {
             pages: (opts.kv_gib * (1u64 << 30) as f64) as usize / page_bytes,
             page_size: opts.page_size,
         };
-        let talker = Talker::load(gpu, &File::open(&dir.join("model.safetensors"))?, &config.model, limits)?;
+        let weights = File::open(&dir.join("model.safetensors"))?;
+        let talker = Talker::load(gpu, &weights, &config.model, &config.generation, limits)?;
         let codec_frames = opts.context_frames + opts.first_chunk_frames.max(opts.chunk_frames);
         let codec = Codec::load(
             gpu,
@@ -136,7 +132,7 @@ impl Model {
         Ok(Self { config, tokenizer, talker, codec })
     }
 
-    /// The front end's view: CustomVoice speakers, languages and sampling knobs.
+    /// The front end's view: CustomVoice speakers, languages, and a sampling seed.
     pub fn info(&self, name: &str, max_input_chars: usize) -> EngineInfo {
         let t = &self.config.model.talker_config;
         let languages = std::iter::once("auto".to_string()).chain(t.codec_language_id.keys().cloned()).collect();
@@ -146,8 +142,6 @@ impl Model {
             voices: t.spk_id.keys().cloned().collect(),
             extra: BTreeMap::from([
                 ("language".to_string(), Extra::OneOf(languages)),
-                ("temperature".to_string(), Extra::Number(0.0..=2.0)),
-                ("top_k".to_string(), Extra::Integer(0..=t.stack.vocab_size as i64)),
                 ("seed".to_string(), Extra::Integer(0..=i64::MAX)),
             ]),
             speeds: 1.0..=1.0,
@@ -166,7 +160,6 @@ struct Job {
     emitted: usize,
     seen: Vec<u32>,
     rng: StdRng,
-    sampling: Sampling,
     cap: usize,
     ended: bool,
 }
@@ -203,9 +196,6 @@ impl Engine {
         let instruct = speech.instructions.as_deref().filter(|s| !s.is_empty()).map(|s| m.tokenizer.instruct(s));
         let prompt =
             prompt::assemble(&m.config.model, voice, &m.tokenizer.assistant(&speech.input), instruct.as_deref());
-        let g = &m.config.generation;
-        let temperature = speech.extra.get("temperature").and_then(|v| v.as_f64()).map_or(g.temperature, |x| x as f32);
-        let top_k = speech.extra.get("top_k").and_then(|v| v.as_i64()).map_or(g.top_k, |x| x as i32);
         let seed = speech.extra.get("seed").and_then(|v| v.as_u64()).unwrap_or_else(rand::random);
         Ok(Job {
             id: speech.id,
@@ -217,14 +207,7 @@ impl Engine {
             emitted: 0,
             seen: vec![0; m.talker.seen_words()],
             rng: StdRng::seed_from_u64(seed),
-            sampling: Sampling {
-                temperature,
-                top_k,
-                repetition_penalty: g.repetition_penalty,
-                sub_temperature: g.subtalker_temperature,
-                sub_top_k: g.subtalker_top_k,
-            },
-            cap: frame_cap(speech.input.chars().count(), g.max_new_tokens),
+            cap: frame_cap(speech.input.chars().count(), m.config.generation.max_new_tokens),
             ended: false,
         })
     }
@@ -280,7 +263,6 @@ impl Engine {
                         Some(f) if j.prefilled() => Input::Frame(f),
                         _ => Input::Prompt(&j.prompt),
                     },
-                    sampling: j.sampling,
                     seen: &j.seen,
                     generated: j.frames.len(),
                     uniforms: u,

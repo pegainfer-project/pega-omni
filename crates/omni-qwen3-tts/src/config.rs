@@ -49,7 +49,7 @@ pub struct Model {
     pub talker_config: Talker,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 pub struct Generation {
     pub temperature: f32,
     pub top_k: i32,

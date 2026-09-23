@@ -78,7 +78,7 @@ impl Stack {
     }
 
     /// Runs `rows` tokens: embeddings in `s.h`, final normed hidden states out in `s.h`.
-    pub fn forward(&self, gpu: &Gpu, s: &Scratch, kv: &KvPool, meta: &Meta, plan: &PrefillPlan) -> Result<()> {
+    pub fn forward(&self, gpu: &Gpu, s: &Scratch, kv: &KvPool, meta: &Meta) -> Result<()> {
         let c = &self.cfg;
         let (rows, batch) = (meta.rows, meta.batch);
         let (h, d, hq, hk, inter) =
@@ -106,7 +106,7 @@ impl Stack {
                 page_indptr: meta.page_indptr.ptr(),
                 last_page_len: meta.last_page_len.ptr(),
             };
-            gpu.paged_prefill((s.qkv.ptr(), qkv_w), s.attn.ptr(), &paged, &meta.plan, plan, (rows, batch), (hq, hk))?;
+            gpu.paged_prefill((s.qkv.ptr(), qkv_w), s.attn.ptr(), &paged, &meta.plan, (rows, batch), (hq, hk))?;
             gpu.linear(s.h.ptr(), s.attn.ptr(), l.o.ptr(), rows, h, hq * d)?;
             gpu.add_rms_norm(s.h.ptr(), s.residual.ptr(), l.ln2.ptr(), rows, h, eps)?;
             gpu.linear(s.gate_up.ptr(), s.h.ptr(), l.gate_up.ptr(), rows, 2 * inter, h)?;
@@ -229,39 +229,28 @@ impl Meta {
             page_indices: gpu.alloc(max_pages)?,
             page_indptr: gpu.alloc(max_batch + 1)?,
             last_page_len: gpu.alloc(max_batch)?,
-            plan: PlanBufs {
-                q_indptr: gpu.alloc(max_batch + 1)?,
-                request_indices: gpu.alloc(max_tiles)?,
-                qo_tile_indices: gpu.alloc(max_tiles)?,
-                kv_tile_indices: gpu.alloc(max_tiles)?,
-                kv_chunk_size: gpu.alloc(1)?,
-                total_rows: gpu.alloc(1)?,
-            },
+            plan: PlanBufs::new(gpu, max_batch, max_tiles)?,
             rows: 0,
             batch: 0,
         })
     }
 
-    /// Uploads `b` and returns its tile plan.
-    pub fn set(&mut self, gpu: &Gpu, b: &Batch, cfg: &config::Stack) -> Result<PrefillPlan> {
+    /// Uploads `b` and its tile plan.
+    pub fn set(&mut self, gpu: &Gpu, b: &Batch, cfg: &config::Stack) -> Result<()> {
         let group = (cfg.num_attention_heads / cfg.num_key_value_heads) as u32;
-        let plan = PrefillPlan::new(&b.qo_lens, group, cfg.head_dim as u32);
         ensure!(
-            b.positions.len() <= self.positions.len() && plan.tiles() <= self.plan.request_indices.len(),
+            b.positions.len() <= self.positions.len(),
             "batch of {} tokens exceeds the stack's scratch",
             b.positions.len()
         );
+        self.plan.set(gpu, &PrefillPlan::new(&b.qo_lens, group, cfg.head_dim as u32), &b.q_indptr)?;
         gpu.write(&mut self.positions, 0, &b.positions)?;
         gpu.write(&mut self.slots, 0, &b.slots)?;
         gpu.write(&mut self.page_indices, 0, &b.page_indices)?;
         gpu.write(&mut self.page_indptr, 0, &b.page_indptr)?;
         gpu.write(&mut self.last_page_len, 0, &b.last_page_len)?;
-        gpu.write(&mut self.plan.q_indptr, 0, &b.q_indptr)?;
-        gpu.write(&mut self.plan.request_indices, 0, &plan.request_indices)?;
-        gpu.write(&mut self.plan.qo_tile_indices, 0, &plan.qo_tile_indices)?;
-        gpu.write(&mut self.plan.total_rows, 0, &[b.positions.len() as u32])?;
         self.rows = b.positions.len();
         self.batch = b.qo_lens.len();
-        Ok(plan)
+        Ok(())
     }
 }

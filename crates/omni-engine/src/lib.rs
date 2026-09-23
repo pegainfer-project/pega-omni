@@ -46,7 +46,6 @@ pub struct EngineInfo {
 /// The values an `extra` key accepts.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Extra {
-    Number(std::ops::RangeInclusive<f64>),
     Integer(std::ops::RangeInclusive<i64>),
     OneOf(BTreeSet<String>),
 }
@@ -54,10 +53,6 @@ pub enum Extra {
 impl Extra {
     fn check(&self, value: &Value) -> Result<(), String> {
         match self {
-            Self::Number(range) => match value.as_f64() {
-                Some(x) if range.contains(&x) => Ok(()),
-                _ => Err(format!("expected a number in {}..={}, got {value}", range.start(), range.end())),
-            },
             Self::Integer(range) => match value.as_i64() {
                 Some(x) if range.contains(&x) => Ok(()),
                 _ => Err(format!("expected an integer in {}..={}, got {value}", range.start(), range.end())),
@@ -98,9 +93,6 @@ pub struct Invalid {
     pub param: &'static str,
     pub message: String,
 }
-
-/// OpenAI's accepted range, for engines that can honour any speed.
-pub const SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.25..=4.0;
 
 impl EngineInfo {
     /// Accepts a draft this engine can serve, or names the first field it cannot.

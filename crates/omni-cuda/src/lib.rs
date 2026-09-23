@@ -10,6 +10,10 @@
 //!
 //! Layout conventions: activations are row-major `[rows, cols]` bf16; linear
 //! weights keep the PyTorch `[out, in]` layout, so `y = x · wᵀ`.
+#![allow(
+    clippy::too_many_arguments,
+    reason = "a kernel launch takes its shapes and pointers; a struct per call would only move the list"
+)]
 
 use std::ffi::CStr;
 use std::sync::Arc;
@@ -64,13 +68,16 @@ pub enum Act {
     Gelu = 2,
 }
 
-/// Per-row sampling inputs of [`Gpu::sample`], all device arrays of `rows` entries.
+/// The draw of [`Gpu::sample`]: one setting for every row, per-row device
+/// arrays for what differs between rows.
 pub struct SampleArgs {
-    pub temperature: Ptr,
-    pub top_k: Ptr,
-    /// Repetition penalty and the bitmap of penalized tokens (`ceil(vocab/32)`
-    /// u32 per row); both 0 for no penalty.
-    pub penalty: Ptr,
+    /// Zero picks the argmax.
+    pub temperature: f32,
+    /// Zero keeps every token.
+    pub top_k: i32,
+    /// Repetition penalty on the tokens set in `seen`, a per-row bitmap of
+    /// `ceil(vocab/32)` u32 (0: no penalty).
+    pub penalty: f32,
     pub seen: Ptr,
     /// Token range masked out, except `exempt`; rows flagged in `block_exempt`
     /// (u8, may be 0) mask `exempt` too.
@@ -91,7 +98,8 @@ pub struct PagedKv {
 }
 
 /// FlashInfer's tile schedule for one ragged batch: which request and which
-/// query tile each thread block takes. Built on the host from query lengths.
+/// query tile each thread block takes. Built on the host from query lengths,
+/// uploaded into [`PlanBufs`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrefillPlan {
     pub cta_tile_q: u32,
@@ -117,9 +125,10 @@ impl PrefillPlan {
     }
 }
 
-/// The device plan buffers FlashInfer reads: `q_indptr` ([batch + 1]),
-/// `request_indices`, `qo_tile_indices`, `kv_tile_indices` (zeros), each sized
-/// for the largest plan, plus the two scalars it dereferences.
+/// A [`PrefillPlan`] on the device, as FlashInfer reads it: `q_indptr`
+/// ([batch + 1]), `request_indices`, `qo_tile_indices`, `kv_tile_indices`
+/// (zeros), each sized for the largest plan, the two scalars it dereferences,
+/// and the plan's shape.
 pub struct PlanBufs {
     pub q_indptr: Buf<i32>,
     pub request_indices: Buf<i32>,
@@ -127,6 +136,36 @@ pub struct PlanBufs {
     pub kv_tile_indices: Buf<i32>,
     pub kv_chunk_size: Buf<i32>,
     pub total_rows: Buf<u32>,
+    pub cta_tile_q: u32,
+    pub tiles: usize,
+}
+
+impl PlanBufs {
+    pub fn new(gpu: &Gpu, max_batch: usize, max_tiles: usize) -> Result<Self> {
+        Ok(Self {
+            q_indptr: gpu.alloc(max_batch + 1)?,
+            request_indices: gpu.alloc(max_tiles)?,
+            qo_tile_indices: gpu.alloc(max_tiles)?,
+            kv_tile_indices: gpu.alloc(max_tiles)?,
+            kv_chunk_size: gpu.alloc(1)?,
+            total_rows: gpu.alloc(1)?,
+            cta_tile_q: 0,
+            tiles: 0,
+        })
+    }
+
+    /// Uploads `plan` for a batch whose query prefix sums are `q_indptr`.
+    pub fn set(&mut self, gpu: &Gpu, plan: &PrefillPlan, q_indptr: &[i32]) -> Result<()> {
+        if plan.tiles() > self.request_indices.len() || q_indptr.len() > self.q_indptr.len() {
+            bail!("plan of {} tiles exceeds its buffers", plan.tiles());
+        }
+        gpu.write(&mut self.q_indptr, 0, q_indptr)?;
+        gpu.write(&mut self.request_indices, 0, &plan.request_indices)?;
+        gpu.write(&mut self.qo_tile_indices, 0, &plan.qo_tile_indices)?;
+        gpu.write(&mut self.total_rows, 0, &[*q_indptr.last().unwrap_or(&0) as u32])?;
+        (self.cta_tile_q, self.tiles) = (plan.cta_tile_q, plan.tiles());
+        Ok(())
+    }
 }
 
 pub struct Gpu {
@@ -220,24 +259,12 @@ impl Gpu {
         Ok(self.stream.synchronize()?)
     }
 
-    /// `y[m, n] = x[m, k] · w[n, k]ᵀ + beta · y`, bf16 in and out, f32 accumulate.
-    pub fn gemm(
-        &self,
-        y: Ptr,
-        ldy: usize,
-        x: Ptr,
-        ldx: usize,
-        w: Ptr,
-        ldw: usize,
-        m: usize,
-        n: usize,
-        k: usize,
-        beta: f32,
-    ) -> Result<()> {
+    /// `y[m, n] = x[m, k] · w[n, k]ᵀ`, contiguous, bf16 in and out, f32 accumulate.
+    pub fn linear(&self, y: Ptr, x: Ptr, w: Ptr, m: usize, n: usize, k: usize) -> Result<()> {
         if m == 0 {
             return Ok(());
         }
-        let alpha = 1f32;
+        let (alpha, beta) = (1f32, 0f32);
         let r = unsafe {
             blas::cublasGemmEx(
                 *self.blas.handle(),
@@ -249,14 +276,14 @@ impl Gpu {
                 (&alpha as *const f32).cast(),
                 w as *const _,
                 blas::cudaDataType_t::CUDA_R_16BF,
-                ldw as i32,
+                k as i32,
                 x as *const _,
                 blas::cudaDataType_t::CUDA_R_16BF,
-                ldx as i32,
+                k as i32,
                 (&beta as *const f32).cast(),
                 y as *mut _,
                 blas::cudaDataType_t::CUDA_R_16BF,
-                ldy as i32,
+                n as i32,
                 blas::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                 blas::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             )
@@ -265,11 +292,6 @@ impl Gpu {
             bail!("cublasGemmEx m={m} n={n} k={k}: {r:?}");
         }
         Ok(())
-    }
-
-    /// Contiguous `y[m, n] = x[m, k] · w[n, k]ᵀ`.
-    pub fn linear(&self, y: Ptr, x: Ptr, w: Ptr, m: usize, n: usize, k: usize) -> Result<()> {
-        self.gemm(y, n, x, k, w, k, m, n, k, 0.0)
     }
 
     pub fn rms_norm(&self, x: Ptr, w: Ptr, out: Ptr, rows: usize, dim: usize, eps: f32) -> Result<()> {
@@ -377,15 +399,13 @@ impl Gpu {
     }
 
     /// Causal attention over a ragged batch against paged K/V (head_dim 128).
-    /// `q` rows have stride `q_stride`; `plan` must describe the query
-    /// lengths whose prefix sums are in `bufs.q_indptr`.
+    /// `q` rows have stride `q_stride`; `plan` describes the batch.
     pub fn paged_prefill(
         &self,
         (q, q_stride): (Ptr, usize),
         out: Ptr,
         kv: &PagedKv,
-        bufs: &PlanBufs,
-        plan: &PrefillPlan,
+        plan: &PlanBufs,
         (rows, batch): (usize, usize),
         (hq, hk): (usize, usize),
     ) -> Result<()> {
@@ -402,18 +422,18 @@ impl Gpu {
                 kv.page_indices,
                 kv.page_indptr,
                 kv.last_page_len,
-                bufs.q_indptr.ptr(),
-                bufs.request_indices.ptr(),
-                bufs.qo_tile_indices.ptr(),
-                bufs.kv_tile_indices.ptr(),
-                bufs.kv_chunk_size.ptr(),
-                bufs.total_rows.ptr(),
+                plan.q_indptr.ptr(),
+                plan.request_indices.ptr(),
+                plan.qo_tile_indices.ptr(),
+                plan.kv_tile_indices.ptr(),
+                plan.kv_chunk_size.ptr(),
+                plan.total_rows.ptr(),
                 hq as u32,
                 hk as u32,
                 kv.page_size,
                 rows as u32,
                 batch as u32,
-                plan.tiles() as u32,
+                plan.tiles as u32,
                 plan.cta_tile_q,
                 (128f32).powf(-0.5),
                 self.s(),

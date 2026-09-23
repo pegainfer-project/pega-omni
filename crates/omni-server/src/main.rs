@@ -113,24 +113,22 @@ impl Qwen3TtsArgs {
     fn start(&self) -> anyhow::Result<(omni_engine::Handle, std::thread::JoinHandle<()>, String)> {
         use omni_qwen3_tts::engine;
         let opts = engine::Options {
-            device: self.device,
             max_batch: self.max_batch,
             max_step_tokens: self.max_step_tokens,
             kv_gib: self.kv_gib,
             first_chunk_frames: self.first_chunk_frames,
             chunk_frames: self.chunk_frames,
             context_frames: self.context_frames,
-            max_input_chars: self.max_input_chars,
             ..engine::Options::default()
         };
         let name = self.model.clone().unwrap_or_else(|| {
             self.model_path.file_name().map_or("qwen3-tts".into(), |n| n.to_string_lossy().into_owned())
         });
-        let gpu = omni_cuda::Gpu::new(opts.device)?;
+        let gpu = omni_cuda::Gpu::new(self.device)?;
         gpu.bind()?;
         let model = engine::Model::load(&gpu, &self.model_path, &opts)
             .with_context(|| format!("load {}", self.model_path.display()))?;
-        let (handle, inbox) = omni_engine::channel(model.info(&name, opts.max_input_chars), self.serve.queue);
+        let (handle, inbox) = omni_engine::channel(model.info(&name, self.max_input_chars), self.serve.queue);
         Ok((handle, engine::spawn(inbox, engine::Engine::new(gpu, model, opts)), name))
     }
 }

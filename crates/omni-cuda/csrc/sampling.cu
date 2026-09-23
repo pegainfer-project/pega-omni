@@ -14,8 +14,8 @@ constexpr int kMaxVocab = 4096;
 constexpr int kThreads = 1024;
 
 __global__ void __launch_bounds__(kThreads)
-    sample_kernel(const bf16* logits, uint32_t ld, uint32_t vocab, const float* temperature, const int32_t* top_k,
-                  const float* penalty, const uint32_t* seen, uint32_t suppress_lo, uint32_t suppress_hi,
+    sample_kernel(const bf16* logits, uint32_t ld, uint32_t vocab, float temperature, int32_t top_k, float penalty,
+                  const uint32_t* seen, uint32_t suppress_lo, uint32_t suppress_hi,
                   int32_t exempt, const uint8_t* block_exempt, const float* uniform, int32_t* out) {
   __shared__ float val[kMaxVocab];
   __shared__ int idx[kMaxVocab];
@@ -29,8 +29,7 @@ __global__ void __launch_bounds__(kThreads)
     if (i < (int)vocab) {
       v = to_f32(l[i]);
       if (seen && (seen[(size_t)row * words + i / 32] >> (i % 32) & 1u)) {
-        const float p = penalty[row];
-        v = v > 0.f ? v / p : v * p;
+        v = v > 0.f ? v / penalty : v * penalty;
       }
       const bool in_range = (uint32_t)i >= suppress_lo && (uint32_t)i < suppress_hi;
       if ((in_range && i != exempt) || (i == exempt && exempt_blocked)) v = -INFINITY;
@@ -40,8 +39,7 @@ __global__ void __launch_bounds__(kThreads)
   }
   __syncthreads();
 
-  const float t = temperature[row];
-  if (t <= 0.f) {
+  if (temperature <= 0.f) {
     for (int stride = kMaxVocab / 2; stride > 0; stride >>= 1) {
       for (int i = tid; i < stride; i += kThreads) {
         const float a = val[i], b = val[i + stride];
@@ -56,7 +54,7 @@ __global__ void __launch_bounds__(kThreads)
     return;
   }
 
-  for (int i = tid; i < kMaxVocab; i += kThreads) val[i] /= t;
+  for (int i = tid; i < kMaxVocab; i += kThreads) val[i] /= temperature;
   __syncthreads();
   // Bitonic sort, descending by value.
   for (int size = 2; size <= kMaxVocab; size <<= 1) {
@@ -81,7 +79,7 @@ __global__ void __launch_bounds__(kThreads)
   }
 
   if (tid >= 32) return;
-  const int k = top_k[row] > 0 && top_k[row] < (int)vocab ? top_k[row] : (int)vocab;
+  const int k = top_k > 0 && top_k < (int)vocab ? top_k : (int)vocab;
   const float m = val[0];
   float total = 0.f;
   for (int i = tid; i < k; i += 32) total += __expf(val[i] - m);
@@ -112,8 +110,8 @@ extern "C" {
 // the repetition penalty (null: no penalty). Tokens in [suppress_lo,
 // suppress_hi) are masked except `exempt`, which is itself masked on rows with
 // `block_exempt` set (null: never).
-int omni_sample(const bf16* logits, uint32_t ld, uint32_t rows, uint32_t vocab, const float* temperature,
-                const int32_t* top_k, const float* penalty, const uint32_t* seen, uint32_t suppress_lo,
+int omni_sample(const bf16* logits, uint32_t ld, uint32_t rows, uint32_t vocab, float temperature, int32_t top_k,
+                float penalty, const uint32_t* seen, uint32_t suppress_lo,
                 uint32_t suppress_hi, int32_t exempt, const uint8_t* block_exempt, const float* uniform, int32_t* out,
                 cudaStream_t stream) {
   if (vocab > kMaxVocab) return (int)cudaErrorInvalidValue;

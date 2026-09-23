@@ -19,7 +19,6 @@ use omni_qwen3_tts::talker::Input;
 use omni_qwen3_tts::talker::Limits;
 use omni_qwen3_tts::talker::Probe;
 use omni_qwen3_tts::talker::Row;
-use omni_qwen3_tts::talker::Sampling;
 use omni_qwen3_tts::talker::Talker;
 use omni_qwen3_tts::weights::File;
 
@@ -98,22 +97,20 @@ fn matches_the_official_run() {
     let gpu = Gpu::new(0).unwrap();
     gpu.bind().unwrap();
     let limits = Limits { max_batch: 1, max_tokens: 256, pages: 64, page_size: 16 };
-    let mut talker =
-        Talker::load(&gpu, &File::open(&model.join("model.safetensors")).unwrap(), &config.model, limits).unwrap();
+    let mut talker = Talker::load(
+        &gpu,
+        &File::open(&model.join("model.safetensors")).unwrap(),
+        &config.model,
+        &config.generation,
+        limits,
+    )
+    .unwrap();
     let codes = golden.i32("codes");
     let frames: Vec<[i32; GROUPS]> = codes.chunks(GROUPS).map(|c| c.try_into().unwrap()).collect();
     let (_, talker_logits) = golden.f32("talker_logits");
     let (_, predictor_logits) = golden.f32("predictor_logits");
     let (vocab, p_vocab) = (config.model.talker_config.stack.vocab_size, 2048);
 
-    let g = &config.generation;
-    let sampling = Sampling {
-        temperature: g.temperature,
-        top_k: g.top_k,
-        repetition_penalty: g.repetition_penalty,
-        sub_temperature: g.subtalker_temperature,
-        sub_top_k: g.subtalker_top_k,
-    };
     let pages: Vec<i32> = (0..64).collect();
     let seen = vec![0u32; talker.seen_words()];
     let mut ours_talker = Vec::new();
@@ -124,7 +121,7 @@ fn matches_the_official_run() {
             0 => Input::Prompt(&prompt),
             _ => Input::Frame(&frames[t - 1]),
         };
-        let row = Row { pages: &pages, cached, input, sampling, seen: &seen, generated: t, uniforms: [0.5; GROUPS] };
+        let row = Row { pages: &pages, cached, input, seen: &seen, generated: t, uniforms: [0.5; GROUPS] };
         let mut probe = Probe { force: frames.get(t).map(|f| vec![*f]).unwrap_or_default(), ..Probe::default() };
         let out = talker.step(&gpu, &[row], Some(&mut probe)).unwrap();
         if t == 0 {

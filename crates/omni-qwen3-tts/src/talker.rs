@@ -39,15 +39,6 @@ pub enum Input<'a> {
     Frame(&'a [i32; GROUPS]),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Sampling {
-    pub temperature: f32,
-    pub top_k: i32,
-    pub repetition_penalty: f32,
-    pub sub_temperature: f32,
-    pub sub_top_k: i32,
-}
-
 /// One row of a step.
 #[derive(Clone, Copy, Debug)]
 pub struct Row<'a> {
@@ -55,7 +46,6 @@ pub struct Row<'a> {
     /// Tokens already in the row's KV.
     pub cached: usize,
     pub input: Input<'a>,
-    pub sampling: Sampling,
     /// Codebook-0 tokens under the repetition penalty, as a bitmap.
     pub seen: &'a [u32],
     /// Frames generated so far; the end token is masked until two exist.
@@ -100,12 +90,9 @@ pub struct Limits {
     pub page_size: usize,
 }
 
-fn table(gpu: &Gpu, ptrs: &[Ptr]) -> Result<Buf<u64>> {
-    gpu.upload(ptrs)
-}
-
 pub struct Talker {
     pub cfg: config::Model,
+    sampling: config::Generation,
     pub limits: Limits,
     talker: Stack,
     kv: KvPool,
@@ -147,19 +134,21 @@ pub struct Talker {
     p_last: Buf<bf16>,
     p_logits: Buf<bf16>,
 
-    temperature: Buf<f32>,
-    top_k: Buf<i32>,
-    penalty: Buf<f32>,
     seen: Buf<u32>,
     block_end: Buf<u8>,
-    sub_temperature: Buf<f32>,
-    sub_top_k: Buf<i32>,
     uniforms: Buf<f32>,
     codes: Buf<i32>,
 }
 
 impl Talker {
-    pub fn load(gpu: &Gpu, file: &File, cfg: &config::Model, limits: Limits) -> Result<Self> {
+    /// Loads the talker and code predictor; every row samples with `sampling`.
+    pub fn load(
+        gpu: &Gpu,
+        file: &File,
+        cfg: &config::Model,
+        sampling: &config::Generation,
+        limits: Limits,
+    ) -> Result<Self> {
         let t = &cfg.talker_config;
         let (h, p) = (t.stack.hidden_size, t.code_predictor_config.hidden_size);
         let (codec_vocab, p_vocab) = (t.stack.vocab_size, t.code_predictor_config.vocab_size);
@@ -190,23 +179,25 @@ impl Talker {
         let codec_embedding = upload(gpu, &w("talker.model.codec_embedding.weight", &[codec_vocab, h])?.data)?;
         let p_embeddings = upload(gpu, &p_embeddings)?;
         let p_table = |g: usize| p_embeddings.at(g * p_vocab * h);
-        let t_frame = table(gpu, &[vec![codec_embedding.ptr()], (0..GROUPS - 1).map(p_table).collect()].concat())?;
-        let t_p_embed = (0..GROUPS - 1).map(|g| table(gpu, &[p_table(g)])).collect::<Result<_>>()?;
+        let t_frame = gpu.upload(&[vec![codec_embedding.ptr()], (0..GROUPS - 1).map(p_table).collect()].concat())?;
+        let t_p_embed = (0..GROUPS - 1).map(|g| gpu.upload(&[p_table(g)])).collect::<Result<_>>()?;
+        let last = gpu.alloc(b * h)?;
 
         let mut talker_ = Self {
             cfg: cfg.clone(),
+            sampling: *sampling,
             limits,
             kv: KvPool::new(gpu, &t.stack, limits.page_size, limits.pages)?,
             meta: Meta::new(gpu, n, b, limits.pages, group)?,
             p_kv: KvPool::new(gpu, &t.code_predictor_config, GROUPS, b)?,
             p_meta: Meta::new(gpu, 2 * b, b, b, p_group)?,
-            t_text: table(gpu, &[text_embedding.ptr()])?,
-            t_codec: table(gpu, &[codec_embedding.ptr()])?,
+            t_text: gpu.upload(&[text_embedding.ptr()])?,
+            t_codec: gpu.upload(&[codec_embedding.ptr()])?,
             t_frame,
-            t_last: gpu.upload(&[0u64])?,
-            t_rows: gpu.upload(&[0u64])?,
+            t_last: gpu.upload(&[scratch.h.ptr()])?,
+            t_rows: gpu.upload(&[last.ptr()])?,
             t_p_embed,
-            t_p_last: table(gpu, &[p_scratch.h.ptr()])?,
+            t_p_last: gpu.upload(&[p_scratch.h.ptr()])?,
             fc1: (
                 upload(gpu, &w("talker.text_projection.linear_fc1.weight", &[h, h])?.data)?,
                 upload(gpu, &w("talker.text_projection.linear_fc1.bias", &[h])?.data)?,
@@ -235,23 +226,16 @@ impl Talker {
             last_idx: gpu.alloc(b)?,
             arange: gpu.upload(&(0..b as i32).collect::<Vec<_>>())?,
             odd: gpu.upload(&(0..b as i32).map(|i| 2 * i + 1).collect::<Vec<_>>())?,
-            last: gpu.alloc(b * h)?,
+            last,
             logits: gpu.alloc(b * codec_vocab)?,
             p_in: gpu.alloc(2 * b * h)?,
             p_last: gpu.alloc(b * p)?,
             p_logits: gpu.alloc(b * p_vocab)?,
-            temperature: gpu.alloc(b)?,
-            top_k: gpu.alloc(b)?,
-            penalty: gpu.alloc(b)?,
             seen: gpu.alloc(b * codec_vocab.div_ceil(32))?,
             block_end: gpu.alloc(b)?,
-            sub_temperature: gpu.alloc(b)?,
-            sub_top_k: gpu.alloc(b)?,
             uniforms: gpu.alloc(b * GROUPS)?,
             codes: gpu.alloc(b * GROUPS)?,
         };
-        talker_.t_last = table(gpu, &[talker_.scratch.h.ptr()])?;
-        talker_.t_rows = table(gpu, &[talker_.last.ptr()])?;
         let pad = cfg.tts_pad_token_id;
         talker_.project_text(gpu, &[pad], talker_.pad_embed.ptr())?;
         Ok(talker_)
@@ -290,9 +274,10 @@ impl Talker {
 
     /// Advances every row by one frame. Prompt rows must come first.
     pub fn step(&mut self, gpu: &Gpu, rows: &[Row], mut probe: Option<&mut Probe>) -> Result<Vec<Frame>> {
-        let t = self.cfg.talker_config.clone();
+        let t = &self.cfg.talker_config;
         let (h, p) = (t.stack.hidden_size, t.code_predictor_config.hidden_size);
-        let (codec_vocab, p_vocab) = (t.stack.vocab_size, t.code_predictor_config.vocab_size);
+        let (codec_vocab, p_vocab, eos) =
+            (t.stack.vocab_size, t.code_predictor_config.vocab_size, t.codec_eos_token_id);
         let b = rows.len();
         ensure!(b <= self.limits.max_batch, "{b} rows exceed max_batch {}", self.limits.max_batch);
         let prompts = rows.iter().take_while(|r| matches!(r.input, Input::Prompt(_))).count();
@@ -354,31 +339,25 @@ impl Talker {
         let row_kv: Vec<RowKv> =
             rows.iter().map(|r| RowKv { pages: r.pages, cached: r.cached, new: r.len() }).collect();
         let batch = Batch::new(&row_kv, self.kv.page_size);
-        let plan = self.meta.set(gpu, &batch, &t.stack)?;
-        self.talker.forward(gpu, &self.scratch, &self.kv, &self.meta, &plan)?;
+        self.meta.set(gpu, &batch, &self.talker.cfg)?;
+        self.talker.forward(gpu, &self.scratch, &self.kv, &self.meta)?;
 
         let last: Vec<i32> = batch.q_indptr[1..].iter().map(|&e| e - 1).collect();
         gpu.write(&mut self.last_idx, 0, &last)?;
         gpu.gather_sum((self.last.ptr(), h), false, 0, self.t_last.ptr(), (self.last_idx.ptr(), 1, 1), b, h)?;
         gpu.linear(self.logits.ptr(), self.last.ptr(), self.codec_head.ptr(), b, codec_vocab, h)?;
 
-        let col = |f: fn(&Row) -> f32| rows.iter().map(f).collect::<Vec<f32>>();
-        gpu.write(&mut self.temperature, 0, &col(|r| r.sampling.temperature))?;
-        gpu.write(&mut self.penalty, 0, &col(|r| r.sampling.repetition_penalty))?;
-        gpu.write(&mut self.sub_temperature, 0, &col(|r| r.sampling.sub_temperature))?;
-        gpu.write(&mut self.top_k, 0, &rows.iter().map(|r| r.sampling.top_k).collect::<Vec<_>>())?;
-        gpu.write(&mut self.sub_top_k, 0, &rows.iter().map(|r| r.sampling.sub_top_k).collect::<Vec<_>>())?;
         gpu.write(&mut self.seen, 0, &rows.iter().flat_map(|r| r.seen.iter().copied()).collect::<Vec<_>>())?;
         gpu.write(&mut self.block_end, 0, &rows.iter().map(|r| (r.generated < 2) as u8).collect::<Vec<_>>())?;
         let uniforms: Vec<f32> = (0..GROUPS).flat_map(|g| rows.iter().map(move |r| r.uniforms[g])).collect();
         gpu.write(&mut self.uniforms, 0, &uniforms)?;
 
-        let eos = t.codec_eos_token_id;
+        let g = self.sampling;
         let special = (codec_vocab - 1024) as u32;
         let args = SampleArgs {
-            temperature: self.temperature.ptr(),
-            top_k: self.top_k.ptr(),
-            penalty: self.penalty.ptr(),
+            temperature: g.temperature,
+            top_k: g.top_k,
+            penalty: g.repetition_penalty,
             seen: self.seen.ptr(),
             suppress: (special, codec_vocab as u32),
             exempt: eos,
@@ -394,12 +373,11 @@ impl Talker {
         // Code predictor: [talker hidden, codebook-0 embedding] per row, then one code per pass.
         gpu.gather_sum((self.p_in.ptr(), 2 * h), false, 0, self.t_rows.ptr(), (self.arange.ptr(), 1, 1), b, h)?;
         gpu.gather_sum((self.p_in.at(h), 2 * h), false, 0, self.t_codec.ptr(), (self.codes.ptr(), 1, 1), b, h)?;
-        let (sub_temperature, sub_top_k, uniforms) =
-            (self.sub_temperature.ptr(), self.sub_top_k.ptr(), self.uniforms.ptr());
+        let (sub_temperature, sub_top_k, uniforms) = (g.subtalker_temperature, g.subtalker_top_k, self.uniforms.ptr());
         let sub_args = |g: usize| SampleArgs {
             temperature: sub_temperature,
             top_k: sub_top_k,
-            penalty: 0,
+            penalty: 1.0,
             seen: 0,
             suppress: (0, 0),
             exempt: -1,
@@ -424,8 +402,8 @@ impl Talker {
             gpu.bias_act(self.p_scratch.h.ptr(), self.mtp.1.ptr(), 0, self.p_scratch.h.ptr(), Act::None, n, p)?;
             let pages: Vec<[i32; 1]> = (0..b as i32).map(|i| [i]).collect();
             let row_kv: Vec<RowKv> = pages.iter().map(|pg| RowKv { pages: pg, cached, new: tokens }).collect();
-            let plan = self.p_meta.set(gpu, &Batch::new(&row_kv, GROUPS), &t.code_predictor_config)?;
-            self.predictor.forward(gpu, &self.p_scratch, &self.p_kv, &self.p_meta, &plan)?;
+            self.p_meta.set(gpu, &Batch::new(&row_kv, GROUPS), &self.predictor.cfg)?;
+            self.predictor.forward(gpu, &self.p_scratch, &self.p_kv, &self.p_meta)?;
             let head = self.lm_heads.at((g - 1) * p_vocab * p);
             if tokens == 2 {
                 gpu.gather_sum((self.p_last.ptr(), p), false, 0, self.t_p_last.ptr(), (self.odd.ptr(), 1, 1), b, p)?;

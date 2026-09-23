@@ -55,20 +55,14 @@ impl Snake {
 
 struct Linear {
     w: Buf<bf16>,
-    b: Option<Buf<bf16>>,
-}
-
-impl Linear {
-    fn bias(&self) -> Ptr {
-        self.b.as_ref().map_or(0, Buf::ptr)
-    }
+    b: Buf<bf16>,
 }
 
 fn load_conv(gpu: &Gpu, file: &File, prefix: &str, shape: [usize; 3]) -> Result<Linear> {
     let w = file.expect(&format!("{prefix}.weight"), &shape)?;
     Ok(Linear {
         w: upload(gpu, &conv_taps(&w))?,
-        b: Some(upload(gpu, &file.expect(&format!("{prefix}.bias"), &shape[..1])?.data)?),
+        b: upload(gpu, &file.expect(&format!("{prefix}.bias"), &shape[..1])?.data)?,
     })
 }
 
@@ -76,7 +70,7 @@ fn load_transposed(gpu: &Gpu, file: &File, prefix: &str, shape: [usize; 3]) -> R
     let w = file.expect(&format!("{prefix}.weight"), &shape)?;
     Ok(Linear {
         w: upload(gpu, &transposed_taps(&w))?,
-        b: Some(upload(gpu, &file.expect(&format!("{prefix}.bias"), &shape[1..2])?.data)?),
+        b: upload(gpu, &file.expect(&format!("{prefix}.bias"), &shape[1..2])?.data)?,
     })
 }
 
@@ -218,7 +212,7 @@ impl Codec {
         let linear = |p: &str, shape: [usize; 2]| -> Result<Linear> {
             Ok(Linear {
                 w: upload(gpu, &file.expect(&format!("{p}.weight"), &shape)?.data)?,
-                b: Some(upload(gpu, &file.expect(&format!("{p}.bias"), &shape[..1])?.data)?),
+                b: upload(gpu, &file.expect(&format!("{p}.bias"), &shape[..1])?.data)?,
             })
         };
 
@@ -235,7 +229,7 @@ impl Codec {
                     up: load_transposed(gpu, file, &format!("{p}.0.conv"), [latent, latent, r])?,
                     dw: Linear {
                         w: upload(gpu, &file.expect(&format!("{p}.1.dwconv.conv.weight"), &[latent, 1, KERNEL])?.data)?,
-                        b: Some(upload(gpu, &file.expect(&format!("{p}.1.dwconv.conv.bias"), &[latent])?.data)?),
+                        b: upload(gpu, &file.expect(&format!("{p}.1.dwconv.conv.bias"), &[latent])?.data)?,
                     },
                     norm: (
                         upload(gpu, &file.expect(&format!("{p}.1.norm.weight"), &[latent])?.data)?,
@@ -244,7 +238,7 @@ impl Codec {
                     pw1: linear(&format!("{p}.1.pwconv1"), [4 * latent, latent])?,
                     pw2: Linear {
                         w: upload(gpu, &scale_rows(&pw2.data, &gamma.data))?,
-                        b: Some(upload(gpu, &scale_rows(&pw2_b.data, &gamma.data))?),
+                        b: upload(gpu, &scale_rows(&pw2_b.data, &gamma.data))?,
                     },
                 })
             })
@@ -304,10 +298,6 @@ impl Codec {
         Ok(codec)
     }
 
-    pub fn max_frames(&self) -> usize {
-        self.scratch.frames
-    }
-
     /// Decodes `codes` (frames × 16, frame-major) to `frames × samples_per_frame` samples in [-1, 1].
     pub fn decode(&mut self, gpu: &Gpu, codes: &[i32]) -> Result<Vec<f32>> {
         let f = codes.len() / GROUPS;
@@ -329,7 +319,7 @@ impl Codec {
 
         // Transformer over the frames, residual stream in `res`.
         gpu.linear(x, b, self.input_proj.w.ptr(), f, hidden, latent)?;
-        gpu.bias_act(x, self.input_proj.bias(), 0, x, Act::None, f, hidden)?;
+        gpu.bias_act(x, self.input_proj.b.ptr(), 0, x, Act::None, f, hidden)?;
         let (heads, hd, inter) = (c.num_attention_heads, c.head_dim, c.intermediate_size);
         let qkv_w = 3 * heads * hd;
         gpu.copy(res, x, f * hidden * 2)?;
@@ -349,17 +339,17 @@ impl Codec {
             gpu.add_rms_norm(x, res, next.ptr(), f, hidden, c.rms_norm_eps)?;
         }
         gpu.linear(a, x, self.output_proj.w.ptr(), f, latent, hidden)?;
-        gpu.bias_act(a, self.output_proj.bias(), 0, a, Act::None, f, latent)?;
+        gpu.bias_act(a, self.output_proj.b.ptr(), 0, a, Act::None, f, latent)?;
 
         // Upsamplers: transposed conv, then ConvNeXt with its residual.
         let mut t = f;
         for (u, &r) in self.upsample.iter().zip(&c.upsampling_ratios) {
             gpu.linear(col, a, u.up.w.ptr(), t, r * latent, latent)?;
-            gpu.col2im(col, u.up.bias(), b, (t, latent), r, r)?;
+            gpu.col2im(col, u.up.b.ptr(), b, (t, latent), r, r)?;
             t *= r;
             gpu.dwconv_layernorm(
                 b,
-                (u.dw.w.ptr(), u.dw.bias()),
+                (u.dw.w.ptr(), u.dw.b.ptr()),
                 (u.norm.0.ptr(), u.norm.1.ptr()),
                 x,
                 (t, latent),
@@ -367,9 +357,9 @@ impl Codec {
                 1e-6,
             )?;
             gpu.linear(col, x, u.pw1.w.ptr(), t, 4 * latent, latent)?;
-            gpu.bias_act(col, u.pw1.bias(), 0, col, Act::Gelu, t, 4 * latent)?;
+            gpu.bias_act(col, u.pw1.b.ptr(), 0, col, Act::Gelu, t, 4 * latent)?;
             gpu.linear(x, col, u.pw2.w.ptr(), t, latent, 4 * latent)?;
-            gpu.bias_act(x, u.pw2.bias(), b, a, Act::None, t, latent)?;
+            gpu.bias_act(x, u.pw2.b.ptr(), b, a, Act::None, t, latent)?;
         }
 
         conv(gpu, a, &self.conv_in, b, col, (t, latent, c.decoder_dim), KERNEL)?;
@@ -378,21 +368,21 @@ impl Codec {
             let (cin, cout) = (c.decoder_dim >> i, c.decoder_dim >> (i + 1));
             gpu.im2col(b, 0, blk.snake.ptrs(), a, (t, cin), 1, 1)?;
             gpu.linear(col, a, blk.up.w.ptr(), t, 2 * blk.rate * cout, cin)?;
-            gpu.col2im(col, blk.up.bias(), b, (t, cout), 2 * blk.rate, blk.rate)?;
+            gpu.col2im(col, blk.up.b.ptr(), b, (t, cout), 2 * blk.rate, blk.rate)?;
             t *= blk.rate;
             for u in &blk.units {
                 gpu.im2col(b, 0, u.snake1.ptrs(), col, (t, cout), KERNEL, u.dilation)?;
                 gpu.linear(a, col, u.conv1.w.ptr(), t, cout, KERNEL * cout)?;
-                gpu.im2col(a, u.conv1.bias(), u.snake2.ptrs(), x, (t, cout), 1, 1)?;
+                gpu.im2col(a, u.conv1.b.ptr(), u.snake2.ptrs(), x, (t, cout), 1, 1)?;
                 gpu.linear(a, x, u.conv2.w.ptr(), t, cout, cout)?;
-                gpu.bias_act(a, u.conv2.bias(), b, b, Act::None, t, cout)?;
+                gpu.bias_act(a, u.conv2.b.ptr(), b, b, Act::None, t, cout)?;
             }
         }
         let out_dim = c.decoder_dim >> self.blocks.len();
         gpu.conv_out(
             b,
             self.snake_out.ptrs(),
-            (self.conv_out.w.ptr(), self.conv_out.bias()),
+            (self.conv_out.w.ptr(), self.conv_out.b.ptr()),
             s.wav.ptr(),
             (t, out_dim),
             KERNEL,
@@ -414,7 +404,7 @@ fn conv(
 ) -> Result<()> {
     gpu.im2col(x, 0, (0, 0), col, (t, cin), k, 1)?;
     gpu.linear(out, col, w.w.ptr(), t, cout, k * cin)?;
-    gpu.bias_act(out, w.bias(), 0, out, Act::None, t, cout)
+    gpu.bias_act(out, w.b.ptr(), 0, out, Act::None, t, cout)
 }
 
 impl Scratch {
