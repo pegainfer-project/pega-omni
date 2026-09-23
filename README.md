@@ -7,7 +7,7 @@
 <p align="center">OpenAI-compatible speech serving in Rust, from the <a href="https://github.com/pegainfer-project/pegainfer">pegainfer</a> project.</p>
 
 <p align="center">
-  <a href="docs/qwen3-tts-vs-vllm-omni.md"><img src="assets/qwen3-tts-vs-vllm-omni.png" width="800" alt="pega-omni vs vLLM-Omni: 8x faster first audio, 1.6x the throughput"></a>
+  <a href="docs/qwen3-tts-vs-vllm-omni.md"><img src="assets/qwen3-tts-vs-vllm-omni.png" width="800" alt="pega-omni vs vLLM-Omni: 6.6x faster first audio, 2.5x the throughput"></a>
 </p>
 
 ---

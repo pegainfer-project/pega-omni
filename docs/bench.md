@@ -239,3 +239,31 @@ The tables use these column conventions:
   needs `min`/`sub` in kern's shape expressions, which kern does not have.
 - **An implicit-GEMM conv1 on mma.sync.** The estimate was about 80 µs at
   B=64, only for the last block, so it was not built.
+
+# Qwen3-TTS: one manifest
+
+**TL;DR** (2026-09-23, one GB300): the talker, code predictor, sampler and
+streamed codec as one kern manifest, one graph launch per decode step, serve
+1.27x main's audio per second at c=1 and 4.24x at c=64, with every stream
+continuous at c=64 (main: 25%).
+
+## Method
+
+- main (3c4ad29) against this branch's release binary, one server at a time on
+  GPU 2; server on cores 108-125, client (`omni-bench`) on 126-143, both on
+  the GPU's NUMA node; order main, new, main, new; the table is the mean of
+  the two runs.
+- Default chunk schedule (2+8). Points c=1/8/32/64 with max(64, 4c) requests
+  and max(8, c) warmups; prompts are 64 varied English and Chinese sentences.
+
+## A/B against main
+
+| c | TTFP p50 / p99 ms | RTF | audio-s/s | streams without underrun |
+|---:|---|---|---|---|
+| 1 | 12.2 / 14.7 → 9.9 / 16.4 | 0.075 → 0.059 | 13.3 → 16.8 (1.27x) | 128/128 → 128/128 |
+| 8 | 23.9 / 46.5 → 19.6 / 29.4 | 0.116 → 0.069 | 65.4 → 111.5 (1.71x) | 128/128 → 128/128 |
+| 32 | 42.3 / 147.9 → 21.2 / 29.6 | 0.252 → 0.084 | 116.7 → 327.7 (2.81x) | 158/256 → 256/256 |
+| 64 | 80.4 / 278.8 → 22.5 / 32.6 | 0.442 → 0.099 | 133.0 → 563.6 (4.24x) | 128/512 → 512/512 |
+
+Under nsys at c=1 each decode step is one `cuGraphLaunch` followed by two
+copies back (codes and PCM); the only other launches are the eager prefills.

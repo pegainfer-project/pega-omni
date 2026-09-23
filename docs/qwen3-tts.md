@@ -116,4 +116,32 @@ Japanese, including 8 concurrent requests in one batch.
 
 ## Performance
 
-PERF_PLACEHOLDER
+Measured 2026-09-23 on one GB300 against main (the chunked codec, the
+talker launch by launch), `omni-bench`, default 2+8 chunks, server and client
+pinned to separate cores, two runs each; [bench.md](bench.md#qwen3-tts-one-manifest)
+has the method.
+
+| c | TTFP p50 / p99 ms | RTF | audio-s/s | streams without underrun |
+|---:|---|---|---|---|
+| 1 | 12.2 / 14.7 → 9.9 / 16.4 | 0.075 → 0.059 | 13.3 → 16.8 (1.27x) | all → all |
+| 8 | 23.9 / 46.5 → 19.6 / 29.4 | 0.116 → 0.069 | 65.4 → 111.5 (1.71x) | all → all |
+| 32 | 42.3 / 147.9 → 21.2 / 29.6 | 0.252 → 0.084 | 116.7 → 327.7 (2.81x) | 62% → all |
+| 64 | 80.4 / 278.8 → 22.5 / 32.6 | 0.442 → 0.099 | 133.0 → 563.6 (4.24x) | 25% → all |
+
+Where it comes from:
+
+- **The streamed codec** decodes each frame once instead of re-decoding a
+  72-frame window per chunk; its kernels bring one frame for 64 streams to
+  1.02 ms of GPU time ([bench.md](bench.md#qwen3-tts-codec-decoder-kernels)).
+- **One graph per step**: talker, code predictor, sampler and codec replay as
+  one launch, so c=1 is no longer bound by launching ~1,100 kernels from the
+  CPU.
+
+Against vLLM-Omni on its own benchmark, see
+[qwen3-tts-vs-vllm-omni.md](qwen3-tts-vs-vllm-omni.md): with the same chunk
+schedule, first audio 3.7-6.6x sooner and 1.4-2.5x the audio per second.
+
+What is next: a decode graph is ~1,200 kernel nodes, most of them the 15
+code-predictor passes, so at c=1 fusing those is the lever; a step that admits
+requests runs `prefill` + `first` and `decode` as two waited calls, the next
+thing to overlap.
