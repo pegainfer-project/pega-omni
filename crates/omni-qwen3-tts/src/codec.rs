@@ -386,7 +386,10 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
     );
     ensure!(latent.is_multiple_of(8) && latent / 8 <= 1024, "codec latent dim {latent} unsupported");
     let out_dim = cfg.decoder_dim >> cfg.upsample_rates.len();
-    ensure!(out_dim.is_multiple_of(8) && out_dim <= 128, "codec output conv width {out_dim} unsupported (at most 128)");
+    ensure!(
+        out_dim.is_multiple_of(32) && out_dim <= 128,
+        "codec output conv width {out_dim} unsupported (32 | c ≤ 128)"
+    );
     let mut g = Gen {
         buffers: serde_json::Map::new(),
         ops: serde_json::Map::new(),
@@ -589,7 +592,6 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
                 i32a(t),
                 i32a(r),
                 i32a(latent),
-                i32a(KERNEL),
                 stride(),
                 f32a(1e-6),
             ],
@@ -683,13 +685,13 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
     let (conv_out, conv_out_b) =
         conv_w(&mut g, &format!("decoder.decoder.{}.conv", n + 1), "conv_out", [1, out_dim, KERNEL])?;
     let conv_out_b = g.weight("conv_out.b", &[1], &conv_out_b);
-    ensure!(t >= KERNEL, "the output conv needs at least {KERNEL} rows per frame");
+    ensure!(t.is_multiple_of(64), "the output conv needs whole 64-row tiles, got {t} rows per frame");
     let history = g.region(2 * (KERNEL - 1) * out_dim * 2);
     g.launch(
         "conv_out",
         "codec_conv_out",
-        [json!(t.div_ceil(128)), json!("seqs"), json!(1)],
-        128,
+        [json!(t.div_ceil(64)), json!("seqs"), json!(1)],
+        256,
         vec![
             inb(cur),
             inb(&in_b),
@@ -703,7 +705,6 @@ fn generate(file: &File, cfg: &config::Codec, spf: usize, max_seqs: usize, sha: 
             outb("wav"),
             i32a(t),
             i32a(out_dim),
-            i32a(KERNEL),
             stride(),
         ],
     );

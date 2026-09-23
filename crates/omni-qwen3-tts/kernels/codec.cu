@@ -425,40 +425,56 @@ extern "C" __global__ void codec_col2im(const bf16* z, const bf16* bias, void* s
   store8(out + (int64_t)i * 8, v);
 }
 
+constexpr int kDwTaps = 7;
+
 // ConvNeXt's input x = z + zb, z the rows of a transposed conv with kernel =
 // stride = r (its GEMM output, already in row order) and zb its bias per
 // (row % r, channel), kept in `xin` for the residual; then the depthwise causal
-// conv (w [K, C]) and LayerNorm into `out`. One block per row, eight channels
-// per thread (C = 8 * blockDim.x); earlier rows from the history (H = K - 1).
+// conv (w [7, C]) and LayerNorm into `out`. One block per row, eight channels
+// per thread (C = 8 * blockDim.x); earlier rows from the history (H = 6).
+// The weights are loaded before the PDL wait, every tap's row in one round.
 extern "C" __global__ void codec_dwconv_ln(const bf16* z, const bf16* zb, const bf16* w, const bf16* b,
                                            const bf16* ln_w, const bf16* ln_b, void* state, const int32_t* pos,
-                                           const int32_t* lines, bf16* xin, bf16* out, int T, int r, int C, int K,
+                                           const int32_t* lines, bf16* xin, bf16* out, int T, int r, int C,
                                            int64_t stride, float eps) {
-  pdl();
+  constexpr int H = kDwTaps - 1;
   const int64_t g = blockIdx.x;
-  const int s = g / T, t = g % T, c = threadIdx.x * 8, H = K - 1;
+  const int s = g / T, t = g % T, c = threadIdx.x * 8;
+  float acc[8], wt[kDwTaps][8], lw[8], lb[8];
+  load8(b + c, acc);
+#pragma unroll
+  for (int j = 0; j < kDwTaps; ++j) load8(w + j * C + c, wt[j]);
+  load8(ln_w + c, lw);
+  load8(ln_b + c, lb);
+  pdl();
   const int p = pos[s];
   bf16* hist = slot(state, lines, s, stride);
   const bf16* old = hist + (p & 1) * (int64_t)H * C;
   bf16* next = hist + ((p + 1) & 1) * (int64_t)H * C;
-  float acc[8], cur[8];
-  load8(b + c, acc);
-  for (int j = 0; j < K; ++j) {
-    const int src = t - (K - 1 - j);
-    float v[8], wj[8];
+  uint4 raw[kDwTaps];
+#pragma unroll
+  for (int j = 0; j < kDwTaps; ++j) {
+    const int src = t - (H - j);
+    raw[j] = *reinterpret_cast<const uint4*>(src >= 0 ? z + ((int64_t)s * T + src) * C + c
+                                                      : old + (int64_t)(H + src) * C + c);
+  }
+  float cur[8];
+#pragma unroll
+  for (int j = 0; j < kDwTaps; ++j) {
+    const int src = t - (H - j);
+    const bf16* e = reinterpret_cast<const bf16*>(&raw[j]);
+    float v[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) v[k] = f32(e[k]);
     if (src >= 0) {
       float zbv[8];
-      load8(z + ((int64_t)s * T + src) * C + c, v);
       load8(zb + (src % r) * C + c, zbv);
 #pragma unroll
       for (int k = 0; k < 8; ++k) v[k] = round_bf16(v[k] + zbv[k]);
-    } else {
-      load8(old + (int64_t)(H + src) * C + c, v);
     }
-    load8(w + j * C + c, wj);
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
-      acc[k] += wj[k] * v[k];
+      acc[k] += wt[j][k] * v[k];
       cur[k] = v[k];
     }
   }
@@ -476,63 +492,83 @@ extern "C" __global__ void codec_dwconv_ln(const bf16* z, const bf16* zb, const 
 #pragma unroll
   for (int k = 0; k < 8; ++k) sq += (acc[k] - mean) * (acc[k] - mean);
   const float rstd = rsqrtf(block_sum(sq) / C + eps);
-  float lw[8], lb[8];
-  load8(ln_w + c, lw);
-  load8(ln_b + c, lb);
 #pragma unroll
   for (int k = 0; k < 8; ++k) acc[k] = (acc[k] - mean) * rstd * lw[k] + lb[k];
   store8(out + g * C + c, acc);
 }
 
-constexpr int kOutTile = 128;
+constexpr int kOutTile = 64;
 constexpr int kOutC = 128;
-constexpr int kOutK = 8;
+constexpr int kOutRows = 4;
 
-// The last SnakeBeta (of x + bias), the C -> 1 conv (w [K, C]) and the clamp
-// to [-1, 1]. A block per (128 rows, sequence) holds its rows and the K - 1
-// before them snaked in shared memory, a thread per output sample. C at most
-// 128, K at most 8, T at least K - 1.
-extern "C" __global__ void __launch_bounds__(kOutTile)
+// The last SnakeBeta (of x + bias), the C -> 1 conv (w [7, C]) and the clamp
+// to [-1, 1]. A block of 256 per (64 rows, sequence) snakes its rows and the
+// six before them once into shared memory, every load issued up front; a
+// thread then sums four consecutive outputs over a sixteenth of the channels
+// (a sliding window over ten rows), and sixteen lanes reduce. C a multiple of
+// 32, at most 128; T a multiple of 64.
+extern "C" __global__ void __launch_bounds__(256)
     codec_conv_out(const bf16* x, const bf16* bias, const float* a, const float* inv_b, const bf16* w, const bf16* wb,
-                   void* state, const int32_t* pos, const int32_t* lines, bf16* out, int T, int C, int K,
-                   int64_t stride) {
+                   void* state, const int32_t* pos, const int32_t* lines, bf16* out, int T, int C, int64_t stride) {
+  constexpr int H = kDwTaps - 1, kItems = ((kOutTile + H) * kOutC / 8 + 255) / 256;
+  // Rows ld ≡ 4 (mod 8) words apart: the two row groups a warp reads fall in opposite bank halves.
+  __shared__ __align__(16) __nv_bfloat162 sx[(kOutTile + H) * (kOutC / 2 + 4)];
+  __shared__ float2 sw[kDwTaps * kOutC / 2];
+  const int s = blockIdx.y, t0 = blockIdx.x * kOutTile, tid = threadIdx.x;
+  const int ld = (C / 2 + 7) / 8 * 8 + 4, C8 = C / 8, pairs = C / 32;
+  const int q = tid & 15, rg = tid >> 4;
+  for (int i = tid; i < kDwTaps * C / 2; i += blockDim.x)
+    sw[i] = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(w)[i]);
   pdl();
-  // Rows C / 2 + 1 words apart, an odd count: a warp reading consecutive rows hits distinct banks.
-  __shared__ __nv_bfloat162 sx[(kOutTile + kOutK) * (kOutC / 2 + 1)];
-  __shared__ float sw[kOutK * kOutC];
-  const int s = blockIdx.y, t0 = blockIdx.x * kOutTile, H = K - 1, tid = threadIdx.x;
-  const int ld = C / 2 + 1, C8 = C / 8;
   const int rows = min(kOutTile, T - t0) + H;
   const int p = pos[s];
   bf16* hist = slot(state, lines, s, stride);
   const bf16* old = hist + (p & 1) * (int64_t)H * C;
   bf16* next = hist + ((p + 1) & 1) * (int64_t)H * C;
-  for (int i = tid; i < K * C; i += blockDim.x) sw[i] = f32(w[i]);
-  for (int i = tid; i < rows * C8; i += blockDim.x) {
-    const int row = i / C8, c = i % C8 * 8, src = t0 - H + row;
+  uint4 raw[kItems];
+#pragma unroll
+  for (int k = 0; k < kItems; ++k) {
+    const int i = tid + k * 256, row = i / C8, c = i % C8 * 8, src = t0 - H + row;
+    if (row < rows)
+      raw[k] = *reinterpret_cast<const uint4*>(src < 0 ? old + (int64_t)(H + src) * C + c
+                                                       : x + ((int64_t)s * T + src) * C + c);
+  }
+#pragma unroll
+  for (int k = 0; k < kItems; ++k) {
+    const int i = tid + k * 256, row = i / C8, c = i % C8 * 8, src = t0 - H + row;
+    if (row >= rows) break;
+    const bf16* e = reinterpret_cast<const bf16*>(&raw[k]);
     float v[8];
-    if (src < 0) {
-      load8(old + (int64_t)(H + src) * C + c, v);
-    } else {
-      load8(x + ((int64_t)s * T + src) * C + c, v);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = f32(e[j]);
+    if (src >= 0) {
       bias_snake8(v, bias, a, inv_b, c);
 #pragma unroll
-      for (int k = 0; k < 8; ++k) v[k] = round_bf16(v[k]);
+      for (int j = 0; j < 8; ++j) v[j] = round_bf16(v[j]);
       if (src >= T - H && row >= H) store8(next + (int64_t)(src - (T - H)) * C + c, v);
     }
-#pragma unroll
-    for (int k = 0; k < 4; ++k) sx[row * ld + c / 2 + k] = __floats2bfloat162_rn(v[2 * k], v[2 * k + 1]);
+    *reinterpret_cast<uint4*>(sx + row * ld + c / 2) = pack8(v);
   }
   __syncthreads();
-  if (t0 + tid >= T) return;
-  float acc = 0.f;
-  for (int j = 0; j < K; ++j) {
-    const __nv_bfloat162* xr = sx + (tid + j) * ld;
-    const float* wr = sw + j * C;
-    for (int c2 = 0; c2 < C / 2; ++c2) {
-      const float2 v = __bfloat1622float2(xr[c2]);
-      acc += v.x * wr[2 * c2] + v.y * wr[2 * c2 + 1];
+  float acc[kOutRows] = {0.f, 0.f, 0.f, 0.f};
+  for (int k = 0; k < pairs; ++k) {
+    const int pr = q + 16 * k;
+    float2 v[kOutRows + H];
+#pragma unroll
+    for (int i = 0; i < kOutRows + H; ++i) v[i] = __bfloat1622float2(sx[(rg * kOutRows + i) * ld + pr]);
+#pragma unroll
+    for (int j = 0; j < kDwTaps; ++j) {
+      const float2 wj = sw[j * (C / 2) + pr];
+#pragma unroll
+      for (int o = 0; o < kOutRows; ++o) acc[o] += v[o + j].x * wj.x + v[o + j].y * wj.y;
     }
   }
-  out[(int64_t)s * T + t0 + tid] = to_bf16(fminf(1.f, fmaxf(-1.f, round_bf16(acc + f32(wb[0])))));
+#pragma unroll
+  for (int o = 0; o < kOutRows; ++o)
+#pragma unroll
+    for (int m = 1; m < 16; m <<= 1) acc[o] += __shfl_xor_sync(0xffffffffu, acc[o], m);
+  if (q < kOutRows) {
+    const int t = t0 + rg * kOutRows + q;
+    if (t < T) out[(int64_t)s * T + t] = to_bf16(fminf(1.f, fmaxf(-1.f, round_bf16(acc[q] + f32(wb[0])))));
+  }
 }
