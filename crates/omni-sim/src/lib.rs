@@ -29,6 +29,7 @@ use bytes::Bytes;
 use omni_engine::Done;
 use omni_engine::EngineInfo;
 use omni_engine::Event;
+use omni_engine::Extra;
 use omni_engine::Finish;
 use omni_engine::Inbox;
 use omni_engine::Speech;
@@ -114,7 +115,8 @@ impl Profile {
             model: model.into(),
             sample_rate: self.sample_rate,
             voices: VOICES.iter().map(|v| v.to_string()).collect(),
-            extra_keys: ["frames".to_string()].into(),
+            extra: [("frames".to_string(), Extra::Integer(1..=self.max_frames as i64))].into(),
+            speeds: omni_engine::SPEED_RANGE,
             max_input_chars: 4096,
         }
     }
