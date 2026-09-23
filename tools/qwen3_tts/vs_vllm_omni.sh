@@ -50,15 +50,16 @@ serve_vllm_omni() {
   mkdir -p "$mps/pipe" "$mps/log"
   export CUDA_MPS_PIPE_DIRECTORY=$mps/pipe CUDA_MPS_LOG_DIRECTORY=$mps/log
   CUDA_VISIBLE_DEVICES=$GPU nvidia-cuda-mps-control -d
+  # find_spec locates the package without importing it (importing logs to stdout).
   local deploy
-  deploy=$(python -c 'import vllm_omni, pathlib; print(pathlib.Path(vllm_omni.__file__).parent / "deploy")')
+  deploy=$(python -c 'import importlib.util as u, pathlib as p; print(p.Path(u.find_spec("vllm_omni").origin).parent / "deploy")')
   CUDA_VISIBLE_DEVICES=$GPU taskset -c "$SERVER_CPUS" vllm serve "$MODEL" --omni --port "$PORT" \
     --served-model-name "$NAME" --trust-remote-code \
     --deploy-config "$deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml" "$@" &
-  local pid=$!
-  trap 'kill $pid 2>/dev/null; wait $pid; echo quit | nvidia-cuda-mps-control' EXIT
+  server=$!
+  trap 'kill $server 2>/dev/null; wait $server; echo quit | nvidia-cuda-mps-control' EXIT
   trap 'exit 143' TERM INT
-  wait $pid
+  wait $server
 }
 
 serve_pega_omni() {
