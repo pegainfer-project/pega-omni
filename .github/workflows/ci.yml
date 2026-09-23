@@ -53,7 +53,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends cuda-nvcc-$CUDA cuda-cudart-dev-$CUDA
           cuda=/usr/local/cuda-${CUDA/-/.}
           echo "$cuda/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=$cuda/lib64" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
