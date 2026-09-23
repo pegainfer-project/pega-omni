@@ -89,12 +89,16 @@ continuous.
 
 ## Method
 
-- **Codec alone.** A test harness decodes one frame for B streams, 300 times,
-  through the same kern graph the engine replays. nsys with CUDA graph node
-  tracing gives the span per call (first kernel start to last kernel end) and
-  each kernel's time. Under programmatic dependent launch a kernel's duration
-  includes its wait on its producer, so each kernel is charged only its
-  critical-path share: the part of its duration that no earlier kernel covers.
+- **Codec alone.** Measured while the codec was still a kern runtime of its
+  own (up to 2c556f1): one frame for B streams, 300 times, through its graph.
+  The codec is now the tail of the model's `first` and `decode` graphs; to
+  reproduce, run nsys with CUDA graph node tracing
+  (`--cuda-graph-trace=node`) on a server under `omni-bench` at c=B and take
+  each `decode` call's `codec_*` kernels. That gives the codec span per call
+  (first codec kernel start to last kernel end) and each kernel's time.
+  Under programmatic dependent launch a kernel's duration includes its wait
+  on its producer, so each kernel is charged only its critical-path share:
+  the part of its duration that no earlier kernel covers.
 - **Server.** nsys on a live server under `omni-bench` load (default 2+8
   chunks) gives the step period: talker start to talker start.
 - **A/B.** Same session, one server at a time on GPU 2. Server on cores

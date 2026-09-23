@@ -20,10 +20,18 @@ check belongs in CI.
 - `crates/omni-sim`: `Sim` is a pure state machine (admission, frames,
   chunks, step cost); `spawn` is the thread shell. Decisions go in `Sim`,
   where property tests reach them.
+- `crates/omni-qwen3-tts`: Qwen3-TTS as one generated kern manifest.
+  `manifest.rs` is the builder; `talker.rs`, `stack.rs` and `codec.rs` emit
+  the calls, `kernels/*.cu` the kernels they launch; `model.rs` is the runtime
+  shell, `engine.rs` the scheduler. `tests/golden.rs` is the correctness
+  oracle.
 - `crates/omni-server`: the `pega-omni` binary; one subcommand per engine.
 - `crates/omni-bench`: the load generator; `playback.rs` is the underrun model.
 - `tools/openai_sdk_check.py`: the official SDK against a live server; it is
   the compatibility oracle, not our reading of the docs.
+- `tools/qwen3_tts/`: `golden.py` records the official run the golden test
+  compares against; `vs_vllm_omni.sh` and `chart.py` reproduce the README
+  comparison.
 
 ## What we prefer
 
