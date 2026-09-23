@@ -6,6 +6,10 @@
 
 <p align="center">OpenAI-compatible speech serving in Rust, from the <a href="https://github.com/pegainfer-project/pegainfer">pegainfer</a> project.</p>
 
+<p align="center">
+  <a href="docs/qwen3-tts-vs-vllm-omni.md"><img src="assets/qwen3-tts-vs-vllm-omni.png" width="800" alt="pega-omni vs vLLM-Omni: 8x faster first audio, 1.6x the throughput"></a>
+</p>
+
 ---
 
 Speech models are not text models with an audio suffix. A codec-frame TTS model

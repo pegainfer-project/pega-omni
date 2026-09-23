@@ -74,14 +74,10 @@ Served audio through Whisper large-v3-turbo transcribes back to the input for
 English, Chinese (with `instructions`, and the Sichuan dialect speaker) and
 Japanese, including 8 concurrent requests in one batch.
 
-## First numbers
+## Performance
 
-2026-09-23, one GB300, server and client unpinned on the same node, 30 diverse
-English sentences (~100 characters, ~6 s of audio), voice `ryan`, PCM, chunks
-2 + 8 frames, context 72. A baseline, not a tuned result:
-
-| concurrency | req/s | audio-s/s | TTFP p50 / p99 | RTF p50 | underrun > 1 ms |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 2.1 | 13.6 | 12 / 12 ms | 0.073 | 0 |
-| 8 | 9.9 | 65.9 | 24 / 54 ms | 0.116 | 0 |
-| 32 | 18.5 | 119.3 | 51 / 103 ms | 0.259 | 114 of 256 (p99 37 ms) |
+[qwen3-tts-vs-vllm-omni.md](qwen3-tts-vs-vllm-omni.md) holds the numbers:
+the method, a script to reproduce them, and results under vLLM-Omni's own
+benchmark on one GB300. With the same chunk schedule, first audio arrives
+5-8x sooner than with vLLM-Omni, and from c=8 up the engine serves 1.3-1.6x the
+audio per second.
