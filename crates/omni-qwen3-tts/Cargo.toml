@@ -23,9 +23,6 @@ tokenizers.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
-[build-dependencies]
-cc.workspace = true
-
 [dev-dependencies]
 proptest.workspace = true
 

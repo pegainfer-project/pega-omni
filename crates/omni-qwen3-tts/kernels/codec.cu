@@ -1,5 +1,5 @@
 // The streaming codec decoder's kernels, compiled to one cubin that the kern
-// runtime launches from the manifest `codec::manifest` generates.
+// runtime launches from the calls `codec::build` generates.
 //
 // A call decodes one frame for each of `seqs` sequences. At a stage running
 // `T` rows per frame, global row `g` is row `t = g % T` of sequence `s = g / T`,
@@ -22,57 +22,15 @@
 // to the stream's consumers, which add it on load (their `bias` params).
 // Elementwise kernels move eight channels (16 bytes) per thread, so channel
 // counts are multiples of 8.
-#include <cuda_bf16.h>
-#include <stdint.h>
-
-using bf16 = __nv_bfloat16;
-
-__device__ __forceinline__ float f32(bf16 x) { return __bfloat162float(x); }
-__device__ __forceinline__ bf16 to_bf16(float x) { return __float2bfloat16(x); }
-__device__ __forceinline__ float round_bf16(float x) { return f32(to_bf16(x)); }
-
-__device__ __forceinline__ void load8(const bf16* p, float* v) {
-  uint4 u = *reinterpret_cast<const uint4*>(p);
-  const bf16* e = reinterpret_cast<const bf16*>(&u);
-#pragma unroll
-  for (int k = 0; k < 8; ++k) v[k] = f32(e[k]);
-}
+#include "common.cuh"
 
 __device__ __forceinline__ void loadf8(const float* p, float* v) {
   const float4 a = reinterpret_cast<const float4*>(p)[0], b = reinterpret_cast<const float4*>(p)[1];
   v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w, v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
 }
 
-__device__ __forceinline__ uint4 pack8(const float* v) {
-  uint4 u;
-  bf16* e = reinterpret_cast<bf16*>(&u);
-#pragma unroll
-  for (int k = 0; k < 8; ++k) e[k] = to_bf16(v[k]);
-  return u;
-}
-
-__device__ __forceinline__ void store8(bf16* p, const float* v) { *reinterpret_cast<uint4*>(p) = pack8(v); }
-
 __device__ __forceinline__ void copy8(bf16* dst, const bf16* src) {
   *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
-}
-
-__device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-  return v;
-}
-
-__device__ __forceinline__ float block_sum(float v) {
-  __shared__ float partial[32];
-  v = warp_sum(v);
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  if (lane == 0) partial[warp] = v;
-  __syncthreads();
-  v = lane < (int)(blockDim.x >> 5) ? partial[lane] : 0.f;
-  v = warp_sum(v);
-  __syncthreads();
-  return v;
 }
 
 // sin by the hardware approximation after a two-step reduction to [-π, π]
@@ -103,10 +61,6 @@ __device__ __forceinline__ void bias_snake8(float* v, const bf16* bias, const fl
 // successor launch, which waits in turn.
 __device__ __forceinline__ void pdl() {
   asm volatile("griddepcontrol.wait;\n\tgriddepcontrol.launch_dependents;" ::: "memory");
-}
-
-__device__ __forceinline__ bf16* slot(void* state, const int32_t* lines, int s, int64_t stride) {
-  return reinterpret_cast<bf16*>(static_cast<char*>(state) + (int64_t)lines[s] * stride);
 }
 
 // Row r: [codebook 0 | Σ codebooks 1..15], each `half` wide; `books` is
@@ -158,23 +112,15 @@ extern "C" __global__ void codec_bias_snake(const bf16* x, const bf16* bias, con
   store8(out + (int64_t)i * 8, v);
 }
 
-// SiLU(gate) * up over fused [gate | up] rows, eight channels per thread.
 extern "C" __global__ void codec_silu_mul(const bf16* gate_up, bf16* out, int inter, int total) {
   pdl();
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= total) return;
-  const int64_t n = i / (inter / 8), c = i % (inter / 8) * 8;
-  float g[8], u[8];
-  load8(gate_up + n * 2 * inter + c, g);
-  load8(gate_up + n * 2 * inter + inter + c, u);
-#pragma unroll
-  for (int k = 0; k < 8; ++k) g[k] = round_bf16(g[k] / (1.f + __expf(-g[k]))) * u[k];
-  store8(out + (int64_t)i * 8, g);
+  silu_mul(gate_up, out, inter, total);
 }
 
-// FlashInfer's FusedAddRMSNorm, a warp per row: res += add; out =
-// rms_norm(res) * w, the norm taken over the unrounded sum. `dim` a multiple
-// of 256, at most 1024; `add_step` 0 adds the same row (a bias) to every row.
+// Residual add then RMSNorm, a warp per row: res += add, stored as bf16;
+// out = res * rsqrt(mean(res²) + eps) * w over the unrounded f32 sum. `dim` a
+// multiple of 256, at most 1024; `add_step` 0 adds the same row (a bias) to
+// every row.
 __device__ __forceinline__ void add_rms_norm(const bf16* add, int64_t add_step, bf16* res, const bf16* w, bf16* out,
                                              int dim, float eps, int rows) {
   const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
@@ -225,12 +171,6 @@ extern "C" __global__ void codec_bias_rms_norm(bf16* res, const bf16* bias, cons
 constexpr int kHead = 64;
 constexpr int kWindow = 72;
 
-__device__ __forceinline__ float warp_max(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-  return v;
-}
-
 // qkv rows are [q | k | v], `heads` heads of 64 each; the layer's ring (`kv`)
 // is K[72][heads*64] then V, frame `p` at `p % 72`. Per (row, head): RoPE on q
 // and k, k and v into the ring, then q against the last min(p + 1, 72) frames,
@@ -251,7 +191,7 @@ extern "C" __global__ void __launch_bounds__(128)
   const int r = blockIdx.x, head = blockIdx.y;
   const int width = heads * kHead;
   const bf16* row = qkv + (int64_t)r * 3 * width + head * kHead;
-  bf16* ring = slot(kv, lines, r, stride);
+  bf16* ring = slot<bf16>(kv, lines, r, stride);
   const int p = pos[r];
   const int n = p + 1 < kWindow ? p + 1 : kWindow;
   const int j0 = p - n + 1;
@@ -355,7 +295,7 @@ __device__ __forceinline__ void im2col(const bf16* x, const bf16* bias, const fl
   const int c = i % C8 * 8, g = i / C8;
   const int s = g / (H + T), r = g % (H + T);
   const int p = pos[s];
-  bf16* hist = slot(state, lines, s, stride);
+  bf16* hist = slot<bf16>(state, lines, s, stride);
   const int64_t half = (int64_t)H * C;
   uint4 u;
   if (r < H) {
@@ -419,7 +359,7 @@ extern "C" __global__ void codec_col2im(const bf16* z, const bf16* bias, void* s
   if (l > 0) {
     load8(zs + (l - 1) * w + (j + r) * C + c, y);
   } else {
-    bf16* prev = slot(state, lines, s, stride) + j * C + c;
+    bf16* prev = slot<bf16>(state, lines, s, stride) + j * C + c;
     load8(prev, y);
     copy8(prev, zs + (L - 1) * w + (j + r) * C + c);
   }
@@ -451,7 +391,7 @@ extern "C" __global__ void codec_dwconv_ln(const bf16* z, const bf16* zb, const 
   load8(ln_b + c, lb);
   pdl();
   const int p = pos[s];
-  bf16* hist = slot(state, lines, s, stride);
+  bf16* hist = slot<bf16>(state, lines, s, stride);
   const bf16* old = hist + (p & 1) * (int64_t)H * C;
   bf16* next = hist + ((p + 1) & 1) * (int64_t)H * C;
   uint4 raw[kDwTaps];
@@ -525,7 +465,7 @@ extern "C" __global__ void __launch_bounds__(256)
   pdl();
   const int rows = min(kOutTile, T - t0) + H;
   const int p = pos[s];
-  bf16* hist = slot(state, lines, s, stride);
+  bf16* hist = slot<bf16>(state, lines, s, stride);
   const bf16* old = hist + (p & 1) * (int64_t)H * C;
   bf16* next = hist + ((p + 1) & 1) * (int64_t)H * C;
   uint4 raw[kItems];

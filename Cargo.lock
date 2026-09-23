@@ -1582,7 +1582,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
- "cc",
  "half",
  "kern-manifest",
  "kern-pool",

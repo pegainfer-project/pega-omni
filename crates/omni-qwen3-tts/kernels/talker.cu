@@ -12,59 +12,10 @@
 //
 // Elementwise kernels take eight bf16 (16 bytes) per thread; every width here
 // is a multiple of eight.
-#include <cuda_bf16.h>
-#include <stdint.h>
-
-using bf16 = __nv_bfloat16;
+#include "common.cuh"
 
 constexpr int kHead = 128;
 constexpr int kGroups = 16;
-
-__device__ __forceinline__ float f32(bf16 x) { return __bfloat162float(x); }
-__device__ __forceinline__ bf16 to_bf16(float x) { return __float2bfloat16(x); }
-
-__device__ __forceinline__ void load8(const bf16* p, float* v) {
-  const uint4 u = *reinterpret_cast<const uint4*>(p);
-  const bf16* e = reinterpret_cast<const bf16*>(&u);
-#pragma unroll
-  for (int k = 0; k < 8; ++k) v[k] = f32(e[k]);
-}
-
-__device__ __forceinline__ void store8(bf16* p, const float* v) {
-  uint4 u;
-  bf16* e = reinterpret_cast<bf16*>(&u);
-#pragma unroll
-  for (int k = 0; k < 8; ++k) e[k] = to_bf16(v[k]);
-  *reinterpret_cast<uint4*>(p) = u;
-}
-
-__device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-  return v;
-}
-
-__device__ __forceinline__ float warp_max(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-  return v;
-}
-
-__device__ __forceinline__ float block_sum(float v) {
-  __shared__ float partial[32];
-  v = warp_sum(v);
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  if (lane == 0) partial[warp] = v;
-  __syncthreads();
-  v = lane < (int)(blockDim.x >> 5) ? partial[lane] : 0.f;
-  v = warp_sum(v);
-  __syncthreads();
-  return v;
-}
-
-__device__ __forceinline__ char* seq_slot(void* state, const int32_t* lines, int s, int64_t stride) {
-  return static_cast<char*>(state) + (int64_t)lines[s] * stride;
-}
 
 // out[r] = table[ids[r * ids_stride]], one block of dim / 8 threads per row.
 extern "C" __global__ void talker_gather(const int32_t* ids, int ids_stride, const bf16* table, bf16* out, int dim) {
@@ -91,7 +42,7 @@ __device__ void bias_act(bf16* x, const bf16* bias, int cols, int total) {
   load8(bias + c, b);
 #pragma unroll
   for (int k = 0; k < 8; ++k) {
-    v[k] = f32(to_bf16(v[k] + b[k]));
+    v[k] = round_bf16(v[k] + b[k]);
     if (SILU) v[k] = v[k] / (1.f + __expf(-v[k]));
   }
   store8(x + (int64_t)i * 8, v);
@@ -132,7 +83,7 @@ extern "C" __global__ void talker_frame_embed(const void* state, const int32_t* 
                                               const bf16* pad, const bf16* codec_emb, const bf16* p_emb, bf16* out,
                                               int dim, int p_vocab) {
   const int s = blockIdx.x, c = threadIdx.x * 8;
-  const int32_t* codes = reinterpret_cast<const int32_t*>(seq_slot(const_cast<void*>(state), lines, s, stride));
+  const int32_t* codes = slot<int32_t>(const_cast<void*>(state), lines, s, stride);
   float acc[8], e[8];
 #pragma unroll
   for (int k = 0; k < 8; ++k) acc[k] = 0.f;
@@ -150,9 +101,9 @@ extern "C" __global__ void talker_frame_embed(const void* state, const int32_t* 
   store8(out + (int64_t)s * dim + c, acc);
 }
 
-// FlashInfer's RMSNorm with the residual stream started: res = x,
-// out = rms_norm(x) * w. One block of dim / 8 threads per row; `out` or `res`
-// may alias `x`.
+// RMSNorm that starts the residual stream: res = x, out = x *
+// rsqrt(mean(x²) + eps) * w in f32. One block of dim / 8 threads per row;
+// `out` or `res` may alias `x`.
 extern "C" __global__ void talker_norm_copy(const bf16* x, const bf16* w, bf16* out, bf16* res, int dim, float eps) {
   const int64_t at = (int64_t)blockIdx.x * dim + threadIdx.x * 8;
   float v[8], wv[8];
@@ -168,10 +119,10 @@ extern "C" __global__ void talker_norm_copy(const bf16* x, const bf16* w, bf16* 
   store8(out + at, v);
 }
 
-// FlashInfer's FusedAddRMSNorm: res += x, then rms_norm(res) * w over the
-// unrounded sum. The normed row `n` goes to `out[n / every]` when
-// `n % every == which` (a strided selection of rows; `out` may be `x` with
-// every = 1).
+// Residual add then RMSNorm: res += x, stored as bf16; out = res *
+// rsqrt(mean(res²) + eps) * w over the unrounded f32 sum. The normed row `n`
+// goes to `out[n / every]` when `n % every == which` (a strided selection of
+// rows; `out` may be `x` with every = 1).
 extern "C" __global__ void talker_add_norm(const bf16* x, bf16* res, const bf16* w, bf16* out, int dim, float eps,
                                            int every, int which) {
   const int n = blockIdx.x;
@@ -194,17 +145,8 @@ extern "C" __global__ void talker_add_norm(const bf16* x, bf16* res, const bf16*
   store8(out + (int64_t)(n / every) * dim + threadIdx.x * 8, v);
 }
 
-// SiLU(gate) * up over fused [gate | up] rows.
 extern "C" __global__ void talker_silu_mul(const bf16* gate_up, bf16* out, int inter, int total) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= total) return;
-  const int64_t n = i / (inter / 8), c = i % (inter / 8) * 8;
-  float g[8], u[8];
-  load8(gate_up + n * 2 * inter + c, g);
-  load8(gate_up + n * 2 * inter + inter + c, u);
-#pragma unroll
-  for (int k = 0; k < 8; ++k) g[k] = f32(to_bf16(g[k] / (1.f + __expf(-g[k])))) * u[k];
-  store8(out + (int64_t)i * 8, g);
+  silu_mul(gate_up, out, inter, total);
 }
 
 // Per-head RMSNorm of Q and K, rotary embedding at `pos`, and K and V to the
@@ -561,7 +503,7 @@ extern "C" __global__ void __launch_bounds__(kSampleThreads)
                   const int32_t* force, void* state, const int32_t* lines, int64_t stride, int penalize,
                   int32_t* codes, int group) {
   const int s = blockIdx.x, tid = threadIdx.x;
-  int32_t* own = reinterpret_cast<int32_t*>(seq_slot(state, lines, s, stride));
+  int32_t* own = slot<int32_t>(state, lines, s, stride);
   uint32_t* seen = reinterpret_cast<uint32_t*>(own + kGroups);
   const int forced = force[s * kGroups + group];
   int token = forced;
