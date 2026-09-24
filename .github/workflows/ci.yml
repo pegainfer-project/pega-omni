@@ -44,16 +44,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Install the CUDA compiler, runtime, cuBLAS and cuRAND headers
+      - name: Install the CUDA compiler and headers (build.rs compiles the kernels to cubins)
         run: |
           set -euo pipefail
           curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update -o Acquire::Retries=3
-          sudo apt-get install -y --no-install-recommends cuda-nvcc-$CUDA cuda-cudart-dev-$CUDA libcublas-dev-$CUDA libcurand-dev-$CUDA
+          sudo apt-get install -y --no-install-recommends cuda-nvcc-$CUDA cuda-cudart-dev-$CUDA
           cuda=/usr/local/cuda-${CUDA/-/.}
           echo "$cuda/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=$cuda/lib64" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

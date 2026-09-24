@@ -1,14 +1,16 @@
 //! Qwen3-TTS (12 Hz tokenizer, CustomVoice) on one GPU.
 //!
-//! [`Model`] is the whole synthesis path: [`talker`] turns a [`prompt`] into
-//! codec frames one step at a time, [`codec`] turns frames into PCM.
-//! [`engine`] runs a batch of requests through it behind an
-//! [`omni_engine::Inbox`].
+//! [`model::Model`] is the whole synthesis path as one kern manifest:
+//! [`talker`] turns a [`prompt`] into codec frames one call at a time,
+//! [`codec`] turns frames into PCM in the same call. [`engine`] runs a batch
+//! of requests through it behind an [`omni_engine::Inbox`].
 
-pub mod codec;
+mod codec;
 pub mod config;
 pub mod engine;
+mod manifest;
+pub mod model;
 pub mod prompt;
-pub mod stack;
-pub mod talker;
+mod stack;
+mod talker;
 pub mod weights;

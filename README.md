@@ -7,7 +7,7 @@
 <p align="center">OpenAI-compatible speech serving in Rust, from the <a href="https://github.com/pegainfer-project/pegainfer">pegainfer</a> project.</p>
 
 <p align="center">
-  <a href="docs/qwen3-tts-vs-vllm-omni.md"><img src="assets/qwen3-tts-vs-vllm-omni.png" width="800" alt="pega-omni vs vLLM-Omni: 8x faster first audio, 1.6x the throughput"></a>
+  <a href="docs/qwen3-tts-vs-vllm-omni.md"><img src="assets/qwen3-tts-vs-vllm-omni.png" width="800" alt="pega-omni vs vLLM-Omni: 6.6x faster first audio, 2.5x the throughput"></a>
 </p>
 
 ---
@@ -87,8 +87,7 @@ differs from OpenAI, it says so instead of guessing:
 | `omni-engine` | the contract: `Speech`, `Event`, `Handle` / `Inbox`; no trait, a channel |
 | `omni-frontend` | axum routes, request parsing, wav / pcm / SSE framing, metrics |
 | `omni-sim` | the simulated engine: a pure scheduling core plus a thread shell |
-| `omni-cuda` | CUDA kernels (FlashInfer attention, fused transformer, sampling, conv) and the GPU layer |
-| `omni-qwen3-tts` | Qwen3-TTS: weights, prompt, talker + code predictor, codec decoder, engine |
+| `omni-qwen3-tts` | Qwen3-TTS as one kern manifest (talker, code predictor, sampler, streaming codec decoder, own CUDA kernels), prompt, engine |
 | `omni-server` | the `pega-omni` binary |
 | `omni-bench` | open-loop load generator: TTFP, E2E, RTF, playback underrun |
 
