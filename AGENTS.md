@@ -33,6 +33,10 @@ check belongs in CI.
 - `crates/omni-personaplex`: PersonaPlex-7B (full duplex) as one manifest;
   `model.rs` the runtime shell, `engine.rs` the clock, `tests/golden.rs` the
   oracle.
+- `crates/omni-hidream-o1`: HiDream-O1-Image as one generated kern manifest.
+  `model.rs` emits the programs and is the runtime shell, `kernels/hidream.cu`
+  the kernels they launch, `sampler.rs` the schedule, `engine.rs` the loop.
+  `tests/golden.rs` is the correctness oracle.
 - `crates/omni-server`: the `pega-omni` binary; one subcommand per engine.
 - `crates/omni-bench`: the load generator; `playback.rs` is the underrun model.
 - `tools/openai_sdk_check.py` (`openai_images_check.py` for images): the
@@ -44,6 +48,8 @@ check belongs in CI.
 - `tools/qwen3_tts/`: `golden.py` records the official run the golden test
   compares against; `vs_vllm_omni.sh` and `chart.py` reproduce the README
   comparison.
+- `tools/hidream_o1/`: `golden.py` records the official run the golden test
+  compares against.
 
 ## What we prefer
 

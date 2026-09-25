@@ -9,6 +9,7 @@ members = [
     "crates/omni-kern",
     "crates/omni-qwen3-tts",
     "crates/omni-personaplex",
+    "crates/omni-hidream-o1",
 ]
 # A plain `cargo build` needs no CUDA toolkit; `--workspace` builds the GPU crates too.
 default-members = [
@@ -33,6 +34,7 @@ omni-frontend = { path = "crates/omni-frontend" }
 omni-kern = { path = "crates/omni-kern" }
 omni-qwen3-tts = { path = "crates/omni-qwen3-tts" }
 omni-personaplex = { path = "crates/omni-personaplex" }
+omni-hidream-o1 = { path = "crates/omni-hidream-o1" }
 
 anyhow = "1"
 # G.711 (`audio/pcmu`, `audio/pcma`) for the live endpoint: the ITU tables,
@@ -49,9 +51,9 @@ half = "2"
 # The model runs as a kern manifest: kern-manifest is its schema and verifier,
 # kern-runtime executes it (graphs per batch bucket, paged KV and per-sequence
 # state slots from kern-pool).
-kern-manifest = { git = "https://github.com/pegainfer-project/kern", rev = "78c73047bb4f8981ff6aa8fc44ccaf1dab43a3a9" }
-kern-pool = { git = "https://github.com/pegainfer-project/kern", rev = "78c73047bb4f8981ff6aa8fc44ccaf1dab43a3a9" }
-kern-runtime = { git = "https://github.com/pegainfer-project/kern", rev = "78c73047bb4f8981ff6aa8fc44ccaf1dab43a3a9" }
+kern-manifest = { git = "https://github.com/pegainfer-project/kern", rev = "444dcd940d9ffbc0de4161bfb8b635c95da5d1ae" }
+kern-pool = { git = "https://github.com/pegainfer-project/kern", rev = "444dcd940d9ffbc0de4161bfb8b635c95da5d1ae" }
+kern-runtime = { git = "https://github.com/pegainfer-project/kern", rev = "444dcd940d9ffbc0de4161bfb8b635c95da5d1ae" }
 hdrhistogram = "7"
 http-body-util = "0.1"
 memmap2 = "0.9"

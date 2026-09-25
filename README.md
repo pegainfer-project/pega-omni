@@ -26,11 +26,12 @@ OpenAI's GPT-Live WebSocket protocol on a clock that never drifts, with all
 sessions in one CUDA graph per tick ([docs/duplex.md](docs/duplex.md)).
 
 The repository holds the serving front end, the engine contracts, CPU-only
-simulated engines used to load-test the front end, and two GPU engines:
+simulated engines used to load-test the front end, and three GPU engines:
 Qwen3-TTS-12Hz-1.7B-CustomVoice ([docs/qwen3-tts.md](docs/qwen3-tts.md)) for
-speech, and NVIDIA PersonaPlex-7B ([docs/personaplex.md](docs/personaplex.md))
+speech, NVIDIA PersonaPlex-7B ([docs/personaplex.md](docs/personaplex.md))
 for full duplex: **128 concurrent live sessions on one GB300 with no playback
-stall**.
+stall**, and HiDream-O1-Image ([docs/hidream-o1.md](docs/hidream-o1.md)), a
+pixel-space diffusion transformer, for OpenAI's `POST /v1/images/generations`.
 
 ## Quick start
 
@@ -60,6 +61,18 @@ voice and transcript out):
 cargo build --release -p omni-server --features personaplex
 target/release/pega-omni personaplex --model-path personaplex-7b-v1
 # open http://127.0.0.1:8000/ (tunnel with ssh -L 8000:127.0.0.1:8000 for a remote GPU)
+```
+
+HiDream-O1-Image (the distilled `-Dev-2604` checkpoint) serves text to image the
+same way, also with the CUDA toolkit:
+
+```bash
+cargo build --release -p omni-server --features hidream-o1
+target/release/pega-omni hidream-o1 --model-path HiDream-O1-Image-Dev-2604
+
+curl -s localhost:8000/v1/images/generations -H 'content-type: application/json' \
+  -d '{"model":"HiDream-O1-Image-Dev-2604","prompt":"A lighthouse on a cliff at dawn.","size":"2048x2048",
+       "extra":{"seed":42}}' | jq -r '.data[0].b64_json' | base64 -d > lighthouse.png
 ```
 
 Any OpenAI client works unchanged:
@@ -115,6 +128,7 @@ differs from OpenAI, it says so instead of guessing:
 | `omni-kern` | the kern manifest builder, weight loading and CUDA helpers the GPU engines share |
 | `omni-qwen3-tts` | Qwen3-TTS as one kern manifest (talker, code predictor, sampler, streaming codec decoder, own CUDA kernels), prompt, engine |
 | `omni-personaplex` | PersonaPlex-7B as one kern manifest (Mimi encoder, Helium, depformer, Mimi decoder, own CUDA kernels), prompt, tokenizer, live engine |
+| `omni-hidream-o1` | HiDream-O1-Image as one kern manifest (diffusion transformer, sampler, own CUDA kernels), sharded weights, prompt and M-RoPE, engine |
 | `omni-server` | the `pega-omni` binary |
 | `omni-bench` | load generator: TTFP, E2E, RTF, playback underrun; `duplex`: concurrent live sessions |
 

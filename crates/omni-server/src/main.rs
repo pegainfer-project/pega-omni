@@ -33,6 +33,9 @@ enum Command {
     /// Serve PersonaPlex-7B, full duplex, on one GPU.
     #[cfg(feature = "personaplex")]
     Personaplex(PersonaplexArgs),
+    /// Serve HiDream-O1-Image (the distilled Dev checkpoints) on one GPU.
+    #[cfg(feature = "hidream-o1")]
+    HidreamO1(HidreamO1Args),
 }
 
 #[derive(Args)]
@@ -250,6 +253,44 @@ impl PersonaplexArgs {
     }
 }
 
+#[cfg(feature = "hidream-o1")]
+#[derive(Args)]
+struct HidreamO1Args {
+    #[command(flatten)]
+    serve: Serve,
+    /// Checkpoint directory (config.json, model-*.safetensors, tokenizer.json).
+    #[arg(long)]
+    model_path: std::path::PathBuf,
+    /// The model name clients send; defaults to the checkpoint directory's name.
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    device: usize,
+    /// Pictures one request may ask for.
+    #[arg(long, default_value_t = 4)]
+    max_n: u32,
+    #[arg(long, default_value_t = 2000)]
+    max_prompt_chars: usize,
+}
+
+#[cfg(feature = "hidream-o1")]
+impl HidreamO1Args {
+    fn start(&self) -> anyhow::Result<Started> {
+        use omni_hidream_o1::engine;
+        let name = self.model.clone().unwrap_or_else(|| {
+            self.model_path.file_name().map_or("hidream-o1".into(), |n| n.to_string_lossy().into_owned())
+        });
+        let (handle, thread) = engine::start(
+            self.device,
+            self.model_path.clone(),
+            name.clone(),
+            (self.max_n, self.max_prompt_chars),
+            self.serve.queue,
+        )?;
+        Ok((handle.into(), thread, name))
+    }
+}
+
 impl SimArgs {
     fn profile(&self) -> anyhow::Result<Profile> {
         Profile {
@@ -298,6 +339,11 @@ fn main() -> anyhow::Result<()> {
         }
         #[cfg(feature = "personaplex")]
         Command::Personaplex(args) => {
+            let started = args.start()?;
+            (args.serve, started)
+        }
+        #[cfg(feature = "hidream-o1")]
+        Command::HidreamO1(args) => {
             let started = args.start()?;
             (args.serve, started)
         }
