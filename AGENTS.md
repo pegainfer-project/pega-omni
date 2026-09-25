@@ -49,7 +49,7 @@ check belongs in CI.
   compares against; `vs_vllm_omni.sh` and `chart.py` reproduce the README
   comparison.
 - `tools/hidream_o1/`: `golden.py` records the official run the golden test
-  compares against.
+  compares against; `vs_vllm_omni.sh` runs the comparison against vLLM-Omni.
 
 ## What we prefer
 

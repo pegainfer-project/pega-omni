@@ -76,6 +76,8 @@ The attention kernel is 4.5% slower than FlashInfer's FA2 at this shape timed al
 
 Where a step goes (nsys with the graph's nodes traced, one 2048 x 2048 step): the four decoder GEMMs 77%, attention 18%, the element-wise kernels 5%.
 
+Against vLLM-Omni under its own benchmark: [hidream-o1-vs-vllm-omni.md](hidream-o1-vs-vllm-omni.md).
+
 ## Not yet
 
 - The undistilled checkpoint: 50 UniPC steps with classifier-free guidance.
