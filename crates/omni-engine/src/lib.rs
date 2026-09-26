@@ -16,6 +16,11 @@
 //!
 //! A [`Speech`] only exists after [`EngineInfo::check`] accepted it, so an
 //! engine never re-validates the voice, the speed or the extension values.
+//!
+//! Full-duplex engines speak the [`live`] contract instead: sessions on a
+//! clock rather than requests.
+
+pub mod live;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

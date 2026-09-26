@@ -1,0 +1,644 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pega-omni live</title>
+<style>
+  :root {
+    --bg: #f4f3f0; --bg-glow: #e7ecff; --panel: rgba(255, 255, 255, .78); --solid: #ffffff;
+    --ink: #17171a; --muted: #6d6c72; --faint: #a3a2a8; --line: rgba(20, 20, 30, .09);
+    --agent-a: #5b6cff; --agent-b: #22c3e6; --you: #ff7a59; --you-ink: #ffffff;
+    --ok: #16a36a; --warn: #d93b30; --shadow: 0 1px 2px rgba(20, 20, 40, .05), 0 12px 32px -12px rgba(20, 20, 60, .18);
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e0f13; --bg-glow: #1a1f3d; --panel: rgba(26, 27, 34, .8); --solid: #1a1b22;
+      --ink: #ecebf2; --muted: #9998a3; --faint: #5f5e69; --line: rgba(255, 255, 255, .08);
+      --agent-a: #7c89ff; --agent-b: #3fd6f2; --you: #ff8f70; --you-ink: #1b0f0b;
+      --ok: #3fd18f; --warn: #ff7b6e; --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 16px 40px -16px rgba(0, 0, 0, .7);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: radial-gradient(1200px 600px at 15% -10%, var(--bg-glow), transparent 60%), var(--bg);
+    background-attachment: fixed; -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 1080px; margin: 0 auto; padding: 28px 16px 40px; }
+
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .logo { width: 28px; height: 28px; border-radius: 9px; background: conic-gradient(from 200deg, var(--agent-a), var(--agent-b), var(--you), var(--agent-a)); box-shadow: var(--shadow); }
+  .brand h1 { font-size: 17px; font-weight: 650; letter-spacing: -.01em; margin: 0; }
+  .brand .model { font: 12px var(--mono); color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; background: var(--panel); }
+  .pill { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px 5px 10px; max-width: 100%; }
+  .pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+  .pill.live { color: var(--ink); } .pill.live::before { background: var(--ok); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 25%, transparent); animation: pulse 1.6s infinite; }
+  .pill.busy::before { background: var(--agent-a); animation: pulse 1s infinite; }
+  .pill.error { color: var(--warn); } .pill.error::before { background: var(--warn); }
+  @keyframes pulse { 50% { opacity: .35; } }
+
+  .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: 16px; align-items: start; }
+  @media (max-width: 860px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  .card { background: var(--panel); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow); }
+  .stack { display: flex; flex-direction: column; gap: 16px; }
+
+  .stage { padding: 20px 20px 18px; display: flex; flex-direction: column; align-items: center; }
+  #orb { width: 100%; max-width: 300px; height: auto; display: block; }
+  .legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin-top: -4px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .controls { display: flex; align-items: center; justify-content: center; gap: 18px; margin: 18px 0 16px; }
+  .round { width: 52px; height: 52px; border-radius: 50%; border: 1px solid var(--line); background: var(--solid); color: var(--ink); display: grid; place-items: center; cursor: pointer; transition: transform .12s, background .2s, opacity .2s; }
+  .round:hover:not(:disabled) { transform: translateY(-1px); }
+  .round:disabled { opacity: .4; cursor: default; }
+  .round svg { width: 22px; height: 22px; }
+  #start { width: 68px; height: 68px; border: 0; color: #fff; background: linear-gradient(135deg, var(--agent-a), var(--agent-b)); box-shadow: 0 10px 24px -8px color-mix(in srgb, var(--agent-a) 70%, transparent); }
+  #start.on { background: linear-gradient(135deg, #ff5a5f, #e5343b); box-shadow: 0 10px 24px -8px rgba(229, 52, 59, .6); }
+  #start svg { width: 28px; height: 28px; }
+  #start .end, #start.on .call, #mute .off, #mute.muted .on { display: none; }
+  #start.on .end, #mute.muted .off { display: block; }
+  #mute.muted { background: var(--you); color: var(--you-ink); border-color: transparent; }
+  .hint { font-size: 12.5px; color: var(--muted); text-align: center; min-height: 1.5em; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); width: 100%; border-top: 1px solid var(--line); margin-top: 14px; padding-top: 14px; }
+  .stats div { text-align: center; }
+  .stats b { display: block; font: 600 16px var(--mono); letter-spacing: -.02em; }
+  .stats small { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+
+  .engine { padding: 16px 20px 18px; }
+  .engine-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 12px; }
+  .engine-head h2 { font-size: 14px; margin: 0; font-weight: 600; }
+  .engine-head span { font: 11px var(--mono); color: var(--faint); }
+  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .kpi { background: var(--solid); border: 1px solid var(--line); border-radius: 12px; padding: 9px 10px; min-width: 0; }
+  .kpi b { display: block; font: 600 17px var(--mono); letter-spacing: -.03em; white-space: nowrap; }
+  .kpi b small { font-size: 11px; color: var(--muted); font-weight: 500; letter-spacing: 0; }
+  .kpi > small { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .slots { height: 4px; border-radius: 2px; background: var(--line); margin-top: 6px; overflow: hidden; }
+  .slots i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--agent-a), var(--agent-b)); transition: width .4s; }
+  #spark { width: 100%; height: 88px; display: block; margin-top: 12px; }
+  .caption { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
+  @media (max-width: 480px) { .kpis { grid-template-columns: repeat(2, 1fr); } }
+
+  details.settings { padding: 0; }
+  details.settings summary { list-style: none; cursor: pointer; padding: 16px 20px; display: flex; justify-content: space-between; align-items: center; font-weight: 600; font-size: 14px; }
+  details.settings summary::-webkit-details-marker { display: none; }
+  details.settings summary::after { content: ""; width: 8px; height: 8px; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(45deg); transition: transform .2s; margin-right: 4px; }
+  details.settings[open] summary::after { transform: rotate(-135deg); }
+  .fields { padding: 0 20px 20px; display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
+  .fields .wide { grid-column: 1 / -1; }
+  @media (max-width: 480px) { .fields { grid-template-columns: 1fr; } }
+  label { display: block; font-size: 12px; font-weight: 550; color: var(--muted); margin-bottom: 5px; }
+  select, textarea { width: 100%; font: inherit; font-size: 14px; color: var(--ink); background: var(--solid); border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; outline: none; transition: border-color .15s, box-shadow .15s; }
+  select:focus, textarea:focus { border-color: var(--agent-a); box-shadow: 0 0 0 3px color-mix(in srgb, var(--agent-a) 20%, transparent); }
+  select:disabled, textarea:disabled { opacity: .55; }
+  textarea { min-height: 84px; resize: vertical; line-height: 1.45; }
+  .locked { font-size: 12px; color: var(--muted); display: none; }
+  body.in-call .locked { display: block; }
+
+  .conversation { display: flex; flex-direction: column; height: min(78vh, 760px); min-height: 420px; }
+  @media (max-width: 860px) { .conversation { height: auto; min-height: 0; } }
+  .conv-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 20px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .conv-head h2 { font-size: 14px; margin: 0; font-weight: 600; }
+  .switch { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); cursor: pointer; margin: 0; font-weight: 500; }
+  .switch input { appearance: none; width: 32px; height: 18px; border-radius: 999px; background: var(--line); position: relative; margin: 0; cursor: pointer; transition: background .2s; border: 1px solid var(--line); }
+  .switch input::after { content: ""; position: absolute; top: 1px; left: 1px; width: 14px; height: 14px; border-radius: 50%; background: var(--solid); box-shadow: 0 1px 2px rgba(0, 0, 0, .25); transition: transform .2s; }
+  .switch input:checked { background: var(--you); }
+  .switch input:checked::after { transform: translateX(14px); }
+  .note { font-size: 12px; color: var(--muted); margin: 0; padding: 10px 20px 0; }
+  #chat { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 16px 20px 20px; scroll-behavior: smooth; }
+  @media (max-width: 860px) { #chat { max-height: 60vh; min-height: 280px; } }
+  .msg { max-width: 82%; padding: 9px 13px; border-radius: 16px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14.5px; animation: rise .25s ease-out; }
+  .msg time { display: block; font: 10.5px var(--mono); opacity: .6; margin-bottom: 2px; }
+  .msg.agent { align-self: flex-start; background: var(--solid); border: 1px solid var(--line); border-bottom-left-radius: 5px; }
+  .msg.agent time::before { content: "Agent · "; font-family: system-ui, sans-serif; }
+  .msg.you { align-self: flex-end; background: var(--you); color: var(--you-ink); border-bottom-right-radius: 5px; }
+  .msg.you time::before { content: "You · "; font-family: system-ui, sans-serif; }
+  .msg.interim { opacity: .55; }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
+  .empty { margin: auto; text-align: center; color: var(--muted); max-width: 380px; padding: 12px 0; }
+  .empty h3 { color: var(--ink); font-size: 15px; margin: 0 0 4px; font-weight: 600; }
+  .empty p { margin: 0 0 14px; font-size: 13px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+  .chips span { font-size: 12.5px; padding: 6px 11px; border-radius: 999px; background: var(--solid); border: 1px solid var(--line); color: var(--ink); }
+
+  footer { text-align: center; font-size: 12px; color: var(--faint); margin-top: 22px; }
+  footer code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand">
+      <div class="logo" aria-hidden="true"></div>
+      <h1>pega-omni live</h1>
+      <span class="model" id="model">…</span>
+    </div>
+    <span id="status" class="pill">Ready</span>
+  </header>
+
+  <div class="grid">
+    <div class="stack">
+      <section class="card stage">
+        <canvas id="orb" width="300" height="300" aria-hidden="true"></canvas>
+        <div class="legend"><span><i style="background: var(--agent-a)"></i>Agent</span><span><i style="background: var(--you)"></i>You</span></div>
+        <div class="controls">
+          <button id="mute" class="round" disabled title="Mute" aria-label="Mute">
+            <svg class="on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+            <svg class="off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 9.3V6a3 3 0 0 0-5.7-1.3M9 9v2a3 3 0 0 0 5 2.2M5 11a7 7 0 0 0 11.5 5.4M19 11a7 7 0 0 1-.4 2.3M12 18v3M3 3l18 18"/></svg>
+          </button>
+          <button id="start" class="round" title="Start call" aria-label="Start call">
+            <svg class="call" viewBox="0 0 24 24" fill="currentColor"><path d="M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.25 11.4 11.4 0 0 0 3.6.57 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.46.57 3.58a1 1 0 0 1-.25 1z"/></svg>
+            <svg class="end" viewBox="0 0 24 24" fill="currentColor"><path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1a1 1 0 0 1-.56.9 11.5 11.5 0 0 0-2.66 1.85 1 1 0 0 1-1.41-.02L.29 13.08a1 1 0 0 1 0-1.41C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67a1 1 0 0 1 0 1.41l-2.48 2.48a1 1 0 0 1-1.41.02 11.3 11.3 0 0 0-2.66-1.85 1 1 0 0 1-.56-.9v-3.1A15 15 0 0 0 12 9z"/></svg>
+          </button>
+          <span class="round" style="visibility: hidden" aria-hidden="true"></span>
+        </div>
+        <div class="hint" id="hint">Use headphones. Speak English, and interrupt whenever you like.</div>
+        <div class="stats">
+          <div><b id="clock">0:00</b><small>Time</small></div>
+          <div><b id="late">–</b><small>Late p99 ms</small></div>
+          <div><b id="buffered">0</b><small>Buffer ms</small></div>
+          <div><b id="gaps">0</b><small>Gaps</small></div>
+        </div>
+      </section>
+
+      <section class="card engine" id="engine" hidden>
+        <div class="engine-head"><h2>Engine</h2><span>live · /live/stats</span></div>
+        <div class="kpis">
+          <div class="kpi"><b id="k-sessions">0<small> / 0</small></b><small>Sessions</small><div class="slots"><i id="k-slots"></i></div></div>
+          <div class="kpi"><b id="k-tick">–</b><small>Tick</small></div>
+          <div class="kpi"><b id="k-busy">0%</b><small>Busy</small></div>
+          <div class="kpi"><b id="k-late">0</b><small>Late ticks</small></div>
+        </div>
+        <canvas id="spark" aria-hidden="true"></canvas>
+        <p class="caption" id="k-caption">Every open session, yours and everyone else's, advances one frame per tick in a single batched step. The line is the tick's compute time against its frame budget.</p>
+      </section>
+
+      <details class="card settings" open>
+        <summary>Session</summary>
+        <div class="fields">
+          <div><label for="voice">Voice</label><select id="voice"></select></div>
+          <div><label for="input">Microphone</label><select id="input"></select></div>
+          <div class="wide" id="output-box" hidden><label for="output">Speaker</label><select id="output"></select></div>
+          <div class="wide"><label for="instructions">Persona</label><textarea id="instructions"></textarea></div>
+          <div class="wide locked">Voice and persona are the session's prompt; they apply to the next call.</div>
+        </div>
+      </details>
+    </div>
+
+    <section class="card conversation">
+      <div class="conv-head">
+        <h2>Conversation</h2>
+        <label class="switch" id="hear-box" hidden><input type="checkbox" id="hear"> Show what I say</label>
+      </div>
+      <p class="note" id="hear-note" hidden>Your side is transcribed by the browser's own speech recognition (Chrome sends that audio to Google) from the default microphone. The model hears your audio, not this text.</p>
+      <div id="chat"></div>
+    </section>
+  </div>
+
+  <footer>Full-duplex speech over <code>/v1/live/sessions</code> (GPT-Live)</footer>
+</main>
+<script>
+const RATE = 24000;
+const RESAMPLER = `
+class Resampler {
+  constructor(from, to) { this.step = from / to; this.pos = 0; this.prev = 0; }
+  push(x) {
+    const out = [], get = (j) => (j < 0 ? this.prev : x[j]);
+    for (; this.pos < x.length - 1; this.pos += this.step) {
+      const i = Math.floor(this.pos), f = this.pos - i;
+      out.push(get(i) * (1 - f) + get(i + 1) * f);
+    }
+    this.pos -= x.length;
+    if (x.length) this.prev = x[x.length - 1];
+    return Float32Array.from(out);
+  }
+}`;
+const WORKLET = RESAMPLER + `
+class Capture extends AudioWorkletProcessor {
+  constructor() { super(); this.rs = new Resampler(sampleRate, ${RATE}); this.buf = new Int16Array(480); this.n = 0; this.e = 0; this.k = 0; }
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (!ch) return true;
+    for (const v of this.rs.push(ch)) {
+      const s = Math.max(-1, Math.min(1, v));
+      this.buf[this.n++] = s < 0 ? s * 32768 : s * 32767;
+      this.e += s * s; this.k++;
+      if (this.n === this.buf.length) {
+        this.port.postMessage({ pcm: this.buf.buffer, level: Math.sqrt(this.e / this.k) }, [this.buf.buffer]);
+        this.buf = new Int16Array(480); this.n = 0; this.e = 0; this.k = 0;
+      }
+    }
+    return true;
+  }
+}
+class Playback extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.ring = new Float32Array(sampleRate * 20); this.r = 0; this.w = 0; this.playing = false;
+    this.prebuffer = Math.round(sampleRate * 0.12); this.gaps = 0; this.e = 0; this.k = 0; this.t = 0;
+    this.port.onmessage = (m) => {
+      if (m.data.reset) { this.r = this.w = 0; this.playing = false; return; }
+      for (const v of m.data.pcm) { this.ring[this.w % this.ring.length] = v; this.w++; }
+    };
+  }
+  process(_, outputs) {
+    const out = outputs[0][0];
+    const have = this.w - this.r;
+    if (!this.playing && have >= this.prebuffer) this.playing = true;
+    for (let i = 0; i < out.length; i++) {
+      if (this.playing && this.r < this.w) { out[i] = this.ring[this.r % this.ring.length]; this.r++; }
+      else { if (this.playing) { this.playing = false; this.gaps++; } out[i] = 0; }
+      this.e += out[i] * out[i]; this.k++;
+    }
+    for (let c = 1; c < outputs[0].length; c++) outputs[0][c].set(out);
+    if ((this.t += out.length) >= sampleRate / 20) {
+      this.port.postMessage({ level: Math.sqrt(this.e / this.k), buffered: (this.w - this.r) / sampleRate, gaps: this.gaps });
+      this.t = 0; this.e = 0; this.k = 0;
+    }
+    return true;
+  }
+}
+registerProcessor('capture', Capture);
+registerProcessor('playback', Playback);`;
+const Resampler = new Function(RESAMPLER + '; return Resampler;')();
+
+const $ = (id) => document.getElementById(id);
+let live = null;
+const levels = { you: 0, agent: 0 };
+
+function status(text, kind = '') { $('status').textContent = text; $('status').className = 'pill ' + kind; }
+function meter(who, level) { levels[who] = Math.min(1, Math.sqrt(level) * 1.8); }
+function b64(buf) {
+  const u8 = new Uint8Array(buf); let s = '';
+  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function pcm(b64s) {
+  const bin = atob(b64s), n = bin.length >> 1, out = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const v = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8); out[i] = (v << 16 >> 16) / 32768; }
+  return out;
+}
+function stamp(ms) { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; }
+
+// The agent is the orb, the caller the ring around it; both breathe with
+// their audio level, and the orb idles grey outside a call.
+function orb() {
+  const canvas = $('orb'), g = canvas.getContext('2d');
+  const shown = { you: 0, agent: 0, on: 0 };
+  const frame = (now) => {
+    const dpr = window.devicePixelRatio || 1, size = canvas.clientWidth;
+    if (canvas.width !== Math.round(size * dpr)) canvas.width = canvas.height = Math.round(size * dpr);
+    const css = getComputedStyle(document.documentElement), color = (v) => css.getPropertyValue(v).trim();
+    for (const k of ['you', 'agent']) shown[k] += (levels[k] - shown[k]) * 0.18;
+    shown.on += ((live && live.started ? 1 : 0) - shown.on) * 0.06;
+    const t = now / 1000, c = canvas.width / 2, base = canvas.width * 0.26;
+    g.clearRect(0, 0, canvas.width, canvas.height);
+
+    const ring = base * (1.28 + 0.32 * shown.you);
+    g.lineWidth = canvas.width * 0.012;
+    g.strokeStyle = color('--you');
+    g.globalAlpha = 0.12 + 0.75 * shown.you * shown.on;
+    g.beginPath(); g.arc(c, c, ring, 0, Math.PI * 2); g.stroke();
+    g.globalAlpha = 0.06 + 0.25 * shown.you * shown.on;
+    g.beginPath(); g.arc(c, c, ring + canvas.width * 0.04 * (1 + shown.you), 0, Math.PI * 2); g.stroke();
+    g.globalAlpha = 1;
+
+    const r = base * (0.92 + 0.05 * Math.sin(t * 1.6) + 0.34 * shown.agent);
+    const glow = g.createRadialGradient(c, c, r * 0.4, c, c, r * 1.9);
+    glow.addColorStop(0, color('--agent-a')); glow.addColorStop(1, 'transparent');
+    g.globalAlpha = 0.18 + 0.35 * shown.agent * shown.on;
+    g.fillStyle = glow; g.beginPath(); g.arc(c, c, r * 1.9, 0, Math.PI * 2); g.fill();
+    g.globalAlpha = 0.35 + 0.65 * shown.on;
+
+    const fill = g.createLinearGradient(c - r, c - r, c + r, c + r);
+    fill.addColorStop(0, color('--agent-a')); fill.addColorStop(1, color('--agent-b'));
+    g.fillStyle = shown.on > 0.02 ? fill : color('--faint');
+    g.beginPath();
+    for (let i = 0; i <= 96; i++) {
+      const a = (i / 96) * Math.PI * 2;
+      const wobble = 1 + (0.025 + 0.09 * shown.agent) * Math.sin(3 * a + t * 2.1) * Math.cos(2 * a - t * 1.3);
+      const x = c + Math.cos(a) * r * wobble, y = c + Math.sin(a) * r * wobble;
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    }
+    g.fill();
+    const shine = g.createRadialGradient(c - r * 0.35, c - r * 0.4, 0, c - r * 0.35, c - r * 0.4, r);
+    shine.addColorStop(0, 'rgba(255,255,255,.45)'); shine.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = shine; g.fill();
+    g.globalAlpha = 1;
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+
+// The engine panel: cumulative counters from /live/stats, diffed between
+// polls into the mean tick and the share of wall time the engine computed.
+function engine() {
+  const history = [], keep = 120, every = 500;
+  let prev = null, budget = 80;
+  const ms = (us) => (us / 1000).toFixed(us < 10000 ? 1 : 0);
+  const draw = () => {
+    const canvas = $('spark'), g = canvas.getContext('2d'), dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth * dpr, h = canvas.clientHeight * dpr;
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    const css = getComputedStyle(document.documentElement), color = (v) => css.getPropertyValue(v).trim();
+    g.clearRect(0, 0, w, h);
+    const top = 14 * dpr, y = (v) => h - (Math.min(v, budget) / budget) * (h - top);
+    g.setLineDash([4 * dpr, 4 * dpr]); g.strokeStyle = color('--faint'); g.lineWidth = dpr;
+    g.beginPath(); g.moveTo(0, y(budget)); g.lineTo(w, y(budget)); g.stroke(); g.setLineDash([]);
+    g.fillStyle = color('--muted'); g.font = `${10.5 * dpr}px ui-monospace, monospace`;
+    g.fillText(`${budget} ms budget`, 4 * dpr, y(budget) - 4 * dpr);
+    if (history.length < 2) return;
+    const x = (i) => w - (history.length - 1 - i) * (w / (keep - 1));
+    const grad = g.createLinearGradient(0, y(budget), 0, h);
+    grad.addColorStop(0, color('--agent-b')); grad.addColorStop(1, 'transparent');
+    g.beginPath(); history.forEach((v, i) => (i ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v))));
+    g.lineTo(x(history.length - 1), h); g.lineTo(x(0), h); g.closePath();
+    g.globalAlpha = 0.35; g.fillStyle = grad; g.fill(); g.globalAlpha = 1;
+    g.beginPath(); history.forEach((v, i) => (i ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v))));
+    g.strokeStyle = color('--agent-a'); g.lineWidth = 2 * dpr; g.stroke();
+  };
+  const poll = async () => {
+    try {
+      const now = performance.now(), s = await (await fetch('/live/stats')).json();
+      $('engine').hidden = false;
+      budget = s.frame_ms;
+      $('k-sessions').firstChild.textContent = s.sessions;
+      $('k-sessions').lastChild.textContent = ` / ${s.max_sessions}`;
+      $('k-slots').style.width = `${(100 * s.sessions) / Math.max(1, s.max_sessions)}%`;
+      $('k-late').textContent = s.late_ticks;
+      if (prev) {
+        const ticks = s.ticks - prev.s.ticks, busy = s.tick_busy_us - prev.s.tick_busy_us;
+        const tick = ticks > 0 ? busy / ticks : null;
+        $('k-tick').innerHTML = tick === null ? '–' : `${ms(tick)}<small> ms</small>`;
+        $('k-busy').textContent = `${Math.min(100, Math.round(busy / 10 / (now - prev.now)))}%`;
+        history.push(tick === null ? 0 : tick / 1000);
+        if (history.length > keep) history.shift();
+        draw();
+      }
+      prev = { now, s };
+    } catch (_) {}
+    setTimeout(poll, every);
+  };
+  window.addEventListener('resize', draw);
+  poll();
+}
+
+// Client-side lateness of the agent's frames: how far each arrived behind its
+// place on the session timeline, relative to the first frame.
+function lateness(e) {
+  const now = performance.now();
+  live.first ||= { now, ms: e.start_ms };
+  live.late.push(Math.max(0, now - live.first.now - (e.start_ms - live.first.ms)));
+  if (live.late.length > 250) live.late.shift();
+  const sorted = [...live.late].sort((a, b) => a - b);
+  $('late').textContent = Math.round(sorted[Math.floor(0.99 * (sorted.length - 1))]);
+}
+
+const SUGGESTIONS = ['Hi, how are you today?', 'What is the capital of France?', 'How can I sleep better at night?', 'Tell me a long story about a dragon.'];
+
+function emptyChat() {
+  const box = document.createElement('div'); box.className = 'empty';
+  const h = document.createElement('h3'); h.textContent = 'Start a call and just talk';
+  const p = document.createElement('p'); p.textContent = 'It listens while it speaks: interrupt it, or let it back-channel. Try:';
+  const chips = document.createElement('div'); chips.className = 'chips';
+  chips.append(...SUGGESTIONS.map((s) => Object.assign(document.createElement('span'), { textContent: s })));
+  box.append(h, p, chips);
+  $('chat').replaceChildren(box);
+}
+
+function setCall(on) {
+  document.body.classList.toggle('in-call', on);
+  $('start').classList.toggle('on', on);
+  $('start').title = on ? 'End call' : 'Start call';
+  $('start').setAttribute('aria-label', $('start').title);
+  $('voice').disabled = on; $('instructions').disabled = on;
+  $('mute').disabled = !on;
+  if (!on) setMuted(false);
+}
+
+function setMuted(muted) {
+  $('mute').classList.toggle('muted', muted);
+  $('mute').title = muted ? 'Unmute' : 'Mute';
+  $('mute').setAttribute('aria-label', $('mute').title);
+  $('hint').textContent = muted ? 'Muted: the agent hears silence.' : 'Use headphones. Speak English, and interrupt whenever you like.';
+}
+
+async function config() {
+  const c = await (await fetch('/live/config')).json();
+  $('model').textContent = c.model;
+  for (const v of c.voices) $('voice').add(new Option(v, v, v === c.voice, v === c.voice));
+  $('instructions').value = c.instructions; $('instructions').maxLength = c.max_instructions_chars;
+}
+
+const canPickOutput = 'setSinkId' in AudioContext.prototype;
+const remembered = (k) => { try { return localStorage.getItem(k) || ''; } catch (_) { return ''; } };
+const remember = (k, v) => { try { localStorage.setItem(k, v); } catch (_) {} };
+
+// Device names are only visible once the page has been granted the microphone;
+// until then the list holds the system default alone.
+async function devices() {
+  const all = navigator.mediaDevices ? await navigator.mediaDevices.enumerateDevices().catch(() => []) : [];
+  const fill = (select, kind, fallback, key) => {
+    const found = all.filter((d) => d.kind === kind && d.deviceId && d.deviceId !== 'default');
+    const want = select.value || remembered(key);
+    select.replaceChildren(new Option('System default', ''),
+      ...found.map((d, i) => new Option(d.label || `${fallback} ${i + 1}`, d.deviceId)));
+    select.value = found.some((d) => d.deviceId === want) ? want : '';
+  };
+  fill($('input'), 'audioinput', 'Microphone', 'omni.input');
+  if (canPickOutput) { $('output-box').hidden = false; fill($('output'), 'audiooutput', 'Speaker', 'omni.output'); }
+}
+
+function openMic() {
+  if (!navigator.mediaDevices) return Promise.reject(new Error('the browser only grants the microphone to https or localhost pages; tunnel the port (ssh -L) and open it on localhost'));
+  const id = $('input').value;
+  return navigator.mediaDevices.getUserMedia({ audio: {
+    deviceId: id ? { exact: id } : undefined,
+    channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true,
+  } });
+}
+
+async function switchInput() {
+  remember('omni.input', $('input').value);
+  if (!live) return;
+  try {
+    const mic = await openMic();
+    live.source.disconnect();
+    live.mic.getTracks().forEach((t) => t.stop());
+    live.mic = mic;
+    live.source = live.ctx.createMediaStreamSource(mic);
+    live.source.connect(live.capture);
+  } catch (e) { status('Cannot switch microphone: ' + e.message, 'error'); }
+}
+
+async function switchOutput() {
+  remember('omni.output', $('output').value);
+  if (live && canPickOutput) await live.ctx.setSinkId($('output').value).catch((e) => status('Cannot switch speaker: ' + e.message, 'error'));
+}
+
+const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+// Changes the chat, keeping it scrolled to the end if the reader was there.
+function follow(change) {
+  const chat = $('chat');
+  const pinned = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40;
+  change(chat);
+  if (pinned) chat.scrollTop = chat.scrollHeight;
+}
+
+function bubble(who, time) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + who;
+  const t = document.createElement('time'); t.textContent = time;
+  const text = document.createElement('span');
+  el.append(t, text);
+  follow((chat) => { chat.querySelector('.empty')?.remove(); chat.append(el); });
+  return text;
+}
+
+const show = (el, text) => follow(() => { el.textContent = text; });
+
+// The caller's side of the chat, from the browser's recognizer. It stops on
+// its own after a pause or a network hiccup, so it restarts until told not to.
+function listen() {
+  if (!Recognition || !live || !live.started || live.muted || !$('hear').checked || live.recognizer) return;
+  const r = new Recognition();
+  r.lang = 'en-US'; r.continuous = true; r.interimResults = true;
+  const lines = [];
+  r.onresult = (ev) => {
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const res = ev.results[i], text = res[0].transcript.trim();
+      if (!text || !live) continue;
+      lines[i] ||= bubble('you', stamp(performance.now() - live.started));
+      show(lines[i], text);
+      lines[i].parentElement.classList.toggle('interim', !res.isFinal);
+      live.agent = null;
+    }
+  };
+  r.onerror = (e) => { if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { $('hear').checked = false; status('Speech recognition blocked: ' + e.error, 'error'); } };
+  r.onend = () => { if (live && live.recognizer === r) { live.recognizer = null; setTimeout(listen, 300); } };
+  live.recognizer = r;
+  r.start();
+}
+
+function deafen() {
+  if (!live || !live.recognizer) return;
+  const r = live.recognizer; live.recognizer = null; r.abort();
+}
+
+async function start() {
+  $('start').disabled = true;
+  emptyChat();
+  status('Asking for the microphone…', 'busy');
+  let mic;
+  try {
+    mic = await openMic();
+    await devices();
+  } catch (e) {
+    status('Microphone unavailable: ' + e.message, 'error');
+    $('start').disabled = false;
+    return;
+  }
+  let ctx;
+  try { ctx = new AudioContext({ sampleRate: RATE, latencyHint: 'interactive' }); } catch (_) { ctx = new AudioContext({ latencyHint: 'interactive' }); }
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' })));
+  let source;
+  try { source = ctx.createMediaStreamSource(mic); } catch (_) {
+    await ctx.close(); ctx = new AudioContext({ latencyHint: 'interactive' });
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' })));
+    source = ctx.createMediaStreamSource(mic);
+  }
+  const capture = new AudioWorkletNode(ctx, 'capture');
+  const playback = new AudioWorkletNode(ctx, 'playback', { outputChannelCount: [2] });
+  source.connect(capture);
+  playback.connect(ctx.destination);
+  if (canPickOutput && $('output').value) await ctx.setSinkId($('output').value).catch(() => {});
+  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/v1/live/sessions');
+  live = { ws, ctx, mic, source, capture, playback, muted: false, started: null, up: new Resampler(RATE, ctx.sampleRate), agent: null, lastText: -1e9, recognizer: null, first: null, late: [] };
+  const send = (e) => ws.readyState === 1 && ws.send(JSON.stringify(e));
+
+  capture.port.onmessage = (m) => { meter('you', live && live.muted ? 0 : m.data.level); if (live && live.started) send({ type: 'session.input_audio.append', audio: b64(m.data.pcm) }); };
+  playback.port.onmessage = (m) => { meter('agent', m.data.level); $('buffered').textContent = Math.round(m.data.buffered * 1000); $('gaps').textContent = m.data.gaps; };
+  ws.onopen = () => {
+    status('Starting session…', 'busy');
+    send({ type: 'session.start', session: { instructions: $('instructions').value, audio: { output: { voice: $('voice').value } } } });
+  };
+  ws.onmessage = (m) => {
+    const e = JSON.parse(m.data);
+    switch (e.type) {
+      case 'session.started':
+        live.started = performance.now();
+        status('Live · ' + e.session.id, 'live');
+        $('start').disabled = false;
+        setCall(true);
+        listen();
+        break;
+      case 'session.output_audio.delta':
+        live.playback.port.postMessage({ pcm: live.up.push(pcm(e.delta)) });
+        lateness(e);
+        break;
+      case 'session.output_transcript.delta':
+        if (!live.agent || e.start_ms - live.lastText > 1500) live.agent = bubble('agent', stamp(e.start_ms));
+        show(live.agent, live.agent.textContent + e.delta);
+        live.lastText = e.end_ms;
+        break;
+      case 'session.input_audio.muted': live.muted = true; setMuted(true); deafen(); break;
+      case 'session.input_audio.unmuted': live.muted = false; setMuted(false); listen(); break;
+      case 'session.closed':
+        status(`Call ended · ${e.reason.replace(/_/g, ' ')} · ${e.usage.seconds.toFixed(1)} s`);
+        break;
+      case 'error':
+        status(e.error.message, 'error');
+        if (!live.started) ws.close();
+        break;
+    }
+  };
+  ws.onclose = () => { teardown(); };
+  ws.onerror = () => status('Connection failed', 'error');
+}
+
+function teardown() {
+  if (!live) return;
+  deafen();
+  live.mic.getTracks().forEach((t) => t.stop());
+  live.ctx.close();
+  live = null;
+  setCall(false);
+  $('start').disabled = false;
+  levels.you = levels.agent = 0;
+  const pill = $('status');
+  if (!pill.classList.contains('error') && !pill.textContent.startsWith('Call ended')) status('Ready');
+}
+
+$('start').onclick = () => {
+  if (!live) return start();
+  $('start').disabled = true; status('Ending call…', 'busy');
+  live.ws.send(JSON.stringify({ type: 'session.close' }));
+};
+$('mute').onclick = () => live && live.ws.send(JSON.stringify({ type: live.muted ? 'session.input_audio.unmute' : 'session.input_audio.mute' }));
+setInterval(() => { if (live && live.started) $('clock').textContent = stamp(performance.now() - live.started); }, 250);
+if (Recognition) {
+  $('hear-box').hidden = false;
+  $('hear').checked = remembered('omni.hear') === '1';
+  $('hear-note').hidden = !$('hear').checked;
+  $('hear').onchange = () => {
+    remember('omni.hear', $('hear').checked ? '1' : '');
+    $('hear-note').hidden = !$('hear').checked;
+    $('hear').checked ? listen() : deafen();
+  };
+}
+$('input').onchange = switchInput;
+$('output').onchange = switchOutput;
+if (navigator.mediaDevices) navigator.mediaDevices.addEventListener('devicechange', devices);
+emptyChat();
+orb();
+engine();
+devices();
+config().catch((e) => status('Cannot load /live/config: ' + e.message, 'error'));
+</script>
+</body>
+</html>

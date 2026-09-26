@@ -8,9 +8,9 @@
 mod codec;
 pub mod config;
 pub mod engine;
-mod manifest;
 pub mod model;
 pub mod prompt;
 mod stack;
 mod talker;
-pub mod weights;
+
+pub use omni_kern::weights;

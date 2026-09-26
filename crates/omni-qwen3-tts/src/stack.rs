@@ -12,17 +12,17 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::config;
-use crate::manifest::Gen;
-use crate::manifest::buf;
-use crate::manifest::count;
-use crate::manifest::f32a;
-use crate::manifest::i32a;
-use crate::manifest::inb;
-use crate::manifest::ini;
-use crate::manifest::io;
-use crate::manifest::outb;
-use crate::weights::File;
-use crate::weights::concat_rows;
+use omni_kern::Gen;
+use omni_kern::buf;
+use omni_kern::count;
+use omni_kern::f32a;
+use omni_kern::i32a;
+use omni_kern::inb;
+use omni_kern::ini;
+use omni_kern::io;
+use omni_kern::outb;
+use omni_kern::weights::File;
+use omni_kern::weights::concat_rows;
 
 pub const HEAD_DIM: usize = 128;
 /// Tokens per page of the talker's paged KV.

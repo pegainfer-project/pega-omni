@@ -1,5 +1,6 @@
 //! Building a kern manifest: buffers, one op per call, and the call lists the
-//! programs are made of.
+//! programs are made of; and reading the checkpoints they bind ([`weights`]).
+//! Every model crate generates its manifest with this.
 //!
 //! [`Gen`] collects everything a generator emits. A launch's geometry lives in
 //! its op, and almost every call here has its own shape, so every kernel call
@@ -24,6 +25,8 @@ use kern_runtime::Tensors;
 use serde_json::Value;
 use serde_json::json;
 
+pub mod weights;
+
 /// Batch sizes a graph is captured at; a call pads up to the next one.
 pub const BUCKETS: [usize; 12] = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128];
 
@@ -44,9 +47,18 @@ pub struct Gen {
     state_bytes: u64,
     /// Per-sequence width of each `seqs`-shaped workspace: the widest thing written into it.
     widths: BTreeMap<String, usize>,
+    /// Modules whose kernels are written for programmatic dependent launch.
+    pdl: Vec<&'static str>,
 }
 
 impl Gen {
+    /// A generator whose launches from `modules` use programmatic dependent
+    /// launch: each of their kernels waits on the grid before touching what an
+    /// earlier launch produced.
+    pub fn with_pdl(modules: &[&'static str]) -> Self {
+        Self { pdl: modules.to_vec(), ..Self::default() }
+    }
+
     pub fn weight(&mut self, name: &str, shape: &[usize], data: &[f32]) -> String {
         debug_assert_eq!(shape.iter().product::<usize>(), data.len(), "{name}");
         let bytes = data.iter().flat_map(|&x| bf16::from_f32(x).to_le_bytes()).collect();
@@ -84,16 +96,14 @@ impl Gen {
     }
 
     /// One kernel launch as its own op, `args` typed by param. `entry` is
-    /// `<module>_<kernel>`. The codec's kernels are written for programmatic
-    /// dependent launch (each waits on the grid before touching what an
-    /// earlier launch produced); the talker's are not.
+    /// `<module>_<kernel>`.
     pub fn launch(&mut self, label: &str, entry: &str, grid: [Value; 3], block: u32, args: Vec<(&str, Value)>) {
         let module = entry.split('_').next().expect("an entry name");
         let params: Vec<&str> = args.iter().map(|(t, _)| *t).collect();
         self.ops.insert(
             label.into(),
             json!({"params": params, "impl": {"launches": [
-                {"module": module, "entry": entry, "block": [block, 1, 1], "grid": grid, "pdl": module == "codec"}
+                {"module": module, "entry": entry, "block": [block, 1, 1], "grid": grid, "pdl": self.pdl.contains(&module)}
             ]}}),
         );
         let args: Vec<Value> = args.into_iter().map(|(_, v)| v).collect();
@@ -254,6 +264,21 @@ impl Tensors for HostTensors {
             self.0.get(name).ok_or_else(|| kern_runtime::Error::WeightArtifact(format!("no tensor `{name}`")))?;
         Ok(Tensor { dtype: *dtype, shape: shape.clone(), data: Blob::Host(data) })
     }
+}
+
+/// A call's `tokens` and `seqs`.
+pub fn vars(tokens: usize, seqs: usize) -> BTreeMap<String, u64> {
+    BTreeMap::from([("tokens".into(), tokens as u64), ("seqs".into(), seqs as u64)])
+}
+
+/// `i32`s as the little-endian bytes an input buffer takes.
+pub fn ints(v: &[i32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// Little-endian bf16 bytes as floats.
+pub fn bf16s(bytes: &[u8]) -> Vec<f32> {
+    bytes.as_chunks::<2>().0.iter().map(|&b| bf16::from_le_bytes(b).to_f32()).collect()
 }
 
 pub fn hex(bytes: &[u8]) -> String {

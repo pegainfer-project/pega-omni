@@ -19,9 +19,18 @@ stalls**, not tokens per second. pega-omni is built around those two numbers:
 one process, one engine loop, audio handed to the HTTP layer by reference, no
 stage-to-stage IPC.
 
-The repository holds the serving front end, the engine contract, a CPU-only
-simulated engine used to load-test the front end, and the first GPU engine,
-Qwen3-TTS-12Hz-1.7B-CustomVoice ([docs/qwen3-tts.md](docs/qwen3-tts.md)).
+Full-duplex models are further from text serving still: a session listens and
+speaks at once for minutes, one 80 ms frame each way per tick, and every open
+session costs a frame per tick whether anyone talks. pega-omni serves them over
+OpenAI's GPT-Live WebSocket protocol on a clock that never drifts, with all
+sessions in one CUDA graph per tick ([docs/duplex.md](docs/duplex.md)).
+
+The repository holds the serving front end, the engine contracts, CPU-only
+simulated engines used to load-test the front end, and two GPU engines:
+Qwen3-TTS-12Hz-1.7B-CustomVoice ([docs/qwen3-tts.md](docs/qwen3-tts.md)) for
+speech, and NVIDIA PersonaPlex-7B ([docs/personaplex.md](docs/personaplex.md))
+for full duplex: **128 concurrent live sessions on one GB300 with no playback
+stall**.
 
 ## Quick start
 
@@ -44,6 +53,15 @@ curl -s localhost:8000/v1/audio/speech -H 'content-type: application/json' \
        "extra":{"language":"english"}}' -o hello.wav
 ```
 
+PersonaPlex serves live sessions and a browser demo (microphone in, the model's
+voice and transcript out):
+
+```bash
+cargo build --release -p omni-server --features personaplex
+target/release/pega-omni personaplex --model-path personaplex-7b-v1
+# open http://127.0.0.1:8000/ (tunnel with ssh -L 8000:127.0.0.1:8000 for a remote GPU)
+```
+
 Any OpenAI client works unchanged:
 
 ```python
@@ -62,6 +80,9 @@ with client.audio.speech.with_streaming_response.create(
 | Route | |
 |---|---|
 | `POST /v1/audio/speech` | OpenAI's request: `model`, `input`, `voice` (name or `{"id": ...}`), `instructions`, `response_format`, `speed`, `stream_format` (`audio` or `sse`) |
+| `GET /v1/live/sessions` | GPT-Live WebSocket: `session.start`, `session.input_audio.append`, `session.close`; `session.output_audio.delta` and `session.output_transcript.delta` on the agent's timeline ([docs/duplex.md](docs/duplex.md#protocol)) |
+| `GET /` | the live demo page |
+| `GET /live/config`, `GET /live/stats` | what the demo reads: the live engine's defaults, and its load as counters (sessions, ticks, tick compute time, late ticks) |
 | `GET /v1/models` | the served model |
 | `GET /v1/audio/voices` | the engine's voices |
 | `GET /metrics` | Prometheus: requests by outcome, TTFP, end-to-end latency, audio samples, engine queue |
@@ -84,12 +105,14 @@ differs from OpenAI, it says so instead of guessing:
 
 | Crate | |
 |---|---|
-| `omni-engine` | the contract: `Speech`, `Event`, `Handle` / `Inbox`; no trait, a channel |
+| `omni-engine` | the contracts: `Speech`, `Event`, `Handle` / `Inbox`; `live`: sessions, the jitter buffer, the clock and `drive`, the loop every live engine runs |
 | `omni-frontend` | axum routes, request parsing, wav / pcm / SSE framing, metrics |
-| `omni-sim` | the simulated engine: a pure scheduling core plus a thread shell |
+| `omni-sim` | the simulated engines (speech and live): pure cores plus thread shells |
+| `omni-kern` | the kern manifest builder, weight loading and CUDA helpers the GPU engines share |
 | `omni-qwen3-tts` | Qwen3-TTS as one kern manifest (talker, code predictor, sampler, streaming codec decoder, own CUDA kernels), prompt, engine |
+| `omni-personaplex` | PersonaPlex-7B as one kern manifest (Mimi encoder, Helium, depformer, Mimi decoder, own CUDA kernels), prompt, tokenizer, live engine |
 | `omni-server` | the `pega-omni` binary |
-| `omni-bench` | open-loop load generator: TTFP, E2E, RTF, playback underrun |
+| `omni-bench` | load generator: TTFP, E2E, RTF, playback underrun; `duplex`: concurrent live sessions |
 
 ## Measured
 

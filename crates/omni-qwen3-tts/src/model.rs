@@ -22,29 +22,31 @@ use std::path::Path;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
-use half::bf16;
 use kern_pool::Denied;
 use kern_pool::Lease;
 use kern_runtime::Capacity;
 use kern_runtime::Runtime;
+use omni_kern::Gen;
+use omni_kern::HostTensors;
+use omni_kern::bf16s;
+use omni_kern::bucket;
+use omni_kern::hex;
+use omni_kern::ints;
+use omni_kern::kernels_dir;
+use omni_kern::vars;
+use omni_kern::weights::File;
 use serde_json::Value;
 use serde_json::json;
 use sha2::Digest;
 
 use crate::codec;
 use crate::config::Config;
-use crate::manifest::Gen;
-use crate::manifest::HostTensors;
-use crate::manifest::bucket;
-use crate::manifest::hex;
-use crate::manifest::kernels_dir;
 use crate::prompt::NO_CODEC;
 use crate::prompt::Prompt;
 use crate::prompt::Tokenizer;
 use crate::stack::PAGE;
 use crate::stack::Stack;
 use crate::talker::Talker;
-use crate::weights::File;
 
 pub use crate::talker::GROUPS;
 
@@ -102,18 +104,6 @@ pub struct Model {
     max_seqs: usize,
     /// The most pages the running sequences may hold.
     pages_max: usize,
-}
-
-fn vars(tokens: usize, seqs: usize) -> BTreeMap<String, u64> {
-    BTreeMap::from([("tokens".into(), tokens as u64), ("seqs".into(), seqs as u64)])
-}
-
-fn ints(v: &[i32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-
-fn bf16s(bytes: &[u8]) -> Vec<f32> {
-    bytes.as_chunks::<2>().0.iter().map(|&b| bf16::from_le_bytes(b).to_f32()).collect()
 }
 
 impl Model {
@@ -327,7 +317,7 @@ fn generate(
     page_table: usize,
 ) -> Result<(Value, HostTensors)> {
     let t = &config.model.talker_config;
-    let mut g = Gen::default();
+    let mut g = Gen::with_pdl(&["codec"]);
     let talker = Talker::load(&mut g, &File::open(&dir.join("model.safetensors"))?, &config.model, &config.generation)?;
     talker.init(&mut g);
     let init = g.take();
