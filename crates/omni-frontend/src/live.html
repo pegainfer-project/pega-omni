@@ -268,6 +268,7 @@ const Resampler = new Function(RESAMPLER + '; return Resampler;')();
 
 const $ = (id) => document.getElementById(id);
 let live = null;
+let model = null;
 const levels = { you: 0, agent: 0 };
 
 function status(text, kind = '') { $('status').textContent = text; $('status').className = 'pill ' + kind; }
@@ -429,6 +430,7 @@ function setMuted(muted) {
 
 async function config() {
   const c = await (await fetch('/live/config')).json();
+  model = c.model;
   $('model').textContent = c.model;
   for (const v of c.voices) $('voice').add(new Option(v, v, v === c.voice, v === c.voice));
   $('instructions').value = c.instructions; $('instructions').maxLength = c.max_instructions_chars;
@@ -565,7 +567,8 @@ async function start() {
   playback.port.onmessage = (m) => { meter('agent', m.data.level); $('buffered').textContent = Math.round(m.data.buffered * 1000); $('gaps').textContent = m.data.gaps; };
   ws.onopen = () => {
     status('Starting session…', 'busy');
-    send({ type: 'session.start', session: { instructions: $('instructions').value, audio: { output: { voice: $('voice').value } } } });
+    const audio = { format: { type: 'audio/pcm', rate: RATE }, output: { voice: $('voice').value } };
+    send({ type: 'session.start', session: { model, instructions: $('instructions').value, audio } });
   };
   ws.onmessage = (m) => {
     const e = JSON.parse(m.data);

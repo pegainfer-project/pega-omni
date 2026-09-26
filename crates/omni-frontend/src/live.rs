@@ -9,11 +9,14 @@
 //! error and leaves the socket open for another `session.start`, whether the
 //! queue or the engine refused it. Muting forwards silence in place of the
 //! caller's audio, so the engine's timeline keeps running without underruns.
+//! Audio crosses a [`Transcoder`] both ways, so the engine only ever sees its
+//! own rate.
 //!
 //! Protocol decisions are [`crate::live_protocol`]'s; this is the shell.
 
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
 
 use axum::extract::ws::Message;
 use axum::extract::ws::WebSocket;
@@ -22,12 +25,12 @@ use omni_engine::Rejected;
 use omni_engine::live::CloseReason;
 use omni_engine::live::LiveHandle;
 use omni_engine::live::Output;
-use omni_engine::live::Session;
 use omni_engine::live::SessionDraft;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::live_audio::Transcoder;
 use crate::live_protocol::ClientEvent;
 use crate::live_protocol::ClosedReason;
 use crate::live_protocol::LiveError;
@@ -36,6 +39,7 @@ use crate::live_protocol::closed_event;
 use crate::live_protocol::error_event;
 use crate::live_protocol::mute_event;
 use crate::live_protocol::parse;
+use crate::live_protocol::resource;
 use crate::live_protocol::stamp;
 use crate::live_protocol::started_event;
 use crate::live_protocol::transcript_event;
@@ -46,8 +50,12 @@ const USAGE_EVERY: Duration = Duration::from_secs(5);
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 struct Line {
-    id: u64,
-    session: Session,
+    /// The `SessionResource` both `session.started` and `session.closed` carry.
+    resource: Value,
+    codec: Transcoder,
+    /// The `session.start` that opened it, until `session.started` answers it.
+    start_id: Option<String>,
+    close_id: Option<String>,
     /// `None` once the client asked to close.
     audio: Option<UnboundedSender<Bytes>>,
     output: UnboundedReceiver<Output>,
@@ -128,16 +136,16 @@ pub async fn serve(ws: WebSocket, live: LiveHandle) {
                         return;
                     }
                 };
-                let received = match parse(&text, live.info.sample_rate) {
+                let received = match parse(&text) {
                     Ok(r) => r,
                     Err(e) => {
                         if !socket.error(&e).await { break; }
                         continue;
                     }
                 };
-                let id = received.client_event_id;
+                let id = received.event_id;
                 let reply = match (received.event, line.as_mut()) {
-                    (ClientEvent::Start { model, draft }, None) => match open(&live, model, draft) {
+                    (ClientEvent::Start { model, draft, format }, None) => match open(&live, model, draft, Transcoder::new(format, live.info.sample_rate), id.clone()) {
                         Ok(l) => {
                             line = Some(l);
                             None
@@ -152,12 +160,15 @@ pub async fn serve(ws: WebSocket, live: LiveHandle) {
                         &LiveError::invalid("session_not_started", Some("type"), "send `session.start` first".into())
                             .answering(id),
                     )),
-                    (ClientEvent::Append(pcm), Some(l)) => {
-                        if let Some(a) = &l.audio {
-                            let _ = a.send(if l.muted { Bytes::from(vec![0; pcm.len()]) } else { pcm });
+                    (ClientEvent::Append(wire), Some(l)) => match l.codec.decode(wire) {
+                        Ok(pcm) => {
+                            if let Some(a) = &l.audio {
+                                let _ = a.send(if l.muted { Bytes::from(vec![0; pcm.len()]) } else { pcm });
+                            }
+                            None
                         }
-                        None
-                    }
+                        Err(e) => Some(error_event(&e.answering(id))),
+                    },
                     (ClientEvent::Mute, Some(l)) => {
                         l.muted = true;
                         Some(mute_event(true, id))
@@ -168,6 +179,7 @@ pub async fn serve(ws: WebSocket, live: LiveHandle) {
                     }
                     (ClientEvent::Close, Some(l)) => {
                         l.audio = None;
+                        l.close_id = l.close_id.take().or(id);
                         l.closing.get_or_insert_with(Instant::now);
                         None
                     }
@@ -181,10 +193,10 @@ pub async fn serve(ws: WebSocket, live: LiveHandle) {
                 let (event, end) = match out {
                     Some(Output::Started) => {
                         l.started = Some(Instant::now());
-                        (started_event(&live.info, l.id, &l.session), None)
+                        (started_event(&l.resource, l.start_id.take()), None)
                     }
                     Some(Output::Audio { frame, pcm }) => {
-                        (audio_event(&pcm, live.info.frame_ms(frame), live.info.frame_ms(frame + 1)), None)
+                        (audio_event(&l.codec.encode(pcm), live.info.frame_ms(frame), live.info.frame_ms(frame + 1)), None)
                     }
                     Some(Output::Text { frame, delta }) => {
                         (transcript_event(&delta, live.info.frame_ms(frame), live.info.frame_ms(frame + 1)), None)
@@ -199,21 +211,24 @@ pub async fn serve(ws: WebSocket, live: LiveHandle) {
                                 if !socket.error(&busy(&live)).await { break; }
                                 continue;
                             }
-                            CloseReason::Expired => (closed_event(ClosedReason::Expired, l.seconds()), Some("expired")),
-                            CloseReason::Hangup => {
-                                (closed_event(ClosedReason::CloseRequested, l.seconds()), Some("close_requested"))
+                            CloseReason::Expired => {
+                                (closed_event(&l.resource, ClosedReason::Expired, l.seconds(), None), Some("expired"))
                             }
+                            CloseReason::Hangup => (
+                                closed_event(&l.resource, ClosedReason::CloseRequested, l.seconds(), l.close_id.clone()),
+                                Some("close_requested"),
+                            ),
                             CloseReason::Aborted => {
                                 let e = LiveError::server("server_error", "the engine ended the session".into());
                                 let _ = socket.error(&e).await;
-                                (closed_event(ClosedReason::ConnectionLost, l.seconds()), Some("aborted"))
+                                (closed_event(&l.resource, ClosedReason::ConnectionLost, l.seconds(), None), Some("aborted"))
                             }
                         }
                     }
                     None => {
                         let e = LiveError::server("server_error", "the engine stopped".into());
                         let _ = socket.error(&e).await;
-                        (closed_event(ClosedReason::ConnectionLost, l.seconds()), Some("aborted"))
+                        (closed_event(&l.resource, ClosedReason::ConnectionLost, l.seconds(), None), Some("aborted"))
                     }
                 };
                 let delivered = socket.send(event).await;
@@ -231,9 +246,9 @@ pub async fn serve(ws: WebSocket, live: LiveHandle) {
                 if !socket.send(usage_event(seconds)).await { break; }
             }
             _ = sleep_until(grace), if grace.is_some() => {
-                let seconds = line.as_ref().map_or(0.0, Line::seconds);
-                let _ = socket.send(closed_event(ClosedReason::CloseRequested, seconds)).await;
-                record("close_requested", seconds);
+                let l = line.as_ref().expect("a closing session");
+                let _ = socket.send(closed_event(&l.resource, ClosedReason::CloseRequested, l.seconds(), l.close_id.clone())).await;
+                record("close_requested", l.seconds());
                 break;
             }
         }
@@ -255,9 +270,21 @@ async fn sleep_until(at: Option<Instant>) {
     }
 }
 
-fn open(live: &LiveHandle, model: Option<String>, draft: SessionDraft) -> Result<Line, LiveError> {
-    if let Some(m) = model.filter(|m| *m != live.info.model) {
-        let message = format!("model `{m}` is not served here; this server serves `{}`", live.info.model);
+/// When a session opened now reaches `max_frames`, in Unix seconds.
+fn expires_at(live: &LiveHandle) -> u64 {
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    (now + Duration::from_millis(live.info.frame_ms(live.info.max_frames))).as_secs()
+}
+
+fn open(
+    live: &LiveHandle,
+    model: String,
+    draft: SessionDraft,
+    codec: Transcoder,
+    start_id: Option<String>,
+) -> Result<Line, LiveError> {
+    if model != live.info.model {
+        let message = format!("model `{model}` is not served here; this server serves `{}`", live.info.model);
         return Err(LiveError::invalid("model_not_found", Some("session.model"), message));
     }
     let session = live.info.check(draft).map_err(LiveError::session)?;
@@ -266,8 +293,10 @@ fn open(live: &LiveHandle, model: Option<String>, draft: SessionDraft) -> Result
         Rejected::Stopped => LiveError::server("server_error", e.to_string()),
     })?;
     Ok(Line {
-        id: opened.id,
-        session: opened.session,
+        resource: resource(&live.info, opened.id, &opened.session, codec.format(), expires_at(live)),
+        codec,
+        start_id,
+        close_id: None,
         audio: Some(opened.audio),
         output: opened.output,
         started: None,

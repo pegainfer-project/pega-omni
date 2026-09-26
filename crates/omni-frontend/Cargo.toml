@@ -7,12 +7,14 @@ license.workspace = true
 [dependencies]
 omni-engine.workspace = true
 
+audio-codec-algorithms.workspace = true
 axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+rubato.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

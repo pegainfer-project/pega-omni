@@ -1,8 +1,8 @@
 //! `omni-bench duplex`: concurrent live sessions over the GPT-Live WebSocket.
 //!
 //! Each session opens `/v1/live/sessions`, waits for `session.started`, then
-//! streams the caller's audio at real time in `--chunk-ms` chunks (a 24 kHz
-//! mono wav, looped, or a synthetic speech-like signal: voiced syllables
+//! streams the caller's audio at real time in `--chunk-ms` chunks (a mono wav
+//! at `--rate`, looped, or a synthetic speech-like signal: voiced syllables
 //! between pauses, different per session) for `--seconds`, and closes.
 //! Meanwhile it records every output frame's arrival:
 //!
@@ -13,8 +13,10 @@
 //!   plays the agent's stream in real time stalls whenever the next frame is
 //!   late ([`Playback`]).
 //!
-//! `session.start` declares the input and output format at 24 kHz, so a
-//! server at another rate refuses the session instead of mishearing it.
+//! `session.start` names the model (`--model`, else what `/live/config`
+//! reports) and declares `audio.format` as PCM16 at `--rate` (16 or 24 kHz),
+//! so a server that cannot serve that rate refuses the session instead of
+//! mishearing it.
 //!
 //! A level is clean when every session ran and none stalled. `--ramp 1,2,4,…`
 //! runs levels in order and stops at the first unclean one; the last clean
@@ -42,15 +44,16 @@ use crate::Percentiles;
 use crate::percentiles;
 use crate::playback::Playback;
 
-const RATE: u32 = 24_000;
-
 #[derive(clap::Args, Clone)]
 pub struct Args {
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     base_url: String,
-    /// Sent as `session.model` when given.
+    /// `session.model`; without it, the model `/live/config` reports.
     #[arg(long)]
     model: Option<String>,
+    /// The wire audio's rate both ways, PCM16 at 16000 or 24000 Hz.
+    #[arg(long, default_value_t = 24_000)]
+    rate: u32,
     #[arg(long)]
     voice: Option<String>,
     #[arg(long)]
@@ -64,7 +67,7 @@ pub struct Args {
     /// Caller audio per session, in seconds.
     #[arg(long, default_value_t = 20.0)]
     seconds: f64,
-    /// 24 kHz mono s16 wav to stream (looped); without it, a synthetic speech-like signal.
+    /// Mono s16 wav at `--rate` to stream (looped); without it, a synthetic speech-like signal.
     #[arg(long)]
     input: Option<PathBuf>,
     #[arg(long, default_value_t = 20)]
@@ -115,8 +118,8 @@ struct Level {
     audio_s: f64,
 }
 
-/// A 24 kHz mono s16 wav's samples.
-fn read_wav(path: &PathBuf) -> anyhow::Result<Vec<i16>> {
+/// A mono s16 wav's samples at `rate`.
+fn read_wav(path: &PathBuf, rate: u32) -> anyhow::Result<Vec<i16>> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         bail!("{} is not a wav file", path.display());
@@ -140,9 +143,11 @@ fn read_wav(path: &PathBuf) -> anyhow::Result<Vec<i16>> {
         at += 8 + len + len % 2;
     }
     match (format, data) {
-        (Some((1, 1, RATE, 16)), Some(d)) => Ok(d.as_chunks::<2>().0.iter().map(|&b| i16::from_le_bytes(b)).collect()),
+        (Some((1, 1, r, 16)), Some(d)) if r == rate => {
+            Ok(d.as_chunks::<2>().0.iter().map(|&b| i16::from_le_bytes(b)).collect())
+        }
         (Some(f), Some(_)) => {
-            bail!("{}: need PCM16 mono at {RATE} Hz, got (format, channels, rate, bits) {f:?}", path.display())
+            bail!("{}: need PCM16 mono at {rate} Hz, got (format, channels, rate, bits) {f:?}", path.display())
         }
         _ => bail!("{}: no fmt or data chunk", path.display()),
     }
@@ -150,25 +155,25 @@ fn read_wav(path: &PathBuf) -> anyhow::Result<Vec<i16>> {
 
 /// Speech-shaped test audio: syllables (a harmonic buzz at a drifting pitch
 /// under a smooth envelope) in phrases separated by pauses, seeded.
-fn synthetic(seconds: f64, seed: u64) -> Vec<i16> {
+fn synthetic(seconds: f64, seed: u64, rate: u32) -> Vec<i16> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let total = (seconds * RATE as f64) as usize;
+    let total = (seconds * rate as f64) as usize;
     let mut out = Vec::with_capacity(total);
     while out.len() < total {
         for _ in 0..rng.random_range(3..12) {
-            let len = (rng.random_range(0.12..0.28) * RATE as f64) as usize;
+            let len = (rng.random_range(0.12..0.28) * rate as f64) as usize;
             let (f0, drift) = (rng.random_range(95.0..230.0), rng.random_range(-0.4..0.4));
             let formant: f64 = rng.random_range(2.0..6.0);
             let mut phase = 0.0f64;
             for i in 0..len {
                 let t = i as f64 / len as f64;
-                phase += std::f64::consts::TAU * f0 * (1.0 + drift * t) / RATE as f64;
+                phase += std::f64::consts::TAU * f0 * (1.0 + drift * t) / rate as f64;
                 let buzz: f64 = (1..8).map(|h| (phase * h as f64).sin() / (1.0 + (h as f64 - formant).abs())).sum();
                 out.push((buzz * (std::f64::consts::PI * t).sin().powi(2) * 5000.0) as i16);
             }
-            out.extend(std::iter::repeat_n(0, (rng.random_range(0.02..0.08) * RATE as f64) as usize));
+            out.extend(std::iter::repeat_n(0, (rng.random_range(0.02..0.08) * rate as f64) as usize));
         }
-        out.extend(std::iter::repeat_n(0, (rng.random_range(0.3..1.2) * RATE as f64) as usize));
+        out.extend(std::iter::repeat_n(0, (rng.random_range(0.3..1.2) * rate as f64) as usize));
     }
     out.truncate(total);
     out
@@ -211,21 +216,19 @@ async fn drive(args: &Args, audio: Vec<i16>, record: &mut Record) -> anyhow::Res
     let connected = Instant::now();
     let (ws, _) = tokio_tungstenite::connect_async(ws_url(&args.base_url)).await.context("connect")?;
     let (mut tx, mut rx) = ws.split();
-    let mut session = json!({});
-    if let Some(m) = &args.model {
-        session["model"] = json!(m);
-    }
+    let mut session = json!({
+        "model": args.model.as_deref().context("the model is resolved before sessions start")?,
+        "audio": {"format": {"type": "audio/pcm", "rate": args.rate}, "output": {}},
+    });
     if let Some(i) = &args.instructions {
         session["instructions"] = json!(i);
     }
-    let format = json!({"type": "audio/pcm", "rate": RATE});
-    session["audio"] = json!({"input": {"format": format}, "output": {"format": format}});
     if let Some(v) = &args.voice {
         session["audio"]["output"]["voice"] = json!(v);
     }
     tx.send(Message::Text(json!({"type": "session.start", "session": session}).to_string().into())).await?;
 
-    let chunk = (RATE as u64 * args.chunk_ms / 1000) as usize;
+    let chunk = (args.rate as u64 * args.chunk_ms / 1000) as usize;
     let chunks = (args.seconds * 1000.0 / args.chunk_ms as f64).ceil() as usize;
     let pace = Duration::from_millis(args.chunk_ms);
     let mut writer: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
@@ -340,7 +343,18 @@ fn print(l: &Level) {
     );
 }
 
-pub async fn run(args: Args) -> anyhow::Result<()> {
+/// The model a pega-omni live server serves, as its demo page learns it.
+async fn live_model(base: &str) -> anyhow::Result<String> {
+    let url = format!("{}/live/config", base.trim_end_matches('/'));
+    let config: Value =
+        reqwest::get(&url).await?.error_for_status()?.json().await.with_context(|| format!("GET {url}"))?;
+    config["model"].as_str().map(String::from).with_context(|| format!("no model in {url}; pass --model"))
+}
+
+pub async fn run(mut args: Args) -> anyhow::Result<()> {
+    if args.model.is_none() {
+        args.model = Some(live_model(&args.base_url).await?);
+    }
     let levels: Vec<usize> = match &args.ramp {
         Some(r) => r
             .split(',')
@@ -349,7 +363,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         None => vec![args.sessions],
     };
     let base = match &args.input {
-        Some(p) => Some(read_wav(p)?),
+        Some(p) => Some(read_wav(p, args.rate)?),
         None => None,
     };
     let mut report = Vec::new();
@@ -359,7 +373,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         let tasks: Vec<_> = (0..n)
             .map(|i| {
                 let args = args.clone();
-                let audio = base.clone().unwrap_or_else(|| synthetic(args.seconds.min(60.0), args.seed + i as u64));
+                let audio =
+                    base.clone().unwrap_or_else(|| synthetic(args.seconds.min(60.0), args.seed + i as u64, args.rate));
                 let delay = Duration::from_millis(args.stagger_ms * i as u64);
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
@@ -391,7 +406,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         let out = json!({
             "config": {
                 "base_url": args.base_url, "model": args.model, "voice": args.voice, "levels": levels,
-                "seconds": args.seconds, "input": args.input, "chunk_ms": args.chunk_ms,
+                "rate": args.rate, "seconds": args.seconds, "input": args.input, "chunk_ms": args.chunk_ms,
                 "stagger_ms": args.stagger_ms, "playout_ms": args.playout_ms, "seed": args.seed,
             },
             "levels": report,

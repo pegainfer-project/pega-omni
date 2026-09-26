@@ -35,6 +35,9 @@ omni-qwen3-tts = { path = "crates/omni-qwen3-tts" }
 omni-personaplex = { path = "crates/omni-personaplex" }
 
 anyhow = "1"
+# G.711 (`audio/pcmu`, `audio/pcma`) for the live endpoint: the ITU tables,
+# already in the tree under rubato.
+audio-codec-algorithms = "0.8"
 # `ws`: the live endpoint is a WebSocket; axum's own upgrade over tungstenite
 # keeps it on the same server and connection handling as the HTTP routes.
 axum = { version = "0.8", features = ["ws"] }
@@ -60,6 +63,10 @@ proptest = "1"
 rand = "0.10"
 rand_distr = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
+# The live endpoint's 16 kHz and G.711 formats meet the engine's rate through
+# a band-limited FFT resampler with fixed chunks, so a stream's output does not
+# depend on how its input was split.
+rubato = "5"
 safetensors = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

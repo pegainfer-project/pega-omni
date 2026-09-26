@@ -43,7 +43,7 @@ side it also holds what every live engine shares (`drive`, below).
 
 ## Protocol
 
-The wire protocol is the WebSocket form of OpenAI's GPT-Live API
+The wire protocol is the primary-WebSocket form of OpenAI's GPT-Live API
 (`gpt-live-1`, `/v1/live/sessions`), the one OpenAI API designed for
 continuous, turnless audio. The Realtime API (`/v1/realtime`) is shaped around
 responses (`response.create`, `commit`, VAD, `truncate`) that a native
@@ -51,37 +51,67 @@ full-duplex model does not have, and fitting one into it means inventing
 response boundaries out of silence. GPT-Live has none of that: audio streams
 both ways, and output is placed on a session timeline.
 
+The schema is the official `openai` Python SDK's (`openai.types.live`), not
+our reading of the docs: `tools/live_check.py` drives the server with the
+SDK's own live client (`client.live.connect()`) and validates every server
+event strictly against the SDK's model for it.
+
 A socket carries one session.
 
-Client events:
+Client events, each with an optional `event_id`:
 
 | event | fields | notes |
 |---|---|---|
-| `session.start` | `session: {model?, instructions?, audio?: {input?: {format?}, output?: {voice?, format?}}}` | strict: an unknown field is an `error` naming it (`param: "session.temprature"`); `format` must be `{"type": "audio/pcm", "rate": 24000}` |
-| `session.input_audio.append` | `audio`: base64 s16le mono at the engine's rate | any chunk size; not acknowledged |
+| `session.start` | `session: {model, instructions?, audio?: {format?, output?: {voice?}}, delegation?, input?, store?}` | `model` is required. Strict: an unknown field is an `error` naming it (`param: "session.temprature"`). Blank `instructions` mean the default. `voice` is a name or `{"id": name}`. `delegation` may be `null` or `{"type": "client"}`; `input` may be absent or `[]`; `store` may be `false` |
+| `session.input_audio.append` | `audio`: base64, in the session's format | never empty, whole samples, any chunk size; not acknowledged |
 | `session.input_audio.mute` / `unmute` | | acknowledged with `session.input_audio.muted` / `unmuted`; the front end replaces muted audio with silence of the same length, so the engine hears silence and its buffer does not run dry |
 | `session.close` | | answered by `session.closed` |
 
-Every client event may carry `client_event_id`, echoed in the `error` it
-causes (and in mute acknowledgements).
+`audio.format` is one of:
 
-Server events, each with `type` and a unique `event_id`:
+| format | |
+|---|---|
+| `{"type": "audio/pcm", "rate": 24000}` | PCM16 little-endian mono; the default |
+| `{"type": "audio/pcm", "rate": 16000}` | PCM16 little-endian mono |
+| `{"type": "audio/pcmu", "rate": 8000}` | G.711 μ-law |
+| `{"type": "audio/pcma", "rate": 8000}` | G.711 A-law |
+
+It applies both ways. The front end converts between it and the engine's own
+rate (`omni_frontend::live_audio`): G.711 through the ITU tables, rates
+through a band-limited FFT resampler (rubato) with fixed 10 ms chunks, so the
+engine hears the same samples however the network split them, and each
+direction adds a constant 5 ms. A format at the engine's rate passes through
+untouched. The engine never sees anything but its own rate.
+
+Server events, each with `type` and a unique `event_id`. A server event that
+answers a command echoes the command's `event_id` as `client_event_id`:
 
 | event | fields |
 |---|---|
-| `session.started` | `session: {id, model, instructions, audio: {input: {format}, output: {format, voice}}}` |
-| `session.output_audio.delta` | `delta` (base64 s16le), `start_ms`, `end_ms` |
+| `session.started` | `session` (below), `client_event_id` of the `session.start` |
+| `session.output_audio.delta` | `delta` (base64, in the session's format), `start_ms`, `end_ms` |
 | `session.output_transcript.delta` | `delta`, `start_ms`, `end_ms` |
 | `session.input_audio.muted` / `unmuted` | `client_event_id` |
 | `session.usage.updated` | `usage: {seconds}`, every 5 s |
-| `session.closed` | `reason` (`close_requested`, `expired`, `connection_lost`), `usage: {seconds}` |
-| `error` | `error: {type, code, message, param, client_event_id}` |
+| `session.closed` | `session` (the same snapshot), `reason` (`close_requested`, `expired`, `connection_lost`), `usage: {seconds}`, `client_event_id` of the `session.close` |
+| `error` | `error: {type, code, message, param?, client_event_id?}` |
+
+The session (the SDK's `SessionResource`) is `{id, status: "active",
+expires_at, model, instructions, audio: {format, output: {voice}},
+delegation: {"type": "client"}}`, resolved: the defaults the engine filled in
+are spelled out. `expires_at` (Unix seconds) is when a session that started
+at `session.start` reaches `max_frames`. `session.usage.updated` carries no
+`context_window`: the engines' context is a ring that never fills, so no
+usage ratio would mean what the field promises.
 
 **Timeline.** The agent's audio is one contiguous stream from
 `session.started`: frame `n` is the `n`th frame the engine ran for the
 session, covering `[80 n, 80 (n + 1))` ms of it. The server never sends a
 done event: audio simply continues. The transcript is the model's own text
-stream, placed on the same timeline as the audio it was spoken with.
+stream, placed on the same timeline as the audio it was spoken with. The SDK
+makes `start_ms` / `end_ms` optional on primary-WebSocket audio deltas; this
+server always sends them, since the timeline is what a client measures
+lateness against.
 
 **Refused, by name.** What the engine cannot honour is an `error`
 (`code: "unsupported"`, `param` naming the event type or field), never
@@ -92,13 +122,20 @@ silently ignored:
 - `session.instructions.append`, `session.thinking.append`,
   `session.commentary.append`, `response.item.create`, `response.create`:
   context injection and responses need a model that takes text mid-session.
-- `session.delegation` (tools, a reasoning backend): same.
+- `session.delegation` of `type: "responses"` (tools, a reasoning backend):
+  same. Client delegation is accepted: the model never delegates, so the
+  client never has anything to handle.
+- A non-empty `session.input`: the model takes no text history.
+- `session.store: true`: nothing is kept after a session closes.
+- `session.client`: it configures a WebRTC data channel.
 - Input transcription (`session.input_transcript.delta`) is not produced; the
   model does not transcribe the caller.
 
 Other errors: `session_not_started` (audio before `session.start`),
-`session_already_started`, `model_not_found` (`param: "session.model"`),
-`invalid_value` (a voice or format the engine does not serve),
+`session_already_started`, `missing_required_parameter` (e.g.
+`param: "session.model"`), `model_not_found` (`param: "session.model"`),
+`invalid_value` (a voice, format or rate the server does not serve),
+`invalid_audio` (`param: "audio"`: empty, not base64, or not whole samples),
 `server_busy` (`type: server_error`; the engine is at `max_sessions` or its
 queue is full; the socket stays open for another `session.start`).
 
@@ -192,7 +229,7 @@ Per session (`session.start`):
 |---|---|
 | `audio.output.voice` | one of the 18 voice prompts (`NATF0-3`, `NATM0-3`, `VARF0-4`, `VARM0-4`); default `NATF2` |
 | `instructions` | the role prompt, e.g. `You work for a bakery called Sunrise; take the caller's order.`; default is a general helpful-assistant persona; at most as many characters as always fit the context even as byte-fallback tokens (711 with the shipped voices) |
-| `audio.{input,output}.format` | only `{"type": "audio/pcm", "rate": 24000}` |
+| `audio.format` | PCM16 at 24 kHz (the model's rate) or 16 kHz, or G.711 μ-law / A-law at 8 kHz, both ways |
 
 Voice and instructions are fixed for a session: they are its prefix.
 
@@ -247,7 +284,7 @@ slot):
     # open http://127.0.0.1:8000/, pick a voice, edit the role prompt, press Start
 
 Any GPT-Live client works the same way; `tools/live_check.py` is a minimal
-one.
+one, on the official `openai` SDK's live client.
 
 Browsers only grant the microphone to a secure context: `http://localhost`
 qualifies, a remote `http://` address does not. For a server on another
@@ -261,8 +298,8 @@ or put it behind https.
 ## Benchmark
 
 `omni-bench duplex` opens N concurrent sessions over the WebSocket, streams
-each one's caller audio at real time in 20 ms chunks (a 24 kHz wav with
-`--input`, looped, or a synthetic speech-like signal, different per session),
+each one's caller audio at real time in 20 ms chunks (PCM16 at `--rate`,
+24 kHz by default or 16 kHz; a wav at that rate with `--input`, looped, or a synthetic speech-like signal, different per session),
 closes them after `--seconds`, and reports per level:
 
 - **started ms**: connect to `session.started` (prompt prefill);
@@ -283,6 +320,6 @@ Against `sim-live --tick-base-us 2000 --tick-per-session-us 3000` (a tick
 costs 2 ms + 3 ms per session, so 26 sessions fit in 80 ms) the ramp finds
 24 clean and 32 not, with late p99 at 66 ms and 155 ms respectively.
 
-`tools/live_check.py` is the protocol oracle, an outside client that checks a
-live server against the rules above; CI runs it and a short ramp against
+`tools/live_check.py` is the protocol oracle, the official SDK's client
+checking a live server against the rules above at 24 and 16 kHz; CI runs it and a short ramp against
 `sim-live`.

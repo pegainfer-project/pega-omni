@@ -19,6 +19,7 @@
 
 pub mod audio;
 mod live;
+pub mod live_audio;
 pub mod live_protocol;
 pub mod protocol;
 

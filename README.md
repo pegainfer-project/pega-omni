@@ -80,7 +80,7 @@ with client.audio.speech.with_streaming_response.create(
 | Route | |
 |---|---|
 | `POST /v1/audio/speech` | OpenAI's request: `model`, `input`, `voice` (name or `{"id": ...}`), `instructions`, `response_format`, `speed`, `stream_format` (`audio` or `sse`) |
-| `GET /v1/live/sessions` | GPT-Live WebSocket: `session.start`, `session.input_audio.append`, `session.close`; `session.output_audio.delta` and `session.output_transcript.delta` on the agent's timeline ([docs/duplex.md](docs/duplex.md#protocol)) |
+| `GET /v1/live/sessions` | GPT-Live WebSocket, as the official `openai` SDK's `client.live.connect()` speaks it: `session.start` (PCM16 at 24 or 16 kHz, or G.711), `session.input_audio.append`, mute, `session.close`; `session.output_audio.delta` and `session.output_transcript.delta` on the agent's timeline ([docs/duplex.md](docs/duplex.md#protocol)) |
 | `GET /` | the live demo page |
 | `GET /live/config`, `GET /live/stats` | what the demo reads: the live engine's defaults, and its load as counters (sessions, ticks, tick compute time, late ticks) |
 | `GET /v1/models` | the served model |
