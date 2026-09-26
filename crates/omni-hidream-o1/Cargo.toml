@@ -9,6 +9,7 @@ omni-engine.workspace = true
 
 anyhow.workspace = true
 bytes.workspace = true
+cudarc.workspace = true
 half.workspace = true
 kern-manifest.workspace = true
 kern-runtime.workspace = true

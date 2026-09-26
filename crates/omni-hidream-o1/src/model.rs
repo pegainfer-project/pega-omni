@@ -30,8 +30,8 @@
 //! `t_embedder1` (sinusoid, linear, SiLU, linear), patches through
 //! `x_embedder` (a 1024-wide bottleneck). The vision tower and `lm_head` are
 //! not loaded: text-to-image never runs them. The decoder's GEMMs in a step
-//! run on cuBLASLt's 256x128 tile (`extern:cublaslt_bf16_tn_wide`); every
-//! other GEMM on its own choice.
+//! run on the algorithms [`Gemms`] names, every other GEMM on cuBLASLt's own
+//! choice.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -48,6 +48,7 @@ use sha2::Digest;
 use crate::config::PATCH_DIM;
 use crate::config::TIMESTEP_FREQUENCIES;
 use crate::config::Text;
+use crate::gemm::Gemms;
 use crate::manifest::Gen;
 use crate::manifest::HostTensors;
 use crate::manifest::arg;
@@ -87,6 +88,8 @@ pub struct Model {
     limits: Limits,
     /// The grid of the last `prefill`.
     grid: (usize, usize),
+    /// The candidate each tuned shape runs, as `predict` vars (see [`Gemms::Candidates`]).
+    picks: BTreeMap<String, u64>,
 }
 
 fn ints(v: &[i32]) -> Vec<u8> {
@@ -102,17 +105,18 @@ fn vars(pairs: &[(&str, usize)]) -> BTreeMap<String, u64> {
 }
 
 impl Model {
-    pub fn load(device: usize, dir: &Path, limits: Limits) -> Result<Self> {
+    pub fn load(device: usize, dir: &Path, limits: Limits, gemms: &Gemms) -> Result<Self> {
         let cfg = Text::load(dir)?;
         let sha = hex(&sha2::Sha256::digest(HIDREAM));
-        let (manifest, tensors) = generate(dir, &cfg, &sha, limits)?;
+        let (manifest, tensors) = generate(dir, &cfg, &sha, limits, gemms)?;
         let verified = kern_manifest::verify(kern_manifest::Manifest::from_json(&manifest.to_string())?)
             .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
         let kernels = kernels_dir(&sha, HIDREAM)?;
         let mut rt =
             Runtime::load(&verified, Some(&kernels), device, Some(Capacity { tokens: Some(1), seqs: 1 }), None)?;
         rt.load_weights(&tensors)?;
-        Ok(Self { cfg, rt, limits, grid: (0, 0) })
+        let picks = gemms.vars().into_keys().map(|v| (v, 1)).collect();
+        Ok(Self { cfg, rt, limits, grid: (0, 0), picks })
     }
 
     fn patches(&self) -> usize {
@@ -173,8 +177,20 @@ impl Model {
             timestep_frequencies(step_t).iter().flat_map(|&x| bf16::from_f32(x).to_le_bytes()).collect();
         self.rt.write_input("freq", &freq)?;
         let p = self.patches();
-        self.rt.issue("predict", &vars(&[("patches", p), ("rows", p + 1)]))?;
+        let mut v = vars(&[("patches", p), ("rows", p + 1)]);
+        v.extend(self.picks.clone());
+        self.rt.issue("predict", &v)?;
         Ok(())
+    }
+
+    /// Runs candidate `index` (from 1) of the shape `var` picks from the next `predict` on.
+    pub fn pick(&mut self, var: &str, index: usize) {
+        self.picks.insert(var.into(), index as u64);
+    }
+
+    /// Waits for everything issued.
+    pub fn synchronize(&self) -> Result<()> {
+        Ok(self.rt.synchronize()?)
     }
 
     /// `z = sigma_next * scale * clip(eps) + (1 - sigma_next) * x0` with `eps`
@@ -266,7 +282,7 @@ struct Pass<'a> {
     slots: &'a str,
     kv_len: &'a str,
     causal: bool,
-    wide: bool,
+    step: bool,
 }
 
 impl Tower<'_> {
@@ -323,7 +339,7 @@ impl Tower<'_> {
         );
         for (i, l) in self.layers.iter().enumerate() {
             let at = |s: &str| format!("{label}.l{i}.{s}");
-            g.gemm(&at("qkv"), (buf("qkv"), buf("h"), buf(&l.qkv)), n.clone(), (qkv_w, h), pass.wide);
+            g.gemm(&at("qkv"), (buf("qkv"), buf("h"), buf(&l.qkv)), n.clone(), (qkv_w, h), pass.step);
             g.launch(
                 &at("rope"),
                 "hidream_qk_rope",
@@ -361,14 +377,14 @@ impl Tower<'_> {
                     f32a((d as f32).powf(-0.5) * std::f32::consts::LOG2_E),
                 ],
             );
-            g.gemm(&at("o"), (buf("h"), buf("attn"), buf(&l.o)), n.clone(), (h, hq * d), pass.wide);
+            g.gemm(&at("o"), (buf("h"), buf("attn"), buf(&l.o)), n.clone(), (h, hq * d), pass.step);
             g.launch(
                 &at("post_attn_norm"),
                 "hidream_add_norm",
                 (per_row.clone(), norm, 0),
                 vec![arg(BF, "h"), arg(BF_IO, "res"), arg(BF, &l.ln2), arg(BF_OUT, "h"), i32a(h), f32a(eps)],
             );
-            g.gemm(&at("gate_up"), (buf("gate_up"), buf("h"), buf(&l.gate_up)), n.clone(), (2 * inter, h), pass.wide);
+            g.gemm(&at("gate_up"), (buf("gate_up"), buf("h"), buf(&l.gate_up)), n.clone(), (2 * inter, h), pass.step);
             let groups = json!({"mul": [rows, inter / 8]});
             g.launch(
                 &at("silu_mul"),
@@ -376,7 +392,7 @@ impl Tower<'_> {
                 ([json!({"ceil_div": [groups.clone(), THREADS]}), json!(1), json!(1)], THREADS, 0),
                 vec![arg(BF, "gate_up"), arg(BF_OUT, "act"), i32a(inter), ("i32", json!({"expr": groups}))],
             );
-            g.gemm(&at("down"), (buf("h"), buf("act"), buf(&l.down)), n.clone(), (h, inter), pass.wide);
+            g.gemm(&at("down"), (buf("h"), buf("act"), buf(&l.down)), n.clone(), (h, inter), pass.step);
             let next = self.layers.get(i + 1).map_or(&self.norm, |n| &n.ln1);
             g.launch(
                 &at("next_norm"),
@@ -403,7 +419,7 @@ fn bias_act(g: &mut Gen, label: &str, (x, offset): (&str, usize), bias: &str, (r
 }
 
 /// The manifest (JSON) and the tensors its weight buffers bind.
-fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits) -> Result<(Value, HostTensors)> {
+fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits, gemms: &Gemms) -> Result<(Value, HostTensors)> {
     let ck = Checkpoint::open(dir)?;
     let mut g = Gen::default();
     let (h, inter, hk, d) = (cfg.hidden_size, cfg.intermediate_size, cfg.num_key_value_heads, cfg.head_dim);
@@ -440,7 +456,7 @@ fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits) -> Result<(Value,
         slots: "text_slots",
         kv_len: "prefill_kv",
         causal: true,
-        wide: false,
+        step: false,
     };
     tower.forward(&mut g, &text_pass);
     let prefill = g.take();
@@ -475,7 +491,7 @@ fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits) -> Result<(Value,
         slots: "gen_slots",
         kv_len: "step_kv",
         causal: false,
-        wide: true,
+        step: true,
     };
     tower.forward(&mut g, &step_pass);
     g.gemm("predict.head", (buf("x0"), buf_at("h", h * 2), buf(&head)), np.clone(), (PATCH_DIM, h), false);
@@ -600,11 +616,14 @@ fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits) -> Result<(Value,
     programs.insert("advance_with".into(), json!({"calls": advance_with}));
     programs.insert("set_z".into(), json!({"calls": set_z}));
     programs.insert("rgb".into(), json!({"calls": rgb}));
-    let (buffers, ops, tensors) = g.into_parts();
+    let (buffers, ops, tensors) = g.into_parts(gemms);
+    let mut vars =
+        json!({"text": {"max": max_text}, "patches": {"max": max_patches}, "rows": {"max": max_patches + 1}});
+    vars.as_object_mut().expect("an object").extend(gemms.vars());
     let manifest = json!({
         "schema_version": 5,
         "model": "hidream-o1",
-        "vars": {"text": {"max": max_text}, "patches": {"max": max_patches}, "rows": {"max": max_patches + 1}},
+        "vars": vars,
         "states": {},
         "buffers": buffers,
         "modules": {"hidream": {"source": format!("hidream-{}.cubin", &sha[..12]), "sha256": sha}},

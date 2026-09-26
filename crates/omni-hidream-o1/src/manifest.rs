@@ -3,11 +3,12 @@
 //!
 //! A launch's geometry lives in its op, and almost every call here has its own
 //! shape, so every kernel call is an op of its own, named by its label. GEMMs
-//! call one of two built-in ops: `gemm` (cuBLASLt's own choice) or `gemm_wide`
-//! (its 256x128 tile, for the step's decoder GEMMs of thousands of rows).
+//! call a built-in op: `gemm` (cuBLASLt's own choice), or for the step's
+//! decoder GEMMs one op per weight shape whose algorithm [`Gemms`] sets.
 //! Calls accumulate until [`Gen::take`] cuts them into a program.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -19,9 +20,15 @@ use kern_runtime::Tensors;
 use serde_json::Value;
 use serde_json::json;
 
+use crate::gemm::Gemms;
+use crate::gemm::Shape;
+use crate::gemm::name;
+
 /// The manifest under construction.
 #[derive(Default)]
 pub struct Gen {
+    /// The step GEMMs' weight shapes.
+    step: BTreeSet<Shape>,
     buffers: serde_json::Map<String, Value>,
     ops: serde_json::Map<String, Value>,
     calls: Vec<Value>,
@@ -69,16 +76,21 @@ impl Gen {
         self.calls.push(json!({"label": label, "op": label, "args": args}));
     }
 
-    /// `y[rows, n] = x[rows, k] · w[n, k]ᵀ`, on the wide tile when `wide`.
+    /// `y[rows, n] = x[rows, k] · w[n, k]ᵀ`; a `step` GEMM runs on its shape's op.
     pub fn gemm(
         &mut self,
         label: &str,
         (y, x, w): (Value, Value, Value),
         rows: Value,
         (n, k): (usize, usize),
-        wide: bool,
+        step: bool,
     ) {
-        let op = if wide { "gemm_wide" } else { "gemm" };
+        let op = if step {
+            self.step.insert((n, k));
+            name((n, k))
+        } else {
+            "gemm".into()
+        };
         self.calls.push(json!({"label": label, "op": op, "args": [x, w, y, rows, {"i32": n}, {"i32": k}]}));
     }
 
@@ -87,14 +99,19 @@ impl Gen {
         std::mem::take(&mut self.calls)
     }
 
-    /// The buffers, ops (the two GEMM ops added) and weights.
-    pub fn into_parts(mut self) -> (serde_json::Map<String, Value>, serde_json::Map<String, Value>, HostTensors) {
-        let gemm = |entry: &str| {
+    /// The buffers, ops (the GEMM ops added, the step ones as `gemms` says) and weights.
+    pub fn into_parts(
+        mut self,
+        gemms: &Gemms,
+    ) -> (serde_json::Map<String, Value>, serde_json::Map<String, Value>, HostTensors) {
+        let gemm = |launches: Vec<Value>| {
             json!({"params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
-                   "impl": {"launches": [{"entry": entry}]}})
+                   "impl": {"launches": launches}})
         };
-        self.ops.insert("gemm".into(), gemm("extern:cublaslt_bf16_tn"));
-        self.ops.insert("gemm_wide".into(), gemm("extern:cublaslt_bf16_tn_wide"));
+        self.ops.insert("gemm".into(), gemm(vec![json!({"entry": "extern:cublaslt_bf16_tn"})]));
+        for &shape in &self.step {
+            self.ops.insert(name(shape), gemm(gemms.launches(shape)));
+        }
         (self.buffers, self.ops, HostTensors(self.tensors))
     }
 }

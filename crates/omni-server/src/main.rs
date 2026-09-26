@@ -36,6 +36,9 @@ enum Command {
     /// Serve HiDream-O1-Image (the distilled Dev checkpoints) on one GPU.
     #[cfg(feature = "hidream-o1")]
     HidreamO1(HidreamO1Args),
+    /// Measure HiDream-O1's decoder GEMM algorithms on one GPU and write them for `--gemm-algos`.
+    #[cfg(feature = "hidream-o1")]
+    HidreamO1TuneGemms(HidreamO1TuneArgs),
 }
 
 #[derive(Args)]
@@ -269,8 +272,24 @@ struct HidreamO1Args {
     /// Pictures one request may ask for.
     #[arg(long, default_value_t = 4)]
     max_n: u32,
-    #[arg(long, default_value_t = 2000)]
+    #[arg(long, default_value_t = omni_hidream_o1::engine::MAX_PROMPT_CHARS)]
     max_prompt_chars: usize,
+    /// Decoder GEMM algorithms written by `hidream-o1-tune-gemms` on this GPU; cuBLASLt's heuristic without.
+    #[arg(long)]
+    gemm_algos: Option<std::path::PathBuf>,
+}
+
+#[cfg(feature = "hidream-o1")]
+#[derive(Args)]
+struct HidreamO1TuneArgs {
+    /// Checkpoint directory.
+    #[arg(long)]
+    model_path: std::path::PathBuf,
+    #[arg(long, default_value_t = 0)]
+    device: usize,
+    /// Where to write the algorithms.
+    #[arg(long)]
+    out: std::path::PathBuf,
 }
 
 #[cfg(feature = "hidream-o1")]
@@ -286,6 +305,10 @@ impl HidreamO1Args {
             name.clone(),
             (self.max_n, self.max_prompt_chars),
             self.serve.queue,
+            match &self.gemm_algos {
+                Some(path) => omni_hidream_o1::gemm::Pins::load(path, self.device)?,
+                None => omni_hidream_o1::gemm::Gemms::Heuristic,
+            },
         )?;
         Ok((handle.into(), thread, name))
     }
@@ -346,6 +369,11 @@ fn main() -> anyhow::Result<()> {
         Command::HidreamO1(args) => {
             let started = args.start()?;
             (args.serve, started)
+        }
+        #[cfg(feature = "hidream-o1")]
+        Command::HidreamO1TuneGemms(args) => {
+            let limits = omni_hidream_o1::engine::limits(omni_hidream_o1::engine::MAX_PROMPT_CHARS);
+            return omni_hidream_o1::tune::tune(args.device, &args.model_path, limits, &args.out);
         }
     };
     let serve = &serve;

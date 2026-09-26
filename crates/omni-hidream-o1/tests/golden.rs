@@ -16,6 +16,8 @@ use half::f16;
 use memmap2::Mmap;
 use omni_engine::image::Size;
 use omni_hidream_o1::config::PATCH_DIM;
+use omni_hidream_o1::gemm::Gemms;
+use omni_hidream_o1::gemm::Pins;
 use omni_hidream_o1::model::Limits;
 use omni_hidream_o1::model::Model;
 use omni_hidream_o1::prompt;
@@ -121,7 +123,13 @@ fn engine_matches_the_official_run() {
     }
 
     let t = Instant::now();
-    let mut model = Model::load(0, &model_dir, Limits { max_text: ids.len(), max_patches: patches }).unwrap();
+    // The algorithms a server would pin with `--gemm-algos`, when given.
+    let gemms = match std::env::var_os("OMNI_HIDREAM_O1_GEMM_ALGOS") {
+        Some(path) => Pins::load(path.as_ref(), 0).unwrap(),
+        None => Gemms::Heuristic,
+    };
+    let limits = Limits { max_text: ids.len(), max_patches: patches };
+    let mut model = Model::load(0, &model_dir, limits, &gemms).unwrap();
     eprintln!("loaded in {:.1?}", t.elapsed());
     model.prefill(&ids, grid).unwrap();
 

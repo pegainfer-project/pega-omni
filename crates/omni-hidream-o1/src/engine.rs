@@ -22,16 +22,22 @@ use omni_engine::image::Inbox;
 use omni_engine::image::Rgb;
 use omni_engine::image::Size;
 
+use crate::gemm::Gemms;
 use crate::model::Limits;
 use crate::model::Model;
 use crate::prompt;
 use crate::prompt::Tokenizer;
 use crate::sampler;
 
-/// Text tokens a prompt may take: the worst case of byte-level BPE (four
-/// tokens a character) over `max_prompt_chars`, plus the template.
-fn max_text_tokens(max_prompt_chars: usize) -> usize {
-    4 * max_prompt_chars + 32
+/// The default of the longest prompt served, in characters.
+pub const MAX_PROMPT_CHARS: usize = 2000;
+
+/// What the runtime is sized for: text tokens of the worst case of
+/// byte-level BPE (four tokens a character) over `max_prompt_chars` plus the
+/// template, and the patches of the largest size.
+pub fn limits(max_prompt_chars: usize) -> Limits {
+    let max_patches = prompt::sizes().map(|s| prompt::grid(s).0 * prompt::grid(s).1).max().unwrap_or(0);
+    Limits { max_text: 4 * max_prompt_chars + 32, max_patches }
 }
 
 pub struct Engine {
@@ -76,13 +82,13 @@ pub fn start(
     name: String,
     (max_n, max_prompt_chars): (u32, usize),
     queue: usize,
+    gemms: Gemms,
 ) -> Result<(Handle, JoinHandle<()>)> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let thread = std::thread::Builder::new().name("omni-hidream-o1".into()).spawn(move || {
         let loaded = (|| {
-            let max_patches = prompt::sizes().map(|s| prompt::grid(s).0 * prompt::grid(s).1).max().unwrap_or(0);
-            let limits = Limits { max_text: max_text_tokens(max_prompt_chars), max_patches };
-            let model = Model::load(device, &dir, limits).with_context(|| format!("load {}", dir.display()))?;
+            let model = Model::load(device, &dir, limits(max_prompt_chars), &gemms)
+                .with_context(|| format!("load {}", dir.display()))?;
             let tokenizer = Tokenizer::load(&dir)?;
             let (handle, inbox) = omni_engine::image::channel(info(&name, max_n, max_prompt_chars), queue);
             anyhow::Ok((handle, inbox, Engine { model, tokenizer }))

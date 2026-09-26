@@ -28,7 +28,7 @@ Noise is a counter-based Philox stream keyed by the request's `seed` (`extra.see
 
 ## Kernels
 
-`kernels/hidream.cu`: the embedding gather, RMSNorm and residual-add RMSNorm, per-head Q/K norm with Qwen3-VL's interleaved three-axis M-RoPE writing K/V to the caches, SiLU-gated multiply, bias-and-activation, the sampler (Philox + Box-Muller noise, its moments, the Euler step) and patches-to-RGB. Attention is FA2 on `mma.sync`: a block owns 128 packed rows (32 query positions times the 4 query heads of one K/V head), Q stays in registers, K and V stream through shared memory 64 keys at a time, and a `causal` flag serves the text prefill. The GEMMs are kern's cuBLASLt built-ins, the four decoder GEMMs of a step on `extern:cublaslt_bf16_tn_wide` (see Performance). The f32 shards are read into bf16 at load, Q|K|V and gate|up fused; the vision tower and `lm_head` are not loaded.
+`kernels/hidream.cu`: the embedding gather, RMSNorm and residual-add RMSNorm, per-head Q/K norm with Qwen3-VL's interleaved three-axis M-RoPE writing K/V to the caches, SiLU-gated multiply, bias-and-activation, the sampler (Philox + Box-Muller noise, its moments, the Euler step) and patches-to-RGB. Attention is FA2 on `mma.sync`: a block owns 128 packed rows (32 query positions times the 4 query heads of one K/V head), Q stays in registers, K and V stream through shared memory 64 keys at a time, and a `causal` flag serves the text prefill. The GEMMs are kern's `extern:cublaslt_bf16_tn`, the four decoder GEMMs of a step on the algorithms `--gemm-algos` pins (see Performance). The f32 shards are read into bf16 at load, Q|K|V and gate|up fused; the vision tower and `lm_head` are not loaded.
 
 ## Correctness
 
@@ -46,7 +46,7 @@ bf16 does not settle to one answer for this model: at the noisiest steps the ref
 
 Each step's cosine must be within 0.002 of the reference's; flattening M-RoPE to one axis drops the step-0 cosine to 0.095.
 
-The finished picture is one trajectory of 28 steps that compound their rounding, and equally accurate numerics land several dB apart on it. The reference's own run with eager attention instead of sdpa lands at 27.68 dB, and its two runs agree with each other only to 26.43 dB; this engine lands at 28.73 dB with cuBLASLt's default GEMM algorithms and at 26.67 dB with the wide tile, and an earlier build of it on FlashInfer attention between 28.20 and 29.34 dB. A sampler bug falls far below: without the noise clip the picture is at 16.70 dB, with sigma off by one step at 11.63 dB. So the test holds the picture within 3 dB of the reference's, and holds accuracy in the teacher-forced steps.
+The finished picture is one trajectory of 28 steps that compound their rounding, and equally accurate numerics land several dB apart on it. The reference's own run with eager attention instead of sdpa lands at 27.68 dB, and its two runs agree with each other only to 26.43 dB; this engine lands at 28.73 dB with cuBLASLt's default GEMM algorithms and at 26.67 dB on the algorithms tuning pins on that card (on a GH200 at 26.81 dB either way), and an earlier build of it on FlashInfer attention between 28.20 and 29.34 dB. A sampler bug falls far below: without the noise clip the picture is at 16.70 dB, with sigma off by one step at 11.63 dB. So the test holds the picture within 3 dB of the reference's, and holds accuracy in the teacher-forced steps.
 
 ```bash
 uv run tools/hidream_o1/golden.py --repo <HiDream-O1-Image checkout> \
@@ -55,6 +55,8 @@ OMNI_HIDREAM_O1_MODEL=<ckpt> OMNI_HIDREAM_O1_GOLDEN=hidream-o1-golden.safetensor
     cargo test -p omni-hidream-o1 --release -- --nocapture
 ```
 
+`OMNI_HIDREAM_O1_GEMM_ALGOS=<file>` runs the test on the algorithms a server would pin with that file.
+
 ## Performance
 
 Single GPU (sm_89, x86_64, 48 GB), CUDA 13.1, 2026-09-25:
@@ -62,7 +64,7 @@ Single GPU (sm_89, x86_64, 48 GB), CUDA 13.1, 2026-09-25:
 | | |
 |---|---|
 | 28 steps at 2048 x 2048, noise uploaded from the host (the golden replay) | 13.4 s |
-| the same through `/v1/images/generations`, PNG and base64 included (vLLM-Omni's benchmark, c=1) | 15.2 s |
+| the same through `/v1/images/generations`, PNG and base64 included (vLLM-Omni's benchmark, c=1, `--gemm-algos` from this card) | 15.2 s |
 | device memory while serving (the process, graphs captured) | 17.3 GiB |
 | load from the f32 shards | 130 to 170 s |
 
@@ -70,7 +72,9 @@ Loading reads the f32 shards, converts them to bf16 on the host and hands them t
 
 By our count a step is about 67 TFLOP. A step keeps the card at its 300 W cap and, over a picture, near 87 °C; the SM clock moves with the power each kernel draws, and bf16 tensor throughput with it (about 138 TFLOPS at 950 MHz). At that limit a kernel is as fast as its energy per multiply.
 
-So the decoder's GEMMs run on kern's `extern:cublaslt_bf16_tn_wide`, cuBLASLt's 256 x 128 tile without split-K; cuBLASLt's first choice is a 128 x 64 or 64 x 128 tile, and split-K for the down projection, where no wide tile is offered and the one it offers at k = 4096 is taken. Alternating whole pictures in one process, the wide tile made a picture 8.8% faster on gate|up (4097 x 24576 x 4096), 7.9% on the down projection (4097 x 4096 x 12288), and 2.8% and 2.7% on Q|K|V and the output projection. Timing the GEMMs alone, or four layers of a step, ranked the candidates otherwise and picked none of these, so the rule is fixed rather than tuned at load.
+So the decoder's GEMMs run on algorithms measured on the card. `pega-omni hidream-o1-tune-gemms --model-path <ckpt> --out <file>` (`src/tune.rs`) takes cuBLASLt's candidates without a split reduction for each of the four shapes, keeps the largest group whose outputs are bitwise one (so the winner changes the speed and not the picture), and times them as whole `predict` steps of real pictures: one shape at a time, largest first, each candidate in turn over three rounds, the lowest median wins. Timing the GEMMs alone, or four layers of a step, ranked the candidates otherwise. The file records the GPU and cuBLASLt version and `--gemm-algos <file>` pins its algorithms in the manifest (kern's `algo`); a file from another GPU or cuBLASLt is refused, and without one cuBLASLt's heuristic runs.
+
+On this card tuning takes about 8 minutes and every shape settles on cuBLASLt's 256 x 128 tile (`algo 6 tile 24`), where its first choice is a 128 x 64 or 64 x 128 tile, or split-K for the down projection. Alternating whole pictures in one process, that tile made a picture 8.8% faster on gate|up (4097 x 24576 x 4096), 7.9% on the down projection (4097 x 4096 x 12288), and 2.8% and 2.7% on Q|K|V and the output projection. Through the server, alternating runs (vLLM-Omni's benchmark, c=1, 10 prompts): 15.56 and 15.55 s pinned against 19.65 and 19.67 s on the heuristic. On a GH200 (900 W, CUDA 13.1) the candidates of each shape are all bitwise one and within 2% of each other, and pinning changes nothing: 4.24 and 4.25 s pinned, 4.24 and 4.24 s on the heuristic.
 
 The attention kernel is 4.5% slower than FlashInfer's FA2 at this shape timed alone (1.73 against 1.66 ms for 4097 queries over 4130 keys, the same numerics against an f32 reference) and 2% faster over whole pictures alternated in one process (15.39 against 15.70 s). Through the server, alternating runs of vLLM-Omni's benchmark (c=1, 10 prompts), per picture: 15.84 and 15.87 s on the same GEMM tiles with FlashInfer attention and no graphs, 15.28 and 15.26 s as the kern manifest.
 

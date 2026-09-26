@@ -23,7 +23,8 @@ tools/hidream_o1/vs_vllm_omni.sh serve-vllm-omni &
 tools/hidream_o1/vs_vllm_omni.sh bench vllm-omni vllm-omni    # then stop the server
 
 cargo build --release -p omni-server --features hidream-o1
-tools/hidream_o1/vs_vllm_omni.sh serve-pega-omni &
+target/release/pega-omni hidream-o1-tune-gemms --model-path "$MODEL" --out gemm-algos.json
+tools/hidream_o1/vs_vllm_omni.sh serve-pega-omni --gemm-algos gemm-algos.json &
 tools/hidream_o1/vs_vllm_omni.sh bench pega-omni pega-omni
 ```
 

@@ -68,7 +68,9 @@ same way, also with the CUDA toolkit:
 
 ```bash
 cargo build --release -p omni-server --features hidream-o1
-target/release/pega-omni hidream-o1 --model-path HiDream-O1-Image-Dev-2604
+# Once per GPU: the decoder GEMMs' algorithms measured on this card (docs/hidream-o1.md, Performance).
+target/release/pega-omni hidream-o1-tune-gemms --model-path HiDream-O1-Image-Dev-2604 --out gemm-algos.json
+target/release/pega-omni hidream-o1 --model-path HiDream-O1-Image-Dev-2604 --gemm-algos gemm-algos.json
 
 curl -s localhost:8000/v1/images/generations -H 'content-type: application/json' \
   -d '{"model":"HiDream-O1-Image-Dev-2604","prompt":"A lighthouse on a cliff at dawn.","size":"2048x2048",

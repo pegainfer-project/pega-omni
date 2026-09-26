@@ -5,15 +5,18 @@
 //! 32 x 32 RGB patches, each one token in the same sequence as the prompt, and
 //! every denoising step is one forward of that sequence. The model and its
 //! sampler run as one kern manifest over our own kernels (`kernels/hidream.cu`)
-//! and cuBLASLt ([`model`]). The distilled checkpoints (`-Dev`, `-Dev-2604`)
+//! and cuBLASLt ([`model`]), the decoder GEMMs on algorithms measured on the
+//! card ([`gemm`], [`tune`]). The distilled checkpoints (`-Dev`, `-Dev-2604`)
 //! sample in 28 steps without guidance ([`sampler`]). [`prompt`] builds the
 //! sequence and its M-RoPE positions, [`weights`] reads the f32 shards, and
 //! [`engine`] serves requests behind the image contract of `omni-engine`.
 
 pub mod config;
 pub mod engine;
+pub mod gemm;
 mod manifest;
 pub mod model;
 pub mod prompt;
 pub mod sampler;
+pub mod tune;
 pub mod weights;
