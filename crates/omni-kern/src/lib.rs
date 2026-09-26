@@ -98,14 +98,26 @@ impl Gen {
     /// One kernel launch as its own op, `args` typed by param. `entry` is
     /// `<module>_<kernel>`.
     pub fn launch(&mut self, label: &str, entry: &str, grid: [Value; 3], block: u32, args: Vec<(&str, Value)>) {
+        self.launch_shared(label, entry, grid, block, 0, args);
+    }
+
+    /// [`Gen::launch`] with `smem` bytes of dynamic shared memory.
+    pub fn launch_shared(
+        &mut self,
+        label: &str,
+        entry: &str,
+        grid: [Value; 3],
+        block: u32,
+        smem: usize,
+        args: Vec<(&str, Value)>,
+    ) {
         let module = entry.split('_').next().expect("an entry name");
         let params: Vec<&str> = args.iter().map(|(t, _)| *t).collect();
-        self.ops.insert(
-            label.into(),
-            json!({"params": params, "impl": {"launches": [
-                {"module": module, "entry": entry, "block": [block, 1, 1], "grid": grid, "pdl": self.pdl.contains(&module)}
-            ]}}),
-        );
+        let mut launch = json!({"module": module, "entry": entry, "block": [block, 1, 1], "grid": grid, "pdl": self.pdl.contains(&module)});
+        if smem > 0 {
+            launch["shared_mem"] = json!(smem);
+        }
+        self.ops.insert(label.into(), json!({"params": params, "impl": {"launches": [launch]}}));
         let args: Vec<Value> = args.into_iter().map(|(_, v)| v).collect();
         self.calls.push(json!({"label": label, "op": label, "args": args}));
     }
@@ -139,8 +151,26 @@ impl Gen {
     }
 
     /// `y = x · wᵀ` over `rows` rows, every operand a call argument (a buffer, maybe at an offset).
-    pub fn gemm_rows(&mut self, label: &str, (y, x, w): (Value, Value, Value), rows: Value, (n, k): (usize, usize)) {
-        self.calls.push(json!({"label": label, "op": "gemm", "args": [x, w, y, rows, {"i32": n}, {"i32": k}]}));
+    pub fn gemm_rows(&mut self, label: &str, operands: (Value, Value, Value), rows: Value, shape: (usize, usize)) {
+        self.gemm_rows_on("gemm", label, operands, rows, shape);
+    }
+
+    /// [`Gen::gemm_rows`] on the GEMM op `op` ([`Gen::gemm_op`]).
+    pub fn gemm_rows_on(
+        &mut self,
+        op: &str,
+        label: &str,
+        (y, x, w): (Value, Value, Value),
+        rows: Value,
+        (n, k): (usize, usize),
+    ) {
+        self.calls.push(json!({"label": label, "op": op, "args": [x, w, y, rows, {"i32": n}, {"i32": k}]}));
+    }
+
+    /// A bf16 `y = x · wᵀ` op of its own `extern:cublaslt_bf16_tn` launches,
+    /// e.g. one per `when` range with a pinned `algo`.
+    pub fn gemm_op(&mut self, name: &str, launches: Vec<Value>) {
+        self.ops.insert(name.into(), gemm_op(launches, "out buffer<bf16>"));
     }
 
     pub fn need(&mut self, workspace: &str, width: usize) {
@@ -167,12 +197,18 @@ impl Gen {
         for (name, w) in &self.widths {
             self.buffers.insert(name.clone(), json!({"dtype": "bf16", "shape": ["seqs", w], "kind": "workspace"}));
         }
-        let gemm = |entry: &str, y: &str| {
-            json!({"params": ["in buffer<bf16>", "in buffer<bf16>", y, "i32", "i32", "i32"],
-                   "impl": {"launches": [{"entry": entry}]}})
+        // Only the GEMM ops a call names: the verifier refuses an op no program calls.
+        let called = |op: &str| {
+            programs.values().flat_map(|p| p["calls"].as_array().into_iter().flatten()).any(|c| c["op"] == op)
         };
-        self.ops.insert("gemm".into(), gemm("extern:cublaslt_bf16_tn", "out buffer<bf16>"));
-        self.ops.insert("gemm_acc".into(), gemm("extern:cublaslt_bf16_tn_acc", "inout buffer<bf16>"));
+        for (op, entry, y) in [
+            ("gemm", "extern:cublaslt_bf16_tn", "out buffer<bf16>"),
+            ("gemm_acc", "extern:cublaslt_bf16_tn_acc", "inout buffer<bf16>"),
+        ] {
+            if called(op) {
+                self.ops.insert(op.into(), gemm_op(vec![json!({"entry": entry})], y));
+            }
+        }
         s
     }
 
@@ -180,6 +216,11 @@ impl Gen {
     pub fn into_parts(self) -> (serde_json::Map<String, Value>, serde_json::Map<String, Value>, HostTensors) {
         (self.buffers, self.ops, HostTensors(self.tensors))
     }
+}
+
+/// A bf16 GEMM op over `launches`, its output param typed `y`.
+fn gemm_op(launches: Vec<Value>, y: &str) -> Value {
+    json!({"params": ["in buffer<bf16>", "in buffer<bf16>", y, "i32", "i32", "i32"], "impl": {"launches": launches}})
 }
 
 /// `rows · n`: a number when `rows` is one, else a var expression.

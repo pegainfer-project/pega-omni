@@ -28,15 +28,16 @@ check belongs in CI.
   `omni-kern`'s builder), `kernels/*.cu` the kernels they launch; `model.rs` is the runtime
   shell, `engine.rs` the scheduler. `tests/golden.rs` is the correctness
   oracle.
-- `crates/omni-kern`: what both GPU engines share: the manifest builder
+- `crates/omni-kern`: what the GPU engines share: the manifest builder
   (`Gen`), weight loading, `common.cuh`.
 - `crates/omni-personaplex`: PersonaPlex-7B (full duplex) as one manifest;
   `model.rs` the runtime shell, `engine.rs` the clock, `tests/golden.rs` the
   oracle.
 - `crates/omni-hidream-o1`: HiDream-O1-Image as one generated kern manifest.
-  `model.rs` emits the programs and is the runtime shell, `kernels/hidream.cu`
-  the kernels they launch, `sampler.rs` the schedule, `engine.rs` the loop.
-  `tests/golden.rs` is the correctness oracle.
+  `model.rs` emits the programs (through `omni-kern`'s builder) and is the
+  runtime shell, `kernels/hidream.cu` the kernels they launch, `gemm.rs` and
+  `tune.rs` the decoder GEMMs' pinned algorithms, `sampler.rs` the schedule,
+  `engine.rs` the loop. `tests/golden.rs` is the correctness oracle.
 - `crates/omni-server`: the `pega-omni` binary; one subcommand per engine.
 - `crates/omni-bench`: the load generator; `playback.rs` is the underrun model.
 - `tools/openai_sdk_check.py` (`openai_images_check.py` for images): the

@@ -1716,6 +1716,7 @@ dependencies = [
  "kern-runtime",
  "memmap2",
  "omni-engine",
+ "omni-kern",
  "safetensors",
  "serde",
  "serde_json",

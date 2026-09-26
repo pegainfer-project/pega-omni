@@ -17,6 +17,8 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 
+use crate::config::Text;
+
 /// A GEMM's weight shape, `(n, k)`: `y[rows, n] = x[rows, k] · w[n, k]ᵀ`.
 pub type Shape = (usize, usize);
 
@@ -31,6 +33,14 @@ pub enum Gemms {
     /// Every candidate of each shape as a launch of its own, run while the
     /// shape's var ([`name`]) holds its index from 1: what tuning times.
     Candidates(BTreeMap<Shape, Vec<GemmAlgo>>),
+}
+
+/// The step's decoder GEMM shapes, largest first.
+pub fn step_shapes(cfg: &Text) -> Vec<Shape> {
+    let (h, d, inter) = (cfg.hidden_size, cfg.head_dim, cfg.intermediate_size);
+    let mut shapes = vec![(cfg.qkv_width(), h), (h, cfg.num_attention_heads * d), (2 * inter, h), (h, inter)];
+    shapes.sort_by_key(|&(n, k)| std::cmp::Reverse(n * k));
+    shapes
 }
 
 /// A step GEMM's op, and the var that picks its candidate.

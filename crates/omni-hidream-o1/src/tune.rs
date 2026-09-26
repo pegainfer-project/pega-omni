@@ -36,6 +36,7 @@ use crate::gemm::Pins;
 use crate::gemm::Shape;
 use crate::gemm::candidates;
 use crate::gemm::name;
+use crate::gemm::step_shapes;
 use crate::model::Limits;
 use crate::model::Model;
 use crate::prompt;
@@ -44,14 +45,6 @@ use crate::sampler;
 
 const ROUNDS: usize = 3;
 const PROMPT: &str = "A lighthouse on a rocky coast at dusk, waves breaking below, warm light in the window";
-
-/// The step's decoder GEMM shapes, largest first.
-pub fn step_shapes(cfg: &Text) -> Vec<Shape> {
-    let (h, d, inter) = (cfg.hidden_size, cfg.head_dim, cfg.intermediate_size);
-    let mut shapes = vec![(cfg.qkv_width(), h), (h, cfg.num_attention_heads * d), (2 * inter, h), (h, inter)];
-    shapes.sort_by_key(|&(n, k)| std::cmp::Reverse(n * k));
-    shapes
-}
 
 /// A deterministic probe value in `-1..1`, times `2^e` with `e` in `-12..=12` when `wide`.
 fn probe(i: usize, seed: u32, wide: bool) -> f32 {

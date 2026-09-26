@@ -14,7 +14,6 @@
 pub mod config;
 pub mod engine;
 pub mod gemm;
-mod manifest;
 pub mod model;
 pub mod prompt;
 pub mod sampler;

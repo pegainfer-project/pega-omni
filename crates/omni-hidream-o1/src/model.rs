@@ -41,6 +41,22 @@ use anyhow::ensure;
 use half::bf16;
 use kern_runtime::Capacity;
 use kern_runtime::Runtime;
+use omni_kern::Gen;
+use omni_kern::HostTensors;
+use omni_kern::buf;
+use omni_kern::buf_at;
+use omni_kern::count;
+use omni_kern::f32a;
+use omni_kern::hex;
+use omni_kern::i32a;
+use omni_kern::inb;
+use omni_kern::inf;
+use omni_kern::ini;
+use omni_kern::ints;
+use omni_kern::io;
+use omni_kern::kernels_dir;
+use omni_kern::outb;
+use omni_kern::weights::concat_rows;
 use serde_json::Value;
 use serde_json::json;
 use sha2::Digest;
@@ -49,29 +65,14 @@ use crate::config::PATCH_DIM;
 use crate::config::TIMESTEP_FREQUENCIES;
 use crate::config::Text;
 use crate::gemm::Gemms;
-use crate::manifest::Gen;
-use crate::manifest::HostTensors;
-use crate::manifest::arg;
-use crate::manifest::arg_at;
-use crate::manifest::buf;
-use crate::manifest::buf_at;
-use crate::manifest::count;
-use crate::manifest::f32a;
-use crate::manifest::hex;
-use crate::manifest::i32a;
-use crate::manifest::kernels_dir;
-use crate::manifest::rows_arg;
+use crate::gemm::name;
+use crate::gemm::step_shapes;
 use crate::prompt;
 use crate::weights::Checkpoint;
-use crate::weights::concat_rows;
 
 const HIDREAM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hidream.cubin"));
 
 const THREADS: u32 = 256;
-const BF: &str = "in buffer<bf16>";
-const BF_OUT: &str = "out buffer<bf16>";
-const BF_IO: &str = "inout buffer<bf16>";
-const I32: &str = "in buffer<i32>";
 
 /// What one runtime is sized for.
 #[derive(Clone, Copy, Debug)]
@@ -92,10 +93,6 @@ pub struct Model {
     picks: BTreeMap<String, u64>,
 }
 
-fn ints(v: &[i32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-
 fn floats(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -111,7 +108,7 @@ impl Model {
         let (manifest, tensors) = generate(dir, &cfg, &sha, limits, gemms)?;
         let verified = kern_manifest::verify(kern_manifest::Manifest::from_json(&manifest.to_string())?)
             .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
-        let kernels = kernels_dir(&sha, HIDREAM)?;
+        let kernels = kernels_dir(&[("hidream", &sha, HIDREAM)])?;
         let mut rt =
             Runtime::load(&verified, Some(&kernels), device, Some(Capacity { tokens: Some(1), seqs: 1 }), None)?;
         rt.load_weights(&tensors)?;
@@ -334,25 +331,27 @@ impl Tower<'_> {
         g.launch(
             &format!("{label}.norm0"),
             "hidream_norm_copy",
-            (per_row.clone(), norm, 0),
-            vec![arg(BF, "h"), arg(BF, &self.layers[0].ln1), arg(BF_OUT, "h"), arg(BF_OUT, "res"), i32a(h), f32a(eps)],
+            per_row.clone(),
+            norm,
+            vec![inb("h"), inb(&self.layers[0].ln1), outb("h"), outb("res"), i32a(h), f32a(eps)],
         );
         for (i, l) in self.layers.iter().enumerate() {
             let at = |s: &str| format!("{label}.l{i}.{s}");
-            g.gemm(&at("qkv"), (buf("qkv"), buf("h"), buf(&l.qkv)), n.clone(), (qkv_w, h), pass.step);
+            gemm(g, &at("qkv"), (buf("qkv"), buf("h"), buf(&l.qkv)), n.clone(), (qkv_w, h), pass.step);
             g.launch(
                 &at("rope"),
                 "hidream_qk_rope",
-                ([rows.clone(), json!((hq + 2 * hk).div_ceil(8)), json!(1)], THREADS, 0),
+                [rows.clone(), json!((hq + 2 * hk).div_ceil(8)), json!(1)],
+                THREADS,
                 vec![
-                    arg(BF_IO, "qkv"),
+                    io("qkv"),
                     i32a(qkv_w),
-                    arg(BF, &l.q_norm),
-                    arg(BF, &l.k_norm),
-                    arg(I32, pass.positions),
-                    arg(I32, pass.slots),
-                    arg(BF_IO, &format!("k{i}")),
-                    arg(BF_IO, &format!("v{i}")),
+                    inb(&l.q_norm),
+                    inb(&l.k_norm),
+                    ini(pass.positions),
+                    ini(pass.slots),
+                    io(&format!("k{i}")),
+                    io(&format!("v{i}")),
                     i32a(hq),
                     i32a(hk),
                     i32a(c.mrope_hw()),
@@ -361,44 +360,49 @@ impl Tower<'_> {
                 ],
             );
             let blocks = json!({"ceil_div": [{"mul": [rows, 4]}, 128]});
-            g.launch(
+            g.launch_shared(
                 &at("attn"),
                 "hidream_attend",
-                ([blocks, json!(hk), json!(1)], THREADS, 4 * 64 * 128 * 2),
+                [blocks, json!(hk), json!(1)],
+                THREADS,
+                4 * 64 * 128 * 2,
                 vec![
-                    arg(BF, "qkv"),
-                    arg(BF, &format!("k{i}")),
-                    arg(BF, &format!("v{i}")),
-                    arg(BF_OUT, "attn"),
+                    inb("qkv"),
+                    inb(&format!("k{i}")),
+                    inb(&format!("v{i}")),
+                    outb("attn"),
                     rows_arg(rows),
-                    arg(I32, pass.kv_len),
+                    ini(pass.kv_len),
                     i32a(qkv_w),
                     i32a(pass.causal as i32),
                     f32a((d as f32).powf(-0.5) * std::f32::consts::LOG2_E),
                 ],
             );
-            g.gemm(&at("o"), (buf("h"), buf("attn"), buf(&l.o)), n.clone(), (h, hq * d), pass.step);
+            gemm(g, &at("o"), (buf("h"), buf("attn"), buf(&l.o)), n.clone(), (h, hq * d), pass.step);
             g.launch(
                 &at("post_attn_norm"),
                 "hidream_add_norm",
-                (per_row.clone(), norm, 0),
-                vec![arg(BF, "h"), arg(BF_IO, "res"), arg(BF, &l.ln2), arg(BF_OUT, "h"), i32a(h), f32a(eps)],
+                per_row.clone(),
+                norm,
+                vec![inb("h"), io("res"), inb(&l.ln2), outb("h"), i32a(h), f32a(eps)],
             );
-            g.gemm(&at("gate_up"), (buf("gate_up"), buf("h"), buf(&l.gate_up)), n.clone(), (2 * inter, h), pass.step);
+            gemm(g, &at("gate_up"), (buf("gate_up"), buf("h"), buf(&l.gate_up)), n.clone(), (2 * inter, h), pass.step);
             let groups = json!({"mul": [rows, inter / 8]});
             g.launch(
                 &at("silu_mul"),
                 "hidream_silu_mul",
-                ([json!({"ceil_div": [groups.clone(), THREADS]}), json!(1), json!(1)], THREADS, 0),
-                vec![arg(BF, "gate_up"), arg(BF_OUT, "act"), i32a(inter), ("i32", json!({"expr": groups}))],
+                [json!({"ceil_div": [groups.clone(), THREADS]}), json!(1), json!(1)],
+                THREADS,
+                vec![inb("gate_up"), outb("act"), i32a(inter), ("i32", json!({"expr": groups}))],
             );
-            g.gemm(&at("down"), (buf("h"), buf("act"), buf(&l.down)), n.clone(), (h, inter), pass.step);
+            gemm(g, &at("down"), (buf("h"), buf("act"), buf(&l.down)), n.clone(), (h, inter), pass.step);
             let next = self.layers.get(i + 1).map_or(&self.norm, |n| &n.ln1);
             g.launch(
                 &at("next_norm"),
                 "hidream_add_norm",
-                (per_row.clone(), norm, 0),
-                vec![arg(BF, "h"), arg(BF_IO, "res"), arg(BF, next), arg(BF_OUT, "h"), i32a(h), f32a(eps)],
+                per_row.clone(),
+                norm,
+                vec![inb("h"), io("res"), inb(next), outb("h"), i32a(h), f32a(eps)],
             );
         }
     }
@@ -413,8 +417,15 @@ fn bias_act(g: &mut Gen, label: &str, (x, offset): (&str, usize), bias: &str, (r
     g.launch(
         label,
         "hidream_bias_act",
-        ([json!({"ceil_div": [total.clone(), THREADS]}), json!(1), json!(1)], THREADS, 0),
-        vec![arg_at(BF_IO, x, offset), arg(BF, bias), i32a(cols), i32a(act), ("i32", json!({"expr": total}))],
+        [json!({"ceil_div": [total.clone(), THREADS]}), json!(1), json!(1)],
+        THREADS,
+        vec![
+            arg_at("inout buffer<bf16>", x, offset),
+            inb(bias),
+            i32a(cols),
+            i32a(act),
+            ("i32", json!({"expr": total})),
+        ],
     );
 }
 
@@ -446,8 +457,9 @@ fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits, gemms: &Gemms) ->
     g.launch(
         "prefill.embed",
         "hidream_embed",
-        ([json!("text"), json!(1), json!(1)], (h / 8) as u32, 0),
-        vec![arg(I32, "ids"), arg(BF, &embed), arg(BF_OUT, "h"), i32a(h)],
+        [json!("text"), json!(1), json!(1)],
+        (h / 8) as u32,
+        vec![ini("ids"), inb(&embed), outb("h"), i32a(h)],
     );
     let text_pass = Pass {
         label: "prefill",
@@ -463,26 +475,19 @@ fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits, gemms: &Gemms) ->
 
     // predict: the timestep slot into row 0, the patches of `z` into rows 1.., the tower, x0.
     let n = json!({"mul": ["patches", PATCH_DIM]});
-    g.gemm(
+    g.gemm_rows(
         "predict.t_fc1",
         (buf("t_hidden"), buf("freq"), buf(&t_fc1)),
         json!({"i32": 1}),
         (h, TIMESTEP_FREQUENCIES),
-        false,
     );
     bias_act(&mut g, "predict.t_fc1.bias", ("t_hidden", 0), &t_fc1_b, (json!(1), h), 1);
-    g.gemm("predict.t_fc2", (buf("h"), buf("t_hidden"), buf(&t_fc2)), json!({"i32": 1}), (h, h), false);
+    g.gemm_rows("predict.t_fc2", (buf("h"), buf("t_hidden"), buf(&t_fc2)), json!({"i32": 1}), (h, h));
     bias_act(&mut g, "predict.t_fc2.bias", ("h", 0), &t_fc2_b, (json!(1), h), 0);
     let patches = json!("patches");
     let np = count(&patches);
-    g.gemm("predict.x_proj1", (buf("bottleneck"), buf("z"), buf(&x_proj1)), np.clone(), (bottleneck, PATCH_DIM), false);
-    g.gemm(
-        "predict.x_proj2",
-        (buf_at("h", h * 2), buf("bottleneck"), buf(&x_proj2)),
-        np.clone(),
-        (h, bottleneck),
-        false,
-    );
+    g.gemm_rows("predict.x_proj1", (buf("bottleneck"), buf("z"), buf(&x_proj1)), np.clone(), (bottleneck, PATCH_DIM));
+    g.gemm_rows("predict.x_proj2", (buf_at("h", h * 2), buf("bottleneck"), buf(&x_proj2)), np.clone(), (h, bottleneck));
     bias_act(&mut g, "predict.x_proj2.bias", ("h", h * 2), &x_proj2_b, (patches.clone(), h), 0);
     let step_pass = Pass {
         label: "predict",
@@ -494,7 +499,7 @@ fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits, gemms: &Gemms) ->
         step: true,
     };
     tower.forward(&mut g, &step_pass);
-    g.gemm("predict.head", (buf("x0"), buf_at("h", h * 2), buf(&head)), np.clone(), (PATCH_DIM, h), false);
+    g.gemm_rows("predict.head", (buf("x0"), buf_at("h", h * 2), buf(&head)), np.clone(), (PATCH_DIM, h));
     bias_act(&mut g, "predict.head.bias", ("x0", 0), &head_b, (patches.clone(), PATCH_DIM), 0);
     let predict = g.take();
 
@@ -504,7 +509,8 @@ fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits, gemms: &Gemms) ->
         g.launch(
             label,
             "hidream_gaussian",
-            ([json!({"ceil_div": [quads.clone(), THREADS]}), json!(1), json!(1)], THREADS, 0),
+            [json!({"ceil_div": [quads.clone(), THREADS]}), json!(1), json!(1)],
+            THREADS,
             vec![arg("out buffer<f32>", "noise"), ("i32", json!({"expr": n.clone()})), arg("in buffer<u32>", "draw")],
         );
     };
@@ -512,32 +518,29 @@ fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits, gemms: &Gemms) ->
         g.launch(
             label,
             "hidream_flow_step",
-            ([json!({"ceil_div": [n.clone(), THREADS]}), json!(1), json!(1)], THREADS, 0),
+            [json!({"ceil_div": [n.clone(), THREADS]}), json!(1), json!(1)],
+            THREADS,
             vec![
-                arg(BF_IO, "z"),
-                arg(BF, x0),
-                arg("in buffer<f32>", noise),
+                io("z"),
+                inb(x0),
+                inf(noise),
                 arg("in buffer<u64>", "sums"),
                 ("i32", json!({"expr": n.clone()})),
-                arg("in buffer<f32>", "step"),
+                inf("step"),
             ],
         );
     };
     let zero = |g: &mut Gen, label: &str| {
-        g.launch(
-            label,
-            "hidream_zero_sums",
-            ([json!(1), json!(1), json!(1)], 2, 0),
-            vec![arg("out buffer<u64>", "sums")],
-        );
+        g.launch(label, "hidream_zero_sums", [json!(1), json!(1), json!(1)], 2, vec![arg("out buffer<u64>", "sums")]);
     };
     let moments = |g: &mut Gen, label: &str, noise: &str| {
         zero(g, &format!("{label}.zero"));
         g.launch(
             &format!("{label}.moments"),
             "hidream_moments",
-            ([json!(256), json!(1), json!(1)], THREADS, 0),
-            vec![arg("in buffer<f32>", noise), ("i32", json!({"expr": n.clone()})), arg("inout buffer<u64>", "sums")],
+            [json!(256), json!(1), json!(1)],
+            THREADS,
+            vec![inf(noise), ("i32", json!({"expr": n.clone()})), arg("inout buffer<u64>", "sums")],
         );
     };
     gaussian(&mut g, "start.noise");
@@ -555,15 +558,17 @@ fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits, gemms: &Gemms) ->
     g.launch(
         "set_z",
         "hidream_copy",
-        ([json!({"ceil_div": [groups.clone(), THREADS]}), json!(1), json!(1)], THREADS, 0),
-        vec![arg(BF, "z_in"), arg(BF_OUT, "z"), ("i32", json!({"expr": groups}))],
+        [json!({"ceil_div": [groups.clone(), THREADS]}), json!(1), json!(1)],
+        THREADS,
+        vec![inb("z_in"), outb("z"), ("i32", json!({"expr": groups}))],
     );
     let set_z = g.take();
     g.launch(
         "rgb",
         "hidream_rgb",
-        ([json!({"ceil_div": [n.clone(), THREADS]}), json!(1), json!(1)], THREADS, 0),
-        vec![arg(BF, "z"), arg("out buffer<u8>", "rgb"), arg(I32, "width"), ("i32", json!({"expr": n.clone()}))],
+        [json!({"ceil_div": [n.clone(), THREADS]}), json!(1), json!(1)],
+        THREADS,
+        vec![inb("z"), arg("out buffer<u8>", "rgb"), ini("width"), ("i32", json!({"expr": n.clone()}))],
     );
     let rgb = g.take();
 
@@ -616,7 +621,11 @@ fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits, gemms: &Gemms) ->
     programs.insert("advance_with".into(), json!({"calls": advance_with}));
     programs.insert("set_z".into(), json!({"calls": set_z}));
     programs.insert("rgb".into(), json!({"calls": rgb}));
-    let (buffers, ops, tensors) = g.into_parts(gemms);
+    for shape in step_shapes(cfg) {
+        g.gemm_op(&name(shape), gemms.launches(shape));
+    }
+    g.finish(&mut programs);
+    let (buffers, ops, tensors) = g.into_parts();
     let mut vars =
         json!({"text": {"max": max_text}, "patches": {"max": max_patches}, "rows": {"max": max_patches + 1}});
     vars.as_object_mut().expect("an object").extend(gemms.vars());
@@ -631,4 +640,27 @@ fn generate(dir: &Path, cfg: &Text, sha: &str, limits: Limits, gemms: &Gemms) ->
         "programs": programs,
     });
     Ok((manifest, tensors))
+}
+
+/// `y = x · wᵀ`; a step GEMM runs on its shape's op, whose algorithm [`Gemms`] sets.
+fn gemm(g: &mut Gen, label: &str, operands: (Value, Value, Value), rows: Value, shape: (usize, usize), step: bool) {
+    if step {
+        g.gemm_rows_on(&name(shape), label, operands, rows, shape);
+    } else {
+        g.gemm_rows(label, operands, rows, shape);
+    }
+}
+
+/// A row count as an `i32` argument.
+fn rows_arg(rows: &Value) -> (&'static str, Value) {
+    ("i32", count(rows))
+}
+
+/// An argument of `ty`, e.g. `("in buffer<bf16>", "h")`.
+fn arg(ty: &'static str, name: &str) -> (&'static str, Value) {
+    (ty, buf(name))
+}
+
+fn arg_at(ty: &'static str, name: &str, offset: usize) -> (&'static str, Value) {
+    (ty, buf_at(name, offset))
 }

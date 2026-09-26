@@ -6,51 +6,7 @@
 // What changes from one request or step to the next (key count, timestep,
 // noise draw, picture width) is read from device buffers, so a captured step
 // replays for every request of a grid size.
-#include <cuda_bf16.h>
-#include <stdint.h>
-
-using bf16 = __nv_bfloat16;
-
-namespace {
-
-__device__ __forceinline__ float f32(bf16 x) { return __bfloat162float(x); }
-__device__ __forceinline__ bf16 to_bf16(float x) { return __float2bfloat16(x); }
-__device__ __forceinline__ float round_bf16(float x) { return f32(to_bf16(x)); }
-
-__device__ __forceinline__ void load8(const bf16* p, float* v) {
-  const uint4 u = *reinterpret_cast<const uint4*>(p);
-  const bf16* e = reinterpret_cast<const bf16*>(&u);
-#pragma unroll
-  for (int k = 0; k < 8; ++k) v[k] = f32(e[k]);
-}
-
-__device__ __forceinline__ void store8(bf16* p, const float* v) {
-  uint4 u;
-  bf16* e = reinterpret_cast<bf16*>(&u);
-#pragma unroll
-  for (int k = 0; k < 8; ++k) e[k] = to_bf16(v[k]);
-  *reinterpret_cast<uint4*>(p) = u;
-}
-
-__device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-  return v;
-}
-
-__device__ __forceinline__ float block_sum(float v) {
-  __shared__ float partial[32];
-  v = warp_sum(v);
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  if (lane == 0) partial[warp] = v;
-  __syncthreads();
-  v = lane < (int)(blockDim.x >> 5) ? partial[lane] : 0.f;
-  v = warp_sum(v);
-  __syncthreads();
-  return v;
-}
-
-}  // namespace
+#include "common.cuh"
 
 // Row `ids[n]` of `table` into row `n` of `out`. One block of dim / 8 threads per row.
 extern "C" __global__ void hidream_embed(const int32_t* ids, const bf16* table, bf16* out, int dim) {
