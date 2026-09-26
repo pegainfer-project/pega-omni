@@ -13,7 +13,7 @@ use omni_sim::Profile;
 use omni_sim::live::LiveProfile;
 
 #[derive(Parser)]
-#[command(name = "pega-omni", version, about = "OpenAI-compatible speech serving")]
+#[command(name = "pega-omni", version, about = "OpenAI-compatible speech and image serving")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -25,12 +25,20 @@ enum Command {
     Sim(SimArgs),
     /// Serve the CPU-only simulated live (full-duplex) engine: it echoes the caller.
     SimLive(SimLiveArgs),
+    /// Serve the CPU-only simulated image engine.
+    SimImage(SimImageArgs),
     /// Serve Qwen3-TTS (12Hz CustomVoice) on one GPU.
     #[cfg(feature = "qwen3-tts")]
     Qwen3Tts(Qwen3TtsArgs),
     /// Serve PersonaPlex-7B, full duplex, on one GPU.
     #[cfg(feature = "personaplex")]
     Personaplex(PersonaplexArgs),
+    /// Serve HiDream-O1-Image (the distilled Dev checkpoints) on one GPU.
+    #[cfg(feature = "hidream-o1")]
+    HidreamO1(HidreamO1Args),
+    /// Measure HiDream-O1's decoder GEMM algorithms on one GPU and write them for `--gemm-algos`.
+    #[cfg(feature = "hidream-o1")]
+    HidreamO1TuneGemms(HidreamO1TuneArgs),
 }
 
 #[derive(Args)]
@@ -81,6 +89,20 @@ struct SimArgs {
     /// Added step cost per admitted input character, in microseconds.
     #[arg(long, default_value_t = 0)]
     prefill_per_char_us: u64,
+}
+
+#[derive(Args)]
+struct SimImageArgs {
+    #[command(flatten)]
+    serve: Serve,
+    #[arg(long, default_value = "pega-omni-sim-image")]
+    model: String,
+    /// Denoising steps per picture.
+    #[arg(long, default_value_t = 4)]
+    steps: u32,
+    /// Cost of one step, in milliseconds.
+    #[arg(long, default_value_t = 0)]
+    step_ms: u64,
 }
 
 #[derive(Args)]
@@ -234,6 +256,64 @@ impl PersonaplexArgs {
     }
 }
 
+#[cfg(feature = "hidream-o1")]
+#[derive(Args)]
+struct HidreamO1Args {
+    #[command(flatten)]
+    serve: Serve,
+    /// Checkpoint directory (config.json, model-*.safetensors, tokenizer.json).
+    #[arg(long)]
+    model_path: std::path::PathBuf,
+    /// The model name clients send; defaults to the checkpoint directory's name.
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    device: usize,
+    /// Pictures one request may ask for.
+    #[arg(long, default_value_t = 4)]
+    max_n: u32,
+    #[arg(long, default_value_t = omni_hidream_o1::engine::MAX_PROMPT_CHARS)]
+    max_prompt_chars: usize,
+    /// Decoder GEMM algorithms written by `hidream-o1-tune-gemms` on this GPU; cuBLASLt's heuristic without.
+    #[arg(long)]
+    gemm_algos: Option<std::path::PathBuf>,
+}
+
+#[cfg(feature = "hidream-o1")]
+#[derive(Args)]
+struct HidreamO1TuneArgs {
+    /// Checkpoint directory.
+    #[arg(long)]
+    model_path: std::path::PathBuf,
+    #[arg(long, default_value_t = 0)]
+    device: usize,
+    /// Where to write the algorithms.
+    #[arg(long)]
+    out: std::path::PathBuf,
+}
+
+#[cfg(feature = "hidream-o1")]
+impl HidreamO1Args {
+    fn start(&self) -> anyhow::Result<Started> {
+        use omni_hidream_o1::engine;
+        let name = self.model.clone().unwrap_or_else(|| {
+            self.model_path.file_name().map_or("hidream-o1".into(), |n| n.to_string_lossy().into_owned())
+        });
+        let (handle, thread) = engine::start(
+            self.device,
+            self.model_path.clone(),
+            name.clone(),
+            (self.max_n, self.max_prompt_chars),
+            self.serve.queue,
+            match &self.gemm_algos {
+                Some(path) => omni_hidream_o1::gemm::Pins::load(path, self.device)?,
+                None => omni_hidream_o1::gemm::Gemms::Heuristic,
+            },
+        )?;
+        Ok((handle.into(), thread, name))
+    }
+}
+
 impl SimArgs {
     fn profile(&self) -> anyhow::Result<Profile> {
         Profile {
@@ -266,6 +346,15 @@ fn main() -> anyhow::Result<()> {
             let (handle, inbox) = omni_engine::live::live_channel(profile.info(&args.model), args.serve.queue);
             (args.serve, (handle.into(), omni_sim::live::spawn_live(inbox, profile), args.model))
         }
+        Command::SimImage(args) => {
+            let profile = omni_sim::image::ImageProfile {
+                steps: args.steps,
+                step_cost: Duration::from_millis(args.step_ms),
+                ..Default::default()
+            };
+            let (handle, inbox) = omni_engine::image::channel(profile.info(&args.model), args.serve.queue);
+            (args.serve, (handle.into(), omni_sim::image::spawn(inbox, profile), args.model))
+        }
         #[cfg(feature = "qwen3-tts")]
         Command::Qwen3Tts(args) => {
             let started = args.start()?;
@@ -275,6 +364,16 @@ fn main() -> anyhow::Result<()> {
         Command::Personaplex(args) => {
             let started = args.start()?;
             (args.serve, started)
+        }
+        #[cfg(feature = "hidream-o1")]
+        Command::HidreamO1(args) => {
+            let started = args.start()?;
+            (args.serve, started)
+        }
+        #[cfg(feature = "hidream-o1")]
+        Command::HidreamO1TuneGemms(args) => {
+            let limits = omni_hidream_o1::engine::limits(omni_hidream_o1::engine::MAX_PROMPT_CHARS);
+            return omni_hidream_o1::tune::tune(args.device, &args.model_path, limits, &args.out);
         }
     };
     let serve = &serve;

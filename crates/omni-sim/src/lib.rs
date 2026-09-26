@@ -1,4 +1,5 @@
-//! A CPU-only speech engine with the timing shape of a codec-frame TTS model.
+//! A CPU-only speech engine with the timing shape of a codec-frame TTS model;
+//! [`image`] is the image counterpart.
 //!
 //! The sim exists to load the front end without a GPU: it admits requests in
 //! FIFO order into a bounded batch, generates one codec frame per running
@@ -38,6 +39,8 @@ use omni_engine::Finish;
 use omni_engine::Inbox;
 use omni_engine::Speech;
 use tokio::sync::mpsc::UnboundedSender;
+
+pub mod image;
 
 /// The sim's timing and chunking model.
 #[derive(Clone, Debug, PartialEq)]

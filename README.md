@@ -4,7 +4,7 @@
 
 <h1 align="center">pega-omni</h1>
 
-<p align="center">OpenAI-compatible speech serving in Rust, from the <a href="https://github.com/pegainfer-project/pegainfer">pegainfer</a> project.</p>
+<p align="center">OpenAI-compatible speech and image serving in Rust, from the <a href="https://github.com/pegainfer-project/pegainfer">pegainfer</a> project.</p>
 
 <p align="center">
   <a href="docs/qwen3-tts-vs-vllm-omni.md"><img src="assets/qwen3-tts-vs-vllm-omni.png" width="800" alt="pega-omni vs vLLM-Omni: 6.6x faster first audio, 2.5x the throughput"></a>
@@ -26,11 +26,12 @@ OpenAI's GPT-Live WebSocket protocol on a clock that never drifts, with all
 sessions in one CUDA graph per tick ([docs/duplex.md](docs/duplex.md)).
 
 The repository holds the serving front end, the engine contracts, CPU-only
-simulated engines used to load-test the front end, and two GPU engines:
+simulated engines used to load-test the front end, and three GPU engines:
 Qwen3-TTS-12Hz-1.7B-CustomVoice ([docs/qwen3-tts.md](docs/qwen3-tts.md)) for
-speech, and NVIDIA PersonaPlex-7B ([docs/personaplex.md](docs/personaplex.md))
+speech, NVIDIA PersonaPlex-7B ([docs/personaplex.md](docs/personaplex.md))
 for full duplex: **128 concurrent live sessions on one GB300 with no playback
-stall**.
+stall**, and HiDream-O1-Image ([docs/hidream-o1.md](docs/hidream-o1.md)), a
+pixel-space diffusion transformer, for OpenAI's `POST /v1/images/generations`.
 
 ## Quick start
 
@@ -62,6 +63,20 @@ target/release/pega-omni personaplex --model-path personaplex-7b-v1
 # open http://127.0.0.1:8000/ (tunnel with ssh -L 8000:127.0.0.1:8000 for a remote GPU)
 ```
 
+HiDream-O1-Image (the distilled `-Dev-2604` checkpoint) serves text to image the
+same way, also with the CUDA toolkit:
+
+```bash
+cargo build --release -p omni-server --features hidream-o1
+# Once per GPU: the decoder GEMMs' algorithms measured on this card (docs/hidream-o1.md, Performance).
+target/release/pega-omni hidream-o1-tune-gemms --model-path HiDream-O1-Image-Dev-2604 --out gemm-algos.json
+target/release/pega-omni hidream-o1 --model-path HiDream-O1-Image-Dev-2604 --gemm-algos gemm-algos.json
+
+curl -s localhost:8000/v1/images/generations -H 'content-type: application/json' \
+  -d '{"model":"HiDream-O1-Image-Dev-2604","prompt":"A lighthouse on a cliff at dawn.","size":"2048x2048",
+       "extra":{"seed":42}}' | jq -r '.data[0].b64_json' | base64 -d > lighthouse.png
+```
+
 Any OpenAI client works unchanged:
 
 ```python
@@ -83,6 +98,7 @@ with client.audio.speech.with_streaming_response.create(
 | `GET /v1/live/sessions` | GPT-Live WebSocket, as the official `openai` SDK's `client.live.connect()` speaks it: `session.start` (PCM16 at 24 or 16 kHz, or G.711), `session.input_audio.append`, mute, `session.close`; `session.output_audio.delta` and `session.output_transcript.delta` on the agent's timeline ([docs/duplex.md](docs/duplex.md#protocol)) |
 | `GET /` | the live demo page |
 | `GET /live/config`, `GET /live/stats` | what the demo reads: the live engine's defaults, and its load as counters (sessions, ticks, tick compute time, late ticks) |
+| `POST /v1/images/generations` | image engines only: `model`, `prompt`, `n`, `size` (one the model generates, or `auto`), `response_format` (`b64_json`), `output_format` (`png`) |
 | `GET /v1/models` | the served model |
 | `GET /v1/audio/voices` | the engine's voices |
 | `GET /metrics` | Prometheus: requests by outcome, TTFP, end-to-end latency, audio samples, engine queue |
@@ -100,17 +116,21 @@ differs from OpenAI, it says so instead of guessing:
 - `stream` (not OpenAI's; vLLM clients such as `vllm bench serve` send it) is
   accepted and changes nothing: every response streams.
 - A full engine queue is an immediate `429`, never a wait in the front end.
+- Images come back as base64 PNG once every picture is done; `response_format:
+  url`, other `output_format`s and `stream: true` are refused by name, and
+  `seed` goes in `extra`. `pega-omni sim-image` serves an image simulator.
 
 ## Layout
 
 | Crate | |
 |---|---|
-| `omni-engine` | the contracts: `Speech`, `Event`, `Handle` / `Inbox`; `live`: sessions, the jitter buffer, the clock and `drive`, the loop every live engine runs |
-| `omni-frontend` | axum routes, request parsing, wav / pcm / SSE framing, metrics |
-| `omni-sim` | the simulated engines (speech and live): pure cores plus thread shells |
+| `omni-engine` | the contracts: `Speech`, `Event`, `Handle` / `Inbox`; `live`: sessions, the jitter buffer, the clock and `drive`, the loop every live engine runs; `image`: `Generation`, its `Event`, `Handle` / `Inbox` |
+| `omni-frontend` | axum routes, request parsing, wav / pcm / SSE framing, PNG, metrics |
+| `omni-sim` | the simulated engines (speech, live and image): pure cores plus thread shells |
 | `omni-kern` | the kern manifest builder, weight loading and CUDA helpers the GPU engines share |
 | `omni-qwen3-tts` | Qwen3-TTS as one kern manifest (talker, code predictor, sampler, streaming codec decoder, own CUDA kernels), prompt, engine |
 | `omni-personaplex` | PersonaPlex-7B as one kern manifest (Mimi encoder, Helium, depformer, Mimi decoder, own CUDA kernels), prompt, tokenizer, live engine |
+| `omni-hidream-o1` | HiDream-O1-Image as one kern manifest (diffusion transformer, sampler, own CUDA kernels), sharded weights, prompt and M-RoPE, engine |
 | `omni-server` | the `pega-omni` binary |
 | `omni-bench` | load generator: TTFP, E2E, RTF, playback underrun; `duplex`: concurrent live sessions |
 
