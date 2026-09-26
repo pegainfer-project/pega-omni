@@ -21,14 +21,22 @@ check belongs in CI.
   chunks, step cost); `spawn` is the thread shell. Decisions go in `Sim`,
   where property tests reach them.
 - `crates/omni-qwen3-tts`: Qwen3-TTS as one generated kern manifest.
-  `manifest.rs` is the builder; `talker.rs`, `stack.rs` and `codec.rs` emit
-  the calls, `kernels/*.cu` the kernels they launch; `model.rs` is the runtime
+  `talker.rs`, `stack.rs` and `codec.rs` emit the calls (through
+  `omni-kern`'s builder), `kernels/*.cu` the kernels they launch; `model.rs` is the runtime
   shell, `engine.rs` the scheduler. `tests/golden.rs` is the correctness
+  oracle.
+- `crates/omni-kern`: what both GPU engines share: the manifest builder
+  (`Gen`), weight loading, `common.cuh`.
+- `crates/omni-personaplex`: PersonaPlex-7B (full duplex) as one manifest;
+  `model.rs` the runtime shell, `engine.rs` the clock, `tests/golden.rs` the
   oracle.
 - `crates/omni-server`: the `pega-omni` binary; one subcommand per engine.
 - `crates/omni-bench`: the load generator; `playback.rs` is the underrun model.
 - `tools/openai_sdk_check.py`: the official SDK against a live server; it is
   the compatibility oracle, not our reading of the docs.
+- `tools/live_check.py`: the GPT-Live oracle, like the SDK check for speech.
+- `tools/personaplex/golden.py`: records the reference run
+  `omni-personaplex`'s golden test compares against.
 - `tools/qwen3_tts/`: `golden.py` records the official run the golden test
   compares against; `vs_vllm_omni.sh` and `chart.py` reproduce the README
   comparison.

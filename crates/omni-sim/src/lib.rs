@@ -15,6 +15,10 @@
 //! Requests that arrive during a step join the next one. A zero-cost profile
 //! runs steps back to back, which is how the front end's own ceiling is
 //! measured.
+//!
+//! [`live`] is the same idea for full-duplex sessions.
+
+pub mod live;
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;

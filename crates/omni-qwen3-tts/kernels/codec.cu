@@ -29,10 +29,6 @@ __device__ __forceinline__ void loadf8(const float* p, float* v) {
   v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w, v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
 }
 
-__device__ __forceinline__ void copy8(bf16* dst, const bf16* src) {
-  *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
-}
-
 // sin by the hardware approximation after a two-step reduction to [-π, π]
 // (absolute error ~4e-7 there): the accurate sinf's instruction count, not
 // memory, bounds every kernel that applies SnakeBeta.

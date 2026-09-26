@@ -25,73 +25,71 @@ use anyhow::ensure;
 use serde_json::json;
 
 use crate::config;
-use crate::manifest::Gen;
-use crate::manifest::f32a;
-use crate::manifest::i32a;
-use crate::manifest::inb;
-use crate::manifest::inf;
-use crate::manifest::ini;
-use crate::manifest::io;
-use crate::manifest::outb;
-use crate::manifest::per_seq;
-use crate::manifest::state_io;
-use crate::manifest::stride;
 use crate::talker::GROUPS;
-use crate::weights::File;
-use crate::weights::concat_rows;
-use crate::weights::conv_taps;
-use crate::weights::scale_rows;
-use crate::weights::transposed_taps;
+use omni_kern::Gen;
+use omni_kern::f32a;
+use omni_kern::i32a;
+use omni_kern::inb;
+use omni_kern::inf;
+use omni_kern::ini;
+use omni_kern::io;
+use omni_kern::outb;
+use omni_kern::per_seq;
+use omni_kern::state_io;
+use omni_kern::stride;
+use omni_kern::weights::File;
+use omni_kern::weights::concat_rows;
+use omni_kern::weights::conv_taps;
+use omni_kern::weights::scale_rows;
+use omni_kern::weights::transposed_taps;
 
 const KERNEL: usize = 7;
 
-impl Gen {
-    fn snake(&mut self, file: &File, prefix: &str, c: usize) -> Result<(String, String)> {
-        let alpha = file.expect(&format!("{prefix}.alpha"), &[c])?;
-        let beta = file.expect(&format!("{prefix}.beta"), &[c])?;
-        Ok((
-            self.weight_f32(&format!("{prefix}.a"), alpha.data.iter().map(|x| x.exp()).collect()),
-            self.weight_f32(&format!("{prefix}.inv_b"), beta.data.iter().map(|x| 1.0 / (x.exp() + 1e-9)).collect()),
-        ))
-    }
+fn snake_weights(g: &mut Gen, file: &File, prefix: &str, c: usize) -> Result<(String, String)> {
+    let alpha = file.expect(&format!("{prefix}.alpha"), &[c])?;
+    let beta = file.expect(&format!("{prefix}.beta"), &[c])?;
+    Ok((
+        g.weight_f32(&format!("{prefix}.a"), alpha.data.iter().map(|x| x.exp()).collect()),
+        g.weight_f32(&format!("{prefix}.inv_b"), beta.data.iter().map(|x| 1.0 / (x.exp() + 1e-9)).collect()),
+    ))
+}
 
-    /// `out = conv(act(x + bias))` for a causal conv of `k` taps dilated by
-    /// `d`, `act` SnakeBeta when given; the conv's own bias is left to its
-    /// consumer. `act(x + bias)` of the last `(k - 1)·d` rows is its history.
-    fn conv(
-        &mut self,
-        label: &str,
-        (x, bias, act): (&str, &str, Option<&(String, String)>),
-        (w, out): (&str, &'static str),
-        t: usize,
-        (cin, cout): (usize, usize),
-        (k, d): (usize, usize),
-    ) {
-        let h = (k - 1) * d;
-        let history = self.region(2 * h * cin * 2);
-        self.need("col", t * k * cin);
-        let mut args = vec![inb(x), inb(bias)];
-        let entry = match act {
-            Some((a, inv_b)) => {
-                args.extend([inf(a), inf(inv_b)]);
-                "codec_im2col_snake"
-            }
-            None => "codec_im2col",
-        };
-        args.extend([
-            state_io(history),
-            ini("pos"),
-            ini("lines"),
-            outb("col"),
-            i32a(t),
-            i32a(cin),
-            i32a(k),
-            i32a(d),
-            stride(),
-        ]);
-        self.each8(&format!("{label}.im2col"), entry, &json!("seqs"), (h + t) * cin, args);
-        self.gemm(&format!("{label}.gemm"), out, "col", w, t, (cout, k * cin));
-    }
+/// `out = conv(act(x + bias))` for a causal conv of `k` taps dilated by
+/// `d`, `act` SnakeBeta when given; the conv's own bias is left to its
+/// consumer. `act(x + bias)` of the last `(k - 1)·d` rows is its history.
+fn conv(
+    g: &mut Gen,
+    label: &str,
+    (x, bias, act): (&str, &str, Option<&(String, String)>),
+    (w, out): (&str, &'static str),
+    t: usize,
+    (cin, cout): (usize, usize),
+    (k, d): (usize, usize),
+) {
+    let h = (k - 1) * d;
+    let history = g.region(2 * h * cin * 2);
+    g.need("col", t * k * cin);
+    let mut args = vec![inb(x), inb(bias)];
+    let entry = match act {
+        Some((a, inv_b)) => {
+            args.extend([inf(a), inf(inv_b)]);
+            "codec_im2col_snake"
+        }
+        None => "codec_im2col",
+    };
+    args.extend([
+        state_io(history),
+        ini("pos"),
+        ini("lines"),
+        outb("col"),
+        i32a(t),
+        i32a(cin),
+        i32a(k),
+        i32a(d),
+        stride(),
+    ]);
+    g.each8(&format!("{label}.im2col"), entry, &json!("seqs"), (h + t) * cin, args);
+    g.gemm(&format!("{label}.gemm"), out, "col", w, t, (cout, k * cin));
 }
 
 /// `w[n, k] · v[k]`.
@@ -172,7 +170,7 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
     };
     let zeros = g.weight("zeros", &[dim], &vec![0.0; dim]);
     let (pre, pre_b) = conv_w(g, "decoder.pre_conv.conv", "pre_conv", [latent, dim, 3])?;
-    g.conv("pre_conv", ("a", &zeros, None), (&pre, "b"), 1, (dim, latent), (3, 1));
+    conv(g, "pre_conv", ("a", &zeros, None), (&pre, "b"), 1, (dim, latent), (3, 1));
 
     // Transformer over the frames, residual stream in `res`; pre_conv's bias
     // goes through input_proj.
@@ -346,7 +344,7 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
 
     let pending_w = g.weight("conv_in.in_b", &[latent], &pending);
     let (conv_in, conv_in_b) = conv_w(g, "decoder.decoder.0.conv", "conv_in", [cfg.decoder_dim, latent, KERNEL])?;
-    g.conv("conv_in", (cur, &pending_w, None), (&conv_in, tmp), t, (latent, cfg.decoder_dim), (KERNEL, 1));
+    conv(g, "conv_in", (cur, &pending_w, None), (&conv_in, tmp), t, (latent, cfg.decoder_dim), (KERNEL, 1));
     (cur, tmp) = (tmp, cur);
     let mut pending = conv_in_b;
 
@@ -356,7 +354,7 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
     for (i, &rate) in cfg.upsample_rates.iter().enumerate() {
         let p = format!("decoder.decoder.{}.block", i + 1);
         let (cin, cout) = (cfg.decoder_dim >> i, cfg.decoder_dim >> (i + 1));
-        let snake = g.snake(file, &format!("{p}.0"), cin)?;
+        let snake = snake_weights(g, file, &format!("{p}.0"), cin)?;
         let in_b = g.weight(&format!("b{i}.in_b"), &[cin], &pending);
         let up = file.expect(&format!("{p}.1.conv.weight"), &[cin, cout, 2 * rate])?;
         let up_w = g.weight(&format!("b{i}.up.w"), &[2 * rate * cout, cin], &transposed_taps(&up));
@@ -396,14 +394,14 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
         for (u, dilation) in [1, 3, 9].into_iter().enumerate() {
             let q = format!("{p}.{}", u + 2);
             let label = format!("b{i}.u{u}");
-            let s1 = g.snake(file, &format!("{q}.act1"), cout)?;
+            let s1 = snake_weights(g, file, &format!("{q}.act1"), cout)?;
             let (c1, c1_b) = conv_w(g, &format!("{q}.conv1.conv"), &format!("{label}.conv1"), [cout, cout, KERNEL])?;
             let c1_b = g.weight(&format!("{label}.conv1.b"), &[cout], &c1_b);
-            let s2 = g.snake(file, &format!("{q}.act2"), cout)?;
+            let s2 = snake_weights(g, file, &format!("{q}.act2"), cout)?;
             let (c2, c2_b) = conv_w(g, &format!("{q}.conv2.conv"), &format!("{label}.conv2"), [cout, cout, 1])?;
             let in_b = g.weight(&format!("{label}.in_b"), &[cout], &pending);
 
-            g.conv(&label, (cur, &in_b, Some(&s1)), (&c1, tmp), t, (cout, cout), (KERNEL, dilation));
+            conv(g, &label, (cur, &in_b, Some(&s1)), (&c1, tmp), t, (cout, cout), (KERNEL, dilation));
             g.each8(
                 &format!("{label}.snake2"),
                 "codec_bias_snake",
@@ -417,7 +415,7 @@ pub fn build(g: &mut Gen, file: &File, cfg: &config::Codec, spf: usize) -> Resul
     }
 
     let n = cfg.upsample_rates.len() + 1;
-    let snake_out = g.snake(file, &format!("decoder.decoder.{n}"), out_dim)?;
+    let snake_out = snake_weights(g, file, &format!("decoder.decoder.{n}"), out_dim)?;
     let in_b = g.weight("conv_out.in_b", &[out_dim], &pending);
     let (conv_out, conv_out_b) =
         conv_w(g, &format!("decoder.decoder.{}.conv", n + 1), "conv_out", [1, out_dim, KERNEL])?;

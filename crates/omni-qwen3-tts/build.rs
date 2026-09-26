@@ -20,11 +20,12 @@ fn main() {
         println!("cargo:rerun-if-env-changed={var}");
     }
     println!("cargo:rerun-if-changed=kernels");
+    println!("cargo:rerun-if-changed=../omni-kern/kernels");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let nvcc = nvcc();
     for name in ["codec", "talker"] {
         let status = Command::new(&nvcc)
-            .args(["-cubin", "-O3", "-std=c++17"])
+            .args(["-cubin", "-O3", "-std=c++17", "-I../omni-kern/kernels"])
             .arg(format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
             .arg("-o")
             .arg(out.join(format!("{name}.cubin")))

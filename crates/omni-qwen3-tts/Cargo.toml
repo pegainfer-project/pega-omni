@@ -6,14 +6,13 @@ license.workspace = true
 
 [dependencies]
 omni-engine.workspace = true
+omni-kern.workspace = true
 
 anyhow.workspace = true
 bytes.workspace = true
-half.workspace = true
 kern-manifest.workspace = true
 kern-pool.workspace = true
 kern-runtime.workspace = true
-memmap2.workspace = true
 rand.workspace = true
 safetensors.workspace = true
 serde.workspace = true

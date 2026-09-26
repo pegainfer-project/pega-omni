@@ -59,7 +59,7 @@ jobs:
       - run: cargo test --workspace --all-features --locked
 
   e2e:
-    name: OpenAI SDK and load smoke
+    name: OpenAI SDK, GPT-Live and load smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -78,3 +78,12 @@ jobs:
         run: target/release/omni-bench --num-requests 20000 --max-concurrency 256 --extra '{"frames":13}' --warmup 256
       - name: Load smoke, SSE wav
         run: target/release/omni-bench --num-requests 5000 --max-concurrency 256 --response-format wav --stream-format sse --extra '{"frames":13}'
+      - name: Start the simulated live engine
+        run: |
+          target/release/pega-omni sim-live --listen 127.0.0.1:8001 > live.log 2>&1 &
+          for _ in $(seq 50); do curl -sf localhost:8001/health && exit 0; sleep 0.2; done
+          cat live.log; exit 1
+      - name: GPT-Live protocol conforms
+        run: uv run tools/live_check.py --url ws://127.0.0.1:8001/v1/live/sessions
+      - name: Duplex smoke
+        run: target/release/omni-bench duplex --base-url http://127.0.0.1:8001 --ramp 8,32 --seconds 5

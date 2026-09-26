@@ -1,4 +1,4 @@
-target/
+/target*/
 /results/
 *.svg.tmp
 __pycache__/

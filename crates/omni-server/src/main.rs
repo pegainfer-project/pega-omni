@@ -8,7 +8,9 @@ use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use metrics_exporter_prometheus::PrometheusBuilder;
+use omni_frontend::Engines;
 use omni_sim::Profile;
+use omni_sim::live::LiveProfile;
 
 #[derive(Parser)]
 #[command(name = "pega-omni", version, about = "OpenAI-compatible speech serving")]
@@ -21,9 +23,14 @@ struct Cli {
 enum Command {
     /// Serve the CPU-only simulated engine.
     Sim(SimArgs),
+    /// Serve the CPU-only simulated live (full-duplex) engine: it echoes the caller.
+    SimLive(SimLiveArgs),
     /// Serve Qwen3-TTS (12Hz CustomVoice) on one GPU.
     #[cfg(feature = "qwen3-tts")]
     Qwen3Tts(Qwen3TtsArgs),
+    /// Serve PersonaPlex-7B, full duplex, on one GPU.
+    #[cfg(feature = "personaplex")]
+    Personaplex(PersonaplexArgs),
 }
 
 #[derive(Args)]
@@ -76,6 +83,56 @@ struct SimArgs {
     prefill_per_char_us: u64,
 }
 
+#[derive(Args)]
+struct SimLiveArgs {
+    #[command(flatten)]
+    serve: Serve,
+    #[arg(long, default_value = "pega-omni-sim-live")]
+    model: String,
+    #[arg(long, default_value_t = 64)]
+    max_sessions: usize,
+    /// Session length before the engine closes it as expired.
+    #[arg(long, default_value_t = 240)]
+    max_seconds: u64,
+    /// Caller audio the engine buffers, in frames, before dropping the oldest.
+    #[arg(long, default_value_t = 4)]
+    jitter_frames: usize,
+    /// Caller audio buffered, in frames, before the engine starts consuming it (and again after it ran dry).
+    #[arg(long, default_value_t = 2)]
+    prebuffer_frames: usize,
+    /// How late the echo is, in frames.
+    #[arg(long, default_value_t = 6)]
+    echo_frames: usize,
+    /// Fixed cost of one tick, in microseconds.
+    #[arg(long, default_value_t = 0)]
+    tick_base_us: u64,
+    /// Added tick cost per session, in microseconds.
+    #[arg(long, default_value_t = 0)]
+    tick_per_session_us: u64,
+}
+
+impl SimLiveArgs {
+    fn profile(&self) -> anyhow::Result<LiveProfile> {
+        let base = LiveProfile::default();
+        LiveProfile {
+            max_sessions: self.max_sessions,
+            max_frames: base.frames_in(Duration::from_secs(self.max_seconds)),
+            jitter_frames: self.jitter_frames,
+            prebuffer_frames: self.prebuffer_frames,
+            echo_frames: self.echo_frames,
+            word_frames: base.frames_in(Duration::from_millis(500)),
+            tick_base: Duration::from_micros(self.tick_base_us),
+            tick_per_session: Duration::from_micros(self.tick_per_session_us),
+            ..base
+        }
+        .check()
+        .map_err(anyhow::Error::msg)
+    }
+}
+
+/// What a subcommand starts: the engines to front, the engine thread, and the served model's name.
+type Started = (Engines, std::thread::JoinHandle<()>, String);
+
 #[cfg(feature = "qwen3-tts")]
 #[derive(Args)]
 struct Qwen3TtsArgs {
@@ -107,7 +164,7 @@ struct Qwen3TtsArgs {
 
 #[cfg(feature = "qwen3-tts")]
 impl Qwen3TtsArgs {
-    fn start(&self) -> anyhow::Result<(omni_engine::Handle, std::thread::JoinHandle<()>, String)> {
+    fn start(&self) -> anyhow::Result<Started> {
         use omni_qwen3_tts::engine;
         let opts = engine::Options {
             max_batch: self.max_batch,
@@ -127,7 +184,53 @@ impl Qwen3TtsArgs {
             self.max_input_chars,
             self.serve.queue,
         )?;
-        Ok((handle, thread, name))
+        Ok((handle.into(), thread, name))
+    }
+}
+
+#[cfg(feature = "personaplex")]
+#[derive(Args)]
+struct PersonaplexArgs {
+    #[command(flatten)]
+    serve: Serve,
+    /// Checkpoint directory (model.safetensors, the Mimi and tokenizer files, voices/).
+    #[arg(long)]
+    model_path: std::path::PathBuf,
+    /// The model name clients send; defaults to the checkpoint directory's name.
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    device: usize,
+    #[arg(long, default_value_t = 16)]
+    max_sessions: usize,
+    /// Session length before the engine closes it as expired.
+    #[arg(long, default_value_t = 240)]
+    max_seconds: u64,
+    /// Caller audio the engine buffers, in frames, before dropping the oldest.
+    #[arg(long, default_value_t = 4)]
+    jitter_frames: usize,
+    /// Caller audio buffered, in frames, before the engine starts consuming it (and again after it ran dry).
+    #[arg(long, default_value_t = 2)]
+    prebuffer_frames: usize,
+}
+
+#[cfg(feature = "personaplex")]
+impl PersonaplexArgs {
+    fn start(&self) -> anyhow::Result<Started> {
+        use omni_personaplex::engine;
+        let opts = engine::Options {
+            max_sessions: self.max_sessions,
+            max_session: Duration::from_secs(self.max_seconds),
+            jitter_frames: self.jitter_frames,
+            prebuffer_frames: self.prebuffer_frames,
+            ..engine::Options::default()
+        };
+        let name = self.model.clone().unwrap_or_else(|| {
+            self.model_path.file_name().map_or("personaplex".into(), |n| n.to_string_lossy().into_owned())
+        });
+        let (handle, thread) =
+            engine::start(self.device, self.model_path.clone(), opts, name.clone(), self.serve.queue)?;
+        Ok((handle.into(), thread, name))
     }
 }
 
@@ -152,14 +255,24 @@ impl SimArgs {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
-    let (serve, (handle, engine, model)) = match Cli::parse().command {
+    let (serve, (engines, engine, model)): (Serve, Started) = match Cli::parse().command {
         Command::Sim(args) => {
             let profile = args.profile()?;
             let (handle, inbox) = omni_engine::channel(profile.info(&args.model), args.serve.queue);
-            (args.serve, (handle, omni_sim::spawn(inbox, profile), args.model))
+            (args.serve, (handle.into(), omni_sim::spawn(inbox, profile), args.model))
+        }
+        Command::SimLive(args) => {
+            let profile = args.profile()?;
+            let (handle, inbox) = omni_engine::live::live_channel(profile.info(&args.model), args.serve.queue);
+            (args.serve, (handle.into(), omni_sim::live::spawn_live(inbox, profile), args.model))
         }
         #[cfg(feature = "qwen3-tts")]
         Command::Qwen3Tts(args) => {
+            let started = args.start()?;
+            (args.serve, started)
+        }
+        #[cfg(feature = "personaplex")]
+        Command::Personaplex(args) => {
             let started = args.start()?;
             (args.serve, started)
         }
@@ -182,10 +295,14 @@ fn main() -> anyhow::Result<()> {
             .then(|| PrometheusBuilder::new().install_recorder())
             .transpose()
             .context("install the metrics recorder")?;
-        let app = omni_frontend::router(handle, prometheus);
+        let live = matches!(engines, Engines::Live(_));
+        let app = omni_frontend::router(engines, prometheus);
         let listener =
             tokio::net::TcpListener::bind(serve.listen).await.with_context(|| format!("bind {}", serve.listen))?;
         tracing::info!("serving `{model}` on http://{}", serve.listen);
+        if live {
+            tracing::info!("live sessions at ws://{0}/v1/live/sessions, demo page at http://{0}/", serve.listen);
+        }
         omni_frontend::serve(listener, app, shutdown()).await?;
         anyhow::Ok(())
     })?;

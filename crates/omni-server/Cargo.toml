@@ -13,12 +13,15 @@ path = "src/main.rs"
 cpu-profile = ["dep:pprof"]
 # The Qwen3-TTS engine; needs the CUDA toolkit to build.
 qwen3-tts = ["dep:omni-qwen3-tts"]
+# The PersonaPlex full-duplex engine; needs the CUDA toolkit to build.
+personaplex = ["dep:omni-personaplex"]
 
 [dependencies]
 omni-engine.workspace = true
 omni-frontend.workspace = true
 omni-sim.workspace = true
 omni-qwen3-tts = { workspace = true, optional = true }
+omni-personaplex = { workspace = true, optional = true }
 
 anyhow.workspace = true
 clap.workspace = true

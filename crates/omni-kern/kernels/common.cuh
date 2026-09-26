@@ -1,4 +1,4 @@
-// Helpers `talker.cu` and `codec.cu` share. Eight bf16 are 16 bytes, one
+// Helpers every model's kernels share. Eight bf16 are 16 bytes, one
 // vector load or store.
 #pragma once
 #include <cuda_bf16.h>
@@ -26,6 +26,10 @@ __device__ __forceinline__ uint4 pack8(const float* v) {
 }
 
 __device__ __forceinline__ void store8(bf16* p, const float* v) { *reinterpret_cast<uint4*>(p) = pack8(v); }
+
+__device__ __forceinline__ void copy8(bf16* dst, const bf16* src) {
+  *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+}
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll

@@ -6,7 +6,10 @@
 //! real-time factor, and playback underrun: a player that starts at the first
 //! packet and plays in real time, stalling whenever the next audio has not
 //! arrived. Stall time is what a listener hears as a gap.
+//!
+//! `omni-bench duplex` loads a live endpoint instead ([`duplex`]).
 
+mod duplex;
 mod playback;
 
 use std::path::PathBuf;
@@ -32,8 +35,27 @@ use tokio::sync::Semaphore;
 
 use crate::playback::Playback;
 
-#[derive(Parser, Clone)]
-#[command(name = "omni-bench", version, about = "Load generator for OpenAI-compatible speech endpoints")]
+#[derive(Parser)]
+#[command(
+    name = "omni-bench",
+    version,
+    about = "Load generator for OpenAI-compatible speech endpoints",
+    args_conflicts_with_subcommands = true
+)]
+struct Top {
+    #[command(subcommand)]
+    mode: Option<Mode>,
+    #[command(flatten)]
+    speech: Cli,
+}
+
+#[derive(clap::Subcommand)]
+enum Mode {
+    /// Concurrent GPT-Live sessions over `/v1/live/sessions`, paced at real time.
+    Duplex(duplex::Args),
+}
+
+#[derive(clap::Args, Clone)]
 struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     base_url: String,
@@ -392,6 +414,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run(cli))
+    let top = Top::parse();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    match top.mode {
+        Some(Mode::Duplex(args)) => rt.block_on(duplex::run(args)),
+        None => rt.block_on(run(top.speech)),
+    }
 }

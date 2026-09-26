@@ -267,3 +267,56 @@ continuous at c=64 (main: 25%).
 
 Under nsys at c=1 each decode step is one `cuGraphLaunch` followed by two
 copies back (codes and PCM); the only other launches are the eager prefills.
+
+# PersonaPlex live sessions
+
+**TL;DR** (2026-09-26): one GB300 runs **128 concurrent full-duplex
+PersonaPlex-7B sessions** with zero playback underrun and zero late ticks;
+frame lateness p99 is 12.6 ms and a tick takes 15 ms of its 80 ms. The ceiling
+is session slots (memory), not time.
+
+## Method
+
+- One GB300 (tray, 4×GB300, aarch64; GPU 0 only), otherwise idle. Server
+  pinned to cores 0-15, `omni-bench duplex` to cores 64-95, loopback.
+- `pega-omni personaplex`, defaults otherwise (voice NATF2, the teacher
+  role prompt): `--max-sessions 64` for levels up to 64, a fresh
+  `--max-sessions 128` process for the rest.
+- Each session streams the reference's 40 s test recording (a person asking
+  about cooking rice, resampled to 24 kHz) at real time in 20 ms chunks for
+  30 s; sessions start 20 ms apart. The model answers each one; the
+  agent's audio and text are real, not forced.
+- A level is clean when every session completed and no session's player
+  (120 ms start-up buffer) stalled for more than 1 ms.
+
+## Ramp
+
+| sessions | clean | started p50 / p99 | late p50 / p99 / max | sessions with underrun |
+|---:|:---:|---:|---:|---:|
+| 1 | yes | 291 / 291 ms | 0.0 / 0.0 / 0.0 ms | 0 |
+| 8 | yes | 68 / 109 ms | 0.0 / 2.0 / 4.1 ms | 0 |
+| 16 | yes | 65 / 113 ms | 0.0 / 2.3 / 29.1 ms | 0 |
+| 24 | yes | 63 / 110 ms | 1.3 / 2.7 / 27.9 ms | 0 |
+| 32 | yes | 61 / 107 ms | 1.6 / 3.1 / 26.1 ms | 0 |
+| 48 | yes | 60 / 106 ms | 2.2 / 4.1 / 24.9 ms | 0 |
+| 64 | yes | 58 / 111 ms | 3.9 / 7.3 / 34.3 ms | 0 |
+| 80 | yes | 64 / 318 ms | 1.9 / 8.0 / 25.9 ms | 0 |
+| 96 | yes | 59 / 103 ms | 4.6 / 9.1 / 18.5 ms | 0 |
+| 112 | yes | 54 / 85 ms | 5.5 / 10.2 / 20.4 ms | 0 |
+| 128 | yes | 44 / 84 ms | 6.8 / 12.6 / 13.1 ms | 0 |
+
+`omni_engine_late_ticks_total` was 0 after the 80-128 run. "Started" is
+connect to `session.started`: waiting for the tick boundary plus the prompt
+prefill; the first level of each process (1 and 80) also pays graph captures.
+"Late" is how far behind its timeline slot a frame arrived, relative to the
+session's first frame.
+
+Tick time (the GPU call as the engine sees it), from the engine's debug log:
+
+| sessions | 1 | 8 | 32 | 64 | 128 |
+|---|---:|---:|---:|---:|---:|
+| p50 | 8.1 ms | 8.0 ms | 8.6 ms | 11.0 ms | 15.0 ms |
+| p99 | 10.0 ms | 8.5 ms | 9.3 ms | 11.8 ms | 15.9 ms |
+
+The first tick of each new bucket includes its graph capture (up to 41 ms,
+once per bucket per process).
