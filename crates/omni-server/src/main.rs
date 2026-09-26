@@ -13,7 +13,7 @@ use omni_sim::Profile;
 use omni_sim::live::LiveProfile;
 
 #[derive(Parser)]
-#[command(name = "pega-omni", version, about = "OpenAI-compatible speech serving")]
+#[command(name = "pega-omni", version, about = "OpenAI-compatible speech and image serving")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -25,6 +25,8 @@ enum Command {
     Sim(SimArgs),
     /// Serve the CPU-only simulated live (full-duplex) engine: it echoes the caller.
     SimLive(SimLiveArgs),
+    /// Serve the CPU-only simulated image engine.
+    SimImage(SimImageArgs),
     /// Serve Qwen3-TTS (12Hz CustomVoice) on one GPU.
     #[cfg(feature = "qwen3-tts")]
     Qwen3Tts(Qwen3TtsArgs),
@@ -81,6 +83,20 @@ struct SimArgs {
     /// Added step cost per admitted input character, in microseconds.
     #[arg(long, default_value_t = 0)]
     prefill_per_char_us: u64,
+}
+
+#[derive(Args)]
+struct SimImageArgs {
+    #[command(flatten)]
+    serve: Serve,
+    #[arg(long, default_value = "pega-omni-sim-image")]
+    model: String,
+    /// Denoising steps per picture.
+    #[arg(long, default_value_t = 4)]
+    steps: u32,
+    /// Cost of one step, in milliseconds.
+    #[arg(long, default_value_t = 0)]
+    step_ms: u64,
 }
 
 #[derive(Args)]
@@ -265,6 +281,15 @@ fn main() -> anyhow::Result<()> {
             let profile = args.profile()?;
             let (handle, inbox) = omni_engine::live::live_channel(profile.info(&args.model), args.serve.queue);
             (args.serve, (handle.into(), omni_sim::live::spawn_live(inbox, profile), args.model))
+        }
+        Command::SimImage(args) => {
+            let profile = omni_sim::image::ImageProfile {
+                steps: args.steps,
+                step_cost: Duration::from_millis(args.step_ms),
+                ..Default::default()
+            };
+            let (handle, inbox) = omni_engine::image::channel(profile.info(&args.model), args.serve.queue);
+            (args.serve, (handle.into(), omni_sim::image::spawn(inbox, profile), args.model))
         }
         #[cfg(feature = "qwen3-tts")]
         Command::Qwen3Tts(args) => {

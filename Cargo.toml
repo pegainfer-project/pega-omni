@@ -59,6 +59,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 mimalloc = "0.1"
 pprof = { version = "0.15", features = ["flamegraph"] }
+png = "0.18"
 proptest = "1"
 rand = "0.10"
 rand_distr = "0.6"

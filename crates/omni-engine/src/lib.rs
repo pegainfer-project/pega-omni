@@ -1,4 +1,5 @@
-//! The contract between the HTTP front end and a speech engine.
+//! The contract between the HTTP front end and a speech engine. The image
+//! contract, the same shape with a prompt in and pictures out, is [`image`].
 //!
 //! An engine is whatever sits on the far side of an [`Inbox`]: a thread (or a
 //! GPU step loop) that takes [`Submission`]s, generates audio, and pushes
@@ -36,6 +37,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
 
+pub mod image;
+
 /// What an engine serves, fixed at launch.
 #[derive(Clone, Debug)]
 pub struct EngineInfo {
@@ -56,7 +59,7 @@ pub enum Extra {
 }
 
 impl Extra {
-    fn check(&self, value: &Value) -> Result<(), String> {
+    pub(crate) fn check(&self, value: &Value) -> Result<(), String> {
         match self {
             Self::Integer(range) => match value.as_i64() {
                 Some(x) if range.contains(&x) => Ok(()),

@@ -7,17 +7,19 @@
 //! a full engine queue is an immediate `429`, so the only waiting a request
 //! does is inside the engine, where it is visible as `omni_engine_waiting`.
 //!
-//! A server fronts a speech engine or a live (full-duplex) engine
+//! A server fronts a speech, a live (full-duplex) or an image engine
 //! ([`Engines`]). Routes: `POST /v1/audio/speech` (speech), the GPT-Live
 //! WebSocket `GET /v1/live/sessions` and the browser demo at `/` (live; see
-//! [`live`]), `GET /v1/models`, `GET /v1/audio/voices`, `GET /health`, and
-//! `GET /metrics` (Prometheus text) when a recorder is installed.
+//! [`live`]), `POST /v1/images/generations` (image; see [`images`]),
+//! `GET /v1/models`, `GET /v1/audio/voices` (speech and live), `GET /health`,
+//! and `GET /metrics` (Prometheus text) when a recorder is installed.
 //!
 //! Serve through [`serve`], not `axum::serve` directly: audio leaves in small
 //! writes, and without `TCP_NODELAY` Nagle holds each one until the client's
 //! delayed ACK, which adds a flat ~40 ms to every packet.
 
 pub mod audio;
+pub mod images;
 mod live;
 pub mod live_audio;
 pub mod live_protocol;
@@ -41,6 +43,7 @@ use axum::routing::post;
 use axum::serve::ListenerExt;
 use metrics_exporter_prometheus::PrometheusHandle;
 use omni_engine::Handle;
+use omni_engine::Load;
 use omni_engine::Rejected;
 use omni_engine::live::LiveHandle;
 use serde_json::json;
@@ -53,6 +56,7 @@ use crate::protocol::ApiError;
 pub enum Engines {
     Speech(Handle),
     Live(LiveHandle),
+    Image(omni_engine::image::Handle),
 }
 
 impl From<Handle> for Engines {
@@ -67,18 +71,31 @@ impl From<LiveHandle> for Engines {
     }
 }
 
+impl From<omni_engine::image::Handle> for Engines {
+    fn from(h: omni_engine::image::Handle) -> Self {
+        Self::Image(h)
+    }
+}
+
 impl Engines {
     fn speech(&self) -> Option<&Handle> {
         match self {
             Self::Speech(h) => Some(h),
-            Self::Live(_) => None,
+            _ => None,
         }
     }
 
     fn live(&self) -> Option<&LiveHandle> {
         match self {
             Self::Live(h) => Some(h),
-            Self::Speech(_) => None,
+            _ => None,
+        }
+    }
+
+    fn image(&self) -> Option<&omni_engine::image::Handle> {
+        match self {
+            Self::Image(h) => Some(h),
+            _ => None,
         }
     }
 
@@ -86,13 +103,15 @@ impl Engines {
         match self {
             Self::Speech(h) => &h.info.model,
             Self::Live(h) => &h.info.model,
+            Self::Image(h) => &h.info.model,
         }
     }
 
-    fn voices(&self) -> &std::collections::BTreeSet<String> {
+    fn voices(&self) -> Option<&std::collections::BTreeSet<String>> {
         match self {
-            Self::Speech(h) => &h.info.voices,
-            Self::Live(h) => &h.info.voices,
+            Self::Speech(h) => Some(&h.info.voices),
+            Self::Live(h) => Some(&h.info.voices),
+            Self::Image(_) => None,
         }
     }
 }
@@ -112,6 +131,7 @@ pub fn router(engines: impl Into<Engines>, prometheus: Option<PrometheusHandle>)
         .route("/", get(demo))
         .route("/live/config", get(live_config))
         .route("/live/stats", get(live_stats))
+        .route("/v1/images/generations", post(images_generate))
         .route("/v1/models", get(models))
         .route("/v1/audio/voices", get(voices))
         .route("/health", get(|| async { "ok" }))
@@ -224,19 +244,26 @@ async fn models(State(s): State<Arc<Shared>>) -> Json<serde_json::Value> {
     Json(json!({ "object": "list", "data": [model] }))
 }
 
-async fn voices(State(s): State<Arc<Shared>>) -> Json<serde_json::Value> {
-    Json(json!({ "voices": s.engines.voices() }))
+async fn voices(State(s): State<Arc<Shared>>) -> Result<Json<serde_json::Value>, ApiError> {
+    let voices = s.engines.voices().ok_or_else(|| not_here("speech"))?;
+    Ok(Json(json!({ "voices": voices })))
+}
+
+async fn images_generate(State(s): State<Arc<Shared>>, body: Bytes) -> Result<Json<serde_json::Value>, ApiError> {
+    images::generate(s.engines.image().ok_or_else(|| not_here("image"))?, &body).await
 }
 
 async fn scrape(State(s): State<Arc<Shared>>) -> Response {
     let Some(p) = &s.prometheus else {
         return ApiError::unavailable("metrics are disabled".into()).into_response();
     };
+    let queued = |load: &Load| {
+        metrics::gauge!("omni_engine_waiting").set(load.waiting.load(Ordering::Relaxed) as f64);
+        metrics::gauge!("omni_engine_running").set(load.running.load(Ordering::Relaxed) as f64);
+    };
     match &s.engines {
-        Engines::Speech(h) => {
-            metrics::gauge!("omni_engine_waiting").set(h.load.waiting.load(Ordering::Relaxed) as f64);
-            metrics::gauge!("omni_engine_running").set(h.load.running.load(Ordering::Relaxed) as f64);
-        }
+        Engines::Speech(h) => queued(&h.load),
+        Engines::Image(h) => queued(&h.load),
         Engines::Live(h) => {
             let pulse = &h.pulse;
             metrics::gauge!("omni_engine_running").set(pulse.sessions.load(Ordering::Relaxed) as f64);
