@@ -9,6 +9,8 @@ use omni_engine::live::CloseReason;
 use omni_engine::live::Closed;
 use omni_engine::live::LiveInbox;
 use omni_engine::live::Output;
+use omni_engine::live::SessionDraft;
+use omni_frontend::live_audio::Format;
 use omni_frontend::live_protocol::ClientEvent;
 use omni_frontend::live_protocol::parse;
 use omni_sim::live::LiveProfile;
@@ -74,6 +76,10 @@ async fn until(ws: &mut Ws, kind: &str) -> Value {
     }
 }
 
+fn start() -> Value {
+    json!({"type": "session.start", "session": {"model": "sim-live"}})
+}
+
 fn error_of(v: &Value) -> (&str, &str, Option<&str>) {
     assert_eq!(v["type"], "error", "{v}");
     let e = &v["error"];
@@ -84,31 +90,32 @@ fn error_of(v: &Value) -> (&str, &str, Option<&str>) {
 async fn a_session_streams_frames_on_the_timeline_and_closes_on_request() {
     let addr = server(LiveProfile::default()).await;
     let mut ws = connect(&addr).await;
-    send(&mut ws, json!({"type": "session.input_audio.append", "audio": "", "client_event_id": "early"})).await;
+    send(&mut ws, json!({"type": "session.input_audio.append", "audio": "AAA=", "event_id": "early"})).await;
     let early = recv(&mut ws).await.unwrap();
     assert_eq!(
         (error_of(&early).1, early["error"]["client_event_id"].as_str()),
         ("session_not_started", Some("early"))
     );
 
-    send(
-        &mut ws,
-        json!({"type": "session.start", "session": {"model": "sim-live", "audio": {"output": {"voice": "nova"}}}}),
-    )
-    .await;
+    let session =
+        json!({"model": "sim-live", "audio": {"output": {"voice": "nova"}}, "delegation": {"type": "client"}});
+    send(&mut ws, json!({"type": "session.start", "event_id": "go", "session": session})).await;
     let started = recv(&mut ws).await.unwrap();
     assert_eq!(started["type"], "session.started", "{started}");
+    let s = &started["session"];
     assert_eq!(
-        (started["session"]["model"].as_str(), started["session"]["audio"]["output"]["voice"].as_str()),
-        (Some("sim-live"), Some("nova"))
+        (s["model"].as_str(), s["audio"]["output"]["voice"].as_str(), s["status"].as_str(), &s["delegation"]),
+        (Some("sim-live"), Some("nova"), Some("active"), &json!({"type": "client"}))
     );
-    assert!(started["event_id"].is_string());
+    assert_eq!(s["audio"]["format"], json!({"type": "audio/pcm", "rate": 24000}));
+    assert!(s["id"].is_string() && s["expires_at"].as_u64().is_some_and(|t| t > 1_700_000_000), "{s}");
+    assert_eq!((started["event_id"].is_string(), started["client_event_id"].as_str()), (true, Some("go")));
 
     let tone: Vec<u8> = (0..4800).flat_map(|i| (((i % 40) as i16 - 20) * 800).to_le_bytes()).collect();
     for chunk in tone.chunks(960) {
         send(&mut ws, json!({"type": "session.input_audio.append", "audio": STANDARD.encode(chunk)})).await;
     }
-    send(&mut ws, json!({"type": "session.input_audio.mute", "client_event_id": "m"})).await;
+    send(&mut ws, json!({"type": "session.input_audio.mute", "event_id": "m"})).await;
     let mut starts = Vec::new();
     let mut muted = false;
     while starts.len() < 5 || !muted {
@@ -129,52 +136,114 @@ async fn a_session_streams_frames_on_the_timeline_and_closes_on_request() {
     }
     assert!(starts.windows(2).all(|w| w[1] > w[0]) && starts[0] == 0, "{starts:?}");
 
-    send(&mut ws, json!({"type": "session.close"})).await;
+    send(&mut ws, json!({"type": "session.close", "event_id": "bye"})).await;
     let closed = until(&mut ws, "session.closed").await;
-    assert_eq!(closed["reason"], "close_requested");
+    assert_eq!((closed["reason"].as_str(), closed["client_event_id"].as_str()), (Some("close_requested"), Some("bye")));
+    assert_eq!(closed["session"], started["session"]);
     assert!(closed["usage"]["seconds"].as_f64().unwrap() > 0.3);
     assert!(recv(&mut ws).await.is_none());
+}
+
+/// The sizes of a session's first output deltas, each 80 ms, when it picks `format`.
+async fn delta_bytes(format: Value) -> Vec<usize> {
+    let addr = server(LiveProfile::default()).await;
+    let mut ws = connect(&addr).await;
+    let session = json!({"model": "sim-live", "audio": {"format": format}});
+    send(&mut ws, json!({"type": "session.start", "session": session})).await;
+    let started = recv(&mut ws).await.unwrap();
+    assert_eq!(started["session"]["audio"]["format"], format);
+    let mut sizes = Vec::new();
+    while sizes.len() < 4 {
+        let v = until(&mut ws, "session.output_audio.delta").await;
+        assert_eq!(v["end_ms"].as_u64().unwrap() - v["start_ms"].as_u64().unwrap(), 80);
+        sizes.push(STANDARD.decode(v["delta"].as_str().unwrap()).unwrap().len());
+    }
+    sizes
+}
+
+#[tokio::test]
+async fn the_wire_format_sets_the_rate_and_encoding_of_the_agents_audio() {
+    assert_eq!(delta_bytes(json!({"type": "audio/pcm", "rate": 16000})).await, [2560; 4]);
+    assert_eq!(delta_bytes(json!({"type": "audio/pcmu", "rate": 8000})).await, [640; 4]);
+    assert_eq!(delta_bytes(json!({"type": "audio/pcma", "rate": 8000})).await, [640; 4]);
+}
+
+#[tokio::test]
+async fn audio_that_is_not_whole_samples_is_refused_and_the_session_goes_on() {
+    let addr = server(LiveProfile::default()).await;
+    let mut ws = connect(&addr).await;
+    send(&mut ws, start()).await;
+    assert_eq!(recv(&mut ws).await.unwrap()["type"], "session.started");
+    let odd = json!({"type": "session.input_audio.append", "audio": STANDARD.encode([1u8; 3]), "event_id": "odd"});
+    send(&mut ws, odd).await;
+    let e = until(&mut ws, "error").await;
+    assert_eq!(
+        (error_of(&e), e["error"]["client_event_id"].as_str()),
+        (("invalid_request_error", "invalid_audio", Some("audio")), Some("odd"))
+    );
+    until(&mut ws, "session.output_audio.delta").await;
+}
+
+/// A `session.start` for sim-live with `extra` session fields.
+fn start_with(extra: Value) -> Value {
+    let mut session = json!({"model": "sim-live"});
+    session.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    json!({"type": "session.start", "session": session})
 }
 
 #[tokio::test]
 async fn refusals_name_what_is_wrong_and_keep_the_socket() {
     let addr = server(LiveProfile::default()).await;
     let mut ws = connect(&addr).await;
+    let pcm = |kind: &str, rate: u32| json!({"audio": {"format": {"type": kind, "rate": rate}}});
     let cases = [
+        (start_with(json!({"temperature": 1})), "unknown_parameter", "session.temperature"),
+        (start_with(json!({"audio": {"output": {"voice": "nobody"}}})), "invalid_value", "session.audio.output.voice"),
         (
-            json!({"type": "session.start", "session": {"temperature": 1}}),
+            start_with(json!({"audio": {"output": {"voice": {"id": "nobody"}}}})),
+            "invalid_value",
+            "session.audio.output.voice",
+        ),
+        (
+            start_with(json!({"audio": {"output": {"voice": {"name": "nova"}}}})),
             "unknown_parameter",
-            Some("session.temperature"),
+            "session.audio.output.voice.name",
         ),
+        (start_with(json!({"model": "other"})), "model_not_found", "session.model"),
+        (json!({"type": "session.start", "session": {}}), "missing_required_parameter", "session.model"),
+        (json!({"type": "session.start"}), "missing_required_parameter", "session"),
         (
-            json!({"type": "session.start", "session": {"audio": {"output": {"voice": "nobody"}}}}),
-            "invalid_value",
-            Some("session.audio.output.voice"),
-        ),
-        (json!({"type": "session.start", "session": {"model": "other"}}), "model_not_found", Some("session.model")),
-        (
-            json!({"type": "session.start", "session": {"delegation": {"type": "client"}}}),
+            start_with(json!({"delegation": {"type": "responses", "responses": {"model": "gpt-5.5"}}})),
             "unsupported",
-            Some("session.delegation"),
+            "session.delegation",
         ),
+        (start_with(json!({"delegation": {"type": "server"}})), "invalid_value", "session.delegation.type"),
+        (start_with(json!({"input": [{"role": "user", "content": [{"text": "hi"}]}]})), "unsupported", "session.input"),
+        (start_with(json!({"store": true})), "unsupported", "session.store"),
+        (start_with(json!({"client": {"data_channel": {}}})), "unsupported", "session.client"),
+        (start_with(json!({"audio": {"input": {}}})), "unknown_parameter", "session.audio.input"),
+        (start_with(pcm("audio/pcm", 44_100)), "invalid_value", "session.audio.format.rate"),
+        (start_with(pcm("audio/pcmu", 16_000)), "invalid_value", "session.audio.format.rate"),
+        (start_with(pcm("audio/opus", 48_000)), "invalid_value", "session.audio.format.type"),
         (
-            json!({"type": "session.start", "session": {"audio": {"input": {"format": {"type": "audio/pcm", "rate": 16000}}}}}),
-            "invalid_value",
-            Some("session.audio.input.format"),
+            start_with(json!({"audio": {"format": {"type": "audio/pcm"}}})),
+            "missing_required_parameter",
+            "session.audio.format.rate",
         ),
-        (json!({"type": "session.update", "session": {}}), "unsupported", Some("type")),
-        (json!({"type": "session.thinking.append", "text": "hm"}), "unsupported", Some("type")),
-        (json!({"type": "nonsense"}), "unknown_event", Some("type")),
+        (json!({"type": "session.close", "client_event_id": "x"}), "unknown_parameter", "client_event_id"),
+        (json!({"type": "session.input_audio.append", "audio": ""}), "invalid_audio", "audio"),
+        (json!({"type": "session.update", "session": {}}), "unsupported", "type"),
+        (json!({"type": "session.thinking.append", "content": "hm", "delegation_id": null}), "unsupported", "type"),
+        (json!({"type": "nonsense"}), "unknown_event", "type"),
     ];
     for (event, code, param) in cases {
         send(&mut ws, event.clone()).await;
         let v = recv(&mut ws).await.unwrap();
-        let (kind, got, p) = error_of(&v);
-        assert_eq!((kind, got, p), ("invalid_request_error", code, param), "{event}");
+        assert_eq!(error_of(&v), ("invalid_request_error", code, Some(param)), "{event}");
     }
-    send(&mut ws, json!({"type": "session.start"})).await;
+    send(&mut ws, start()).await;
     assert_eq!(recv(&mut ws).await.unwrap()["type"], "session.started");
-    send(&mut ws, json!({"type": "session.start"})).await;
+    send(&mut ws, start()).await;
     assert_eq!(error_of(&until(&mut ws, "error").await).1, "session_already_started");
 }
 
@@ -182,15 +251,15 @@ async fn refusals_name_what_is_wrong_and_keep_the_socket() {
 async fn a_full_engine_says_busy_and_keeps_the_socket_for_a_retry() {
     let addr = server(LiveProfile { max_sessions: 1, ..LiveProfile::default() }).await;
     let mut first = connect(&addr).await;
-    send(&mut first, json!({"type": "session.start"})).await;
+    send(&mut first, start()).await;
     assert_eq!(recv(&mut first).await.unwrap()["type"], "session.started");
     let mut second = connect(&addr).await;
-    send(&mut second, json!({"type": "session.start"})).await;
+    send(&mut second, start()).await;
     assert_eq!(error_of(&recv(&mut second).await.unwrap()), ("server_error", "server_busy", None));
     send(&mut first, json!({"type": "session.close"})).await;
     until(&mut first, "session.closed").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    send(&mut second, json!({"type": "session.start"})).await;
+    send(&mut second, start()).await;
     assert_eq!(recv(&mut second).await.unwrap()["type"], "session.started");
 }
 
@@ -202,9 +271,9 @@ async fn a_full_queue_says_busy_and_keeps_the_socket() {
     })
     .await;
     let mut first = connect(&addr).await;
-    send(&mut first, json!({"type": "session.start"})).await;
+    send(&mut first, start()).await;
     let mut second = connect(&addr).await;
-    send(&mut second, json!({"type": "session.start", "client_event_id": "s"})).await;
+    send(&mut second, json!({"type": "session.start", "event_id": "s", "session": {"model": "sim-live"}})).await;
     let v = recv(&mut second).await.unwrap();
     assert_eq!(
         (error_of(&v), v["error"]["client_event_id"].as_str()),
@@ -224,7 +293,7 @@ async fn an_engine_abort_is_an_error_then_closed() {
     })
     .await;
     let mut ws = connect(&addr).await;
-    send(&mut ws, json!({"type": "session.start"})).await;
+    send(&mut ws, start()).await;
     assert_eq!(recv(&mut ws).await.unwrap()["type"], "session.started");
     assert_eq!(error_of(&recv(&mut ws).await.unwrap()), ("server_error", "server_error", None));
     assert_eq!(recv(&mut ws).await.unwrap()["reason"], "connection_lost");
@@ -239,7 +308,7 @@ async fn an_engine_that_stops_ends_its_sessions() {
     })
     .await;
     let mut ws = connect(&addr).await;
-    send(&mut ws, json!({"type": "session.start"})).await;
+    send(&mut ws, start()).await;
     assert_eq!(recv(&mut ws).await.unwrap()["type"], "session.started");
     let e = recv(&mut ws).await.unwrap();
     assert!(e["error"]["message"].as_str().unwrap().contains("stopped"), "{e}");
@@ -257,7 +326,7 @@ async fn close_before_started_is_answered_by_the_engine() {
     })
     .await;
     let mut ws = connect(&addr).await;
-    send(&mut ws, json!({"type": "session.start"})).await;
+    send(&mut ws, start()).await;
     send(&mut ws, json!({"type": "session.close"})).await;
     let closed = recv(&mut ws).await.unwrap();
     assert_eq!((closed["type"].as_str(), closed["reason"].as_str()), (Some("session.closed"), Some("close_requested")));
@@ -274,7 +343,7 @@ async fn close_gives_up_on_a_silent_engine_after_the_grace() {
     })
     .await;
     let mut ws = connect(&addr).await;
-    send(&mut ws, json!({"type": "session.start"})).await;
+    send(&mut ws, start()).await;
     assert_eq!(recv(&mut ws).await.unwrap()["type"], "session.started");
     let asked = std::time::Instant::now();
     send(&mut ws, json!({"type": "session.close"})).await;
@@ -296,7 +365,7 @@ async fn muting_forwards_silence_of_the_same_length() {
     })
     .await;
     let mut ws = connect(&addr).await;
-    send(&mut ws, json!({"type": "session.start"})).await;
+    send(&mut ws, start()).await;
     assert_eq!(recv(&mut ws).await.unwrap()["type"], "session.started");
     let loud = STANDARD.encode([7u8; 6]);
     for event in [
@@ -317,7 +386,7 @@ async fn muting_forwards_silence_of_the_same_length() {
 async fn expiry_closes_the_session() {
     let addr = server(LiveProfile { max_frames: 3, ..LiveProfile::default() }).await;
     let mut ws = connect(&addr).await;
-    send(&mut ws, json!({"type": "session.start"})).await;
+    send(&mut ws, start()).await;
     let closed = until(&mut ws, "session.closed").await;
     assert_eq!(closed["reason"], "expired");
 }
@@ -357,20 +426,72 @@ async fn a_live_only_server_refuses_speech_and_serves_the_demo() {
     );
 }
 
+/// `None` (absent), `null`, or one of `values`.
+fn optional(values: Vec<Value>) -> impl Strategy<Value = Option<Value>> {
+    prop_oneof![Just(None), Just(Some(Value::Null)), prop::sample::select(values).prop_map(Some)]
+}
+
+fn format_of(v: &Value) -> Format {
+    match (v["type"].as_str(), v["rate"].as_u64()) {
+        (Some("audio/pcmu"), _) => Format::Pcmu,
+        (Some("audio/pcma"), _) => Format::Pcma,
+        (_, rate) => Format::Pcm(rate.unwrap() as u32),
+    }
+}
+
 proptest! {
     #[test]
-    fn appends_decode_exactly_what_was_encoded(pcm in prop::collection::vec(any::<u8>(), 0..4000), id in "[a-z0-9]{0,8}") {
-        let text = json!({"type": "session.input_audio.append", "audio": STANDARD.encode(&pcm), "client_event_id": id}).to_string();
-        let r = parse(&text, 24_000).unwrap();
-        prop_assert_eq!((r.event, r.client_event_id), (ClientEvent::Append(pcm.into()), Some(id)));
+    fn appends_decode_exactly_what_was_encoded(pcm in prop::collection::vec(any::<u8>(), 1..4000), id in "[a-z0-9]{0,8}") {
+        let text = json!({"type": "session.input_audio.append", "audio": STANDARD.encode(&pcm), "event_id": id}).to_string();
+        let r = parse(&text).unwrap();
+        prop_assert_eq!((r.event, r.event_id), (ClientEvent::Append(pcm.into()), Some(id)));
     }
 
     #[test]
     fn any_unknown_top_level_field_is_named(field in "[a-z_]{1,12}") {
-        prop_assume!(!["type", "client_event_id", "session"].contains(&field.as_str()));
-        let text = json!({"type": "session.start", field.clone(): 1}).to_string();
-        let e = parse(&text, 24_000).unwrap_err();
+        prop_assume!(!["type", "event_id", "session"].contains(&field.as_str()));
+        let text = json!({"type": "session.start", "session": {"model": "m"}, field.clone(): 1}).to_string();
+        let e = parse(&text).unwrap_err();
         prop_assert_eq!((e.code, e.param), ("unknown_parameter", Some(field)));
+    }
+
+    /// Every mix of the optional startup fields the server accepts starts a
+    /// session with exactly what they say; `null` and blank mean the default.
+    #[test]
+    fn accepted_startups_carry_their_format_voice_and_instructions(
+        format in optional(vec![
+            json!({"type": "audio/pcm", "rate": 16000}),
+            json!({"type": "audio/pcm", "rate": 24000}),
+            json!({"type": "audio/pcmu", "rate": 8000}),
+            json!({"type": "audio/pcma", "rate": 8000}),
+        ]),
+        voice in optional(vec![json!("nova"), json!({"id": "nova"})]),
+        instructions in optional(vec![json!("Be brief."), json!(""), json!("  ")]),
+        delegation in optional(vec![json!({"type": "client"})]),
+        input in optional(vec![json!([])]),
+        store in optional(vec![json!(false)]),
+    ) {
+        let mut session = json!({"model": "m", "audio": {"output": {}}});
+        if let Some(f) = &format {
+            session["audio"]["format"] = f.clone();
+        }
+        if let Some(v) = &voice {
+            session["audio"]["output"]["voice"] = v.clone();
+        }
+        for (key, v) in [("instructions", &instructions), ("delegation", &delegation), ("input", &input), ("store", &store)] {
+            if let Some(v) = v {
+                session[key] = v.clone();
+            }
+        }
+        let r = parse(&json!({"type": "session.start", "session": session}).to_string()).unwrap();
+        let text = |v: &Option<Value>| v.as_ref().and_then(Value::as_str).map(String::from);
+        let voice = voice.map(|v| if v.is_object() { v["id"].clone() } else { v });
+        let expected = ClientEvent::Start {
+            model: "m".into(),
+            draft: SessionDraft { voice: text(&voice), instructions: text(&instructions).filter(|s| !s.trim().is_empty()) },
+            format: format.as_ref().filter(|f| !f.is_null()).map_or(Format::DEFAULT, format_of),
+        };
+        prop_assert_eq!(r.event, expected);
     }
 }
 
@@ -392,7 +513,7 @@ async fn stats_count_the_running_session_and_its_ticks() {
         serde_json::from_slice::<Value>(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
     };
     let mut ws = connect(&addr).await;
-    send(&mut ws, json!({"type": "session.start"})).await;
+    send(&mut ws, start()).await;
     for _ in 0..3 {
         until(&mut ws, "session.output_audio.delta").await;
     }
