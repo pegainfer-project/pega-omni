@@ -1,0 +1,28 @@
+[package]
+name = "omni-hidream-o1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+omni-engine.workspace = true
+omni-kern.workspace = true
+
+anyhow.workspace = true
+bytes.workspace = true
+cudarc.workspace = true
+half.workspace = true
+kern-manifest.workspace = true
+kern-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokenizers.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+memmap2.workspace = true
+safetensors.workspace = true
+
+[lints]
+workspace = true

@@ -1292,7 +1292,7 @@ dependencies = [
 [[package]]
 name = "kern-manifest"
 version = "0.2.3"
-source = "git+https://github.com/pegainfer-project/kern?rev=78c73047bb4f8981ff6aa8fc44ccaf1dab43a3a9#78c73047bb4f8981ff6aa8fc44ccaf1dab43a3a9"
+source = "git+https://github.com/pegainfer-project/kern?rev=b43bb5a680d6fc92f969a7881e1ceca98c301607#b43bb5a680d6fc92f969a7881e1ceca98c301607"
 dependencies = [
  "half",
  "schemars",
@@ -1304,7 +1304,7 @@ dependencies = [
 [[package]]
 name = "kern-pool"
 version = "0.2.3"
-source = "git+https://github.com/pegainfer-project/kern?rev=78c73047bb4f8981ff6aa8fc44ccaf1dab43a3a9#78c73047bb4f8981ff6aa8fc44ccaf1dab43a3a9"
+source = "git+https://github.com/pegainfer-project/kern?rev=b43bb5a680d6fc92f969a7881e1ceca98c301607#b43bb5a680d6fc92f969a7881e1ceca98c301607"
 dependencies = [
  "kern-manifest",
  "thiserror",
@@ -1313,7 +1313,7 @@ dependencies = [
 [[package]]
 name = "kern-runtime"
 version = "0.2.3"
-source = "git+https://github.com/pegainfer-project/kern?rev=78c73047bb4f8981ff6aa8fc44ccaf1dab43a3a9#78c73047bb4f8981ff6aa8fc44ccaf1dab43a3a9"
+source = "git+https://github.com/pegainfer-project/kern?rev=b43bb5a680d6fc92f969a7881e1ceca98c301607#b43bb5a680d6fc92f969a7881e1ceca98c301607"
 dependencies = [
  "cudarc",
  "half",
@@ -1705,6 +1705,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-hidream-o1"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "cudarc",
+ "half",
+ "kern-manifest",
+ "kern-runtime",
+ "memmap2",
+ "omni-engine",
+ "omni-kern",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokenizers",
+ "tracing",
+]
+
+[[package]]
 name = "omni-kern"
 version = "0.1.0"
 dependencies = [
@@ -1769,6 +1790,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "omni-engine",
  "omni-frontend",
+ "omni-hidream-o1",
  "omni-personaplex",
  "omni-qwen3-tts",
  "omni-sim",
