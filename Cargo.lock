@@ -1726,6 +1726,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-higgs-audio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "proptest",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
 name = "omni-kern"
 version = "0.1.0"
 dependencies = [

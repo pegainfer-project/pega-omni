@@ -11,6 +11,7 @@ members = [
     "crates/omni-qwen3-tts",
     "crates/omni-personaplex",
     "crates/omni-hidream-o1",
+    "crates/omni-higgs-audio",
 ]
 # A plain `cargo build` needs no CUDA toolkit; `--workspace` builds the GPU crates too.
 default-members = [
@@ -37,6 +38,7 @@ omni-qwen3 = { path = "crates/omni-qwen3" }
 omni-qwen3-tts = { path = "crates/omni-qwen3-tts" }
 omni-personaplex = { path = "crates/omni-personaplex" }
 omni-hidream-o1 = { path = "crates/omni-hidream-o1" }
+omni-higgs-audio = { path = "crates/omni-higgs-audio" }
 
 anyhow = "1"
 # G.711 (`audio/pcmu`, `audio/pcma`) for the live endpoint: the ITU tables,
