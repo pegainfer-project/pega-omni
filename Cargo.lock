@@ -1760,6 +1760,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-qwen3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "omni-kern",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "omni-qwen3-tts"
 version = "0.1.0"
 dependencies = [
@@ -1770,6 +1780,7 @@ dependencies = [
  "kern-runtime",
  "omni-engine",
  "omni-kern",
+ "omni-qwen3",
  "proptest",
  "rand 0.10.3",
  "safetensors",

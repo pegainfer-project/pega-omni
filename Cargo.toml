@@ -7,6 +7,7 @@ members = [
     "crates/omni-server",
     "crates/omni-bench",
     "crates/omni-kern",
+    "crates/omni-qwen3",
     "crates/omni-qwen3-tts",
     "crates/omni-personaplex",
     "crates/omni-hidream-o1",
@@ -32,6 +33,7 @@ omni-engine = { path = "crates/omni-engine" }
 omni-sim = { path = "crates/omni-sim" }
 omni-frontend = { path = "crates/omni-frontend" }
 omni-kern = { path = "crates/omni-kern" }
+omni-qwen3 = { path = "crates/omni-qwen3" }
 omni-qwen3-tts = { path = "crates/omni-qwen3-tts" }
 omni-personaplex = { path = "crates/omni-personaplex" }
 omni-hidream-o1 = { path = "crates/omni-hidream-o1" }

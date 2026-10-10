@@ -128,6 +128,7 @@ differs from OpenAI, it says so instead of guessing:
 | `omni-frontend` | axum routes, request parsing, wav / pcm / SSE framing, PNG, metrics |
 | `omni-sim` | the simulated engines (speech, live and image): pure cores plus thread shells |
 | `omni-kern` | the kern manifest builder, weight loading and CUDA helpers the GPU engines share |
+| `omni-qwen3` | the Qwen3 decoder stack as manifest calls over paged or dense KV, and its CUDA kernels; Qwen3-TTS builds on it |
 | `omni-qwen3-tts` | Qwen3-TTS as one kern manifest (talker, code predictor, sampler, streaming codec decoder, own CUDA kernels), prompt, engine |
 | `omni-personaplex` | PersonaPlex-7B as one kern manifest (Mimi encoder, Helium, depformer, Mimi decoder, own CUDA kernels), prompt, tokenizer, live engine |
 | `omni-hidream-o1` | HiDream-O1-Image as one kern manifest (diffusion transformer, sampler, own CUDA kernels), sharded weights, prompt and M-RoPE, engine |
