@@ -51,7 +51,7 @@ audio leaves: every call already returns its frames decoded.
 
 ## Kernels
 
-The talker's and predictor's decoder layers are `omni-qwen3`'s, and its
+The talker's and predictor's decoder layers are `omni-qwen3`'s (shared with Higgs TTS), and its
 `kernels/qwen3.cu` has their kernels: paged attention (one block per row and KV head, online
 softmax over 32-key tiles; a ragged prefill row finds its sequence's pages through `kv_indptr`)
 and its dense twin for the predictor, per-head RMSNorm + RoPE + K/V write, fused residual RMSNorm

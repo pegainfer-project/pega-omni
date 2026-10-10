@@ -1730,11 +1730,22 @@ name = "omni-higgs-audio"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "kern-manifest",
+ "kern-pool",
+ "kern-runtime",
+ "omni-engine",
+ "omni-kern",
+ "omni-qwen3",
  "proptest",
+ "rand 0.10.3",
  "safetensors",
  "serde",
  "serde_json",
+ "sha2",
  "tokenizers",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1814,6 +1825,7 @@ dependencies = [
  "omni-engine",
  "omni-frontend",
  "omni-hidream-o1",
+ "omni-higgs-audio",
  "omni-personaplex",
  "omni-qwen3-tts",
  "omni-sim",

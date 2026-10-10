@@ -1,5 +1,5 @@
-//! A Qwen3 decoder stack as manifest calls: the talker and the code predictor
-//! are both one of these.
+//! A Qwen3 decoder stack as manifest calls: Qwen3-TTS's talker and code
+//! predictor and Higgs TTS's body are each one of these.
 //!
 //! [`Stack::forward`] emits one pass over `rows` token rows: from an input
 //! embedding buffer to the final norm's output, the residual stream alongside.

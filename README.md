@@ -26,9 +26,10 @@ OpenAI's GPT-Live WebSocket protocol on a clock that never drifts, with all
 sessions in one CUDA graph per tick ([docs/duplex.md](docs/duplex.md)).
 
 The repository holds the serving front end, the engine contracts, CPU-only
-simulated engines used to load-test the front end, and three GPU engines:
-Qwen3-TTS-12Hz-1.7B-CustomVoice ([docs/qwen3-tts.md](docs/qwen3-tts.md)) for
-speech, NVIDIA PersonaPlex-7B ([docs/personaplex.md](docs/personaplex.md))
+simulated engines used to load-test the front end, and four GPU engines:
+Qwen3-TTS-12Hz-1.7B-CustomVoice ([docs/qwen3-tts.md](docs/qwen3-tts.md)) and
+Higgs TTS 3 ([docs/higgs-audio.md](docs/higgs-audio.md)) for speech, NVIDIA
+PersonaPlex-7B ([docs/personaplex.md](docs/personaplex.md))
 for full duplex: **128 concurrent live sessions on one GB300 with no playback
 stall**, and HiDream-O1-Image ([docs/hidream-o1.md](docs/hidream-o1.md)), a
 pixel-space diffusion transformer, for OpenAI's `POST /v1/images/generations`.
@@ -52,6 +53,17 @@ target/release/pega-omni qwen3-tts --model-path Qwen3-TTS-12Hz-1.7B-CustomVoice
 curl -s localhost:8000/v1/audio/speech -H 'content-type: application/json' \
   -d '{"model":"Qwen3-TTS-12Hz-1.7B-CustomVoice","input":"Hello from pega-omni.","voice":"ryan",
        "extra":{"language":"english"}}' -o hello.wav
+```
+
+Higgs TTS 3 (4B) serves the same route; control tags such as `<|emotion:elation|>` go inside
+`input`:
+
+```bash
+cargo build --release -p omni-server --features higgs-audio
+target/release/pega-omni higgs-audio --model-path higgs-tts-3-4b
+
+curl -s localhost:8000/v1/audio/speech -H 'content-type: application/json' \
+  -d '{"model":"higgs-tts-3-4b","input":"Hello from pega-omni.","voice":"default"}' -o hello.wav
 ```
 
 PersonaPlex serves live sessions and a browser demo (microphone in, the model's
@@ -111,7 +123,7 @@ differs from OpenAI, it says so instead of guessing:
   `mp3` / `opus` / `aac` / `flac` are refused by name.
 - A streaming `wav` carries `0xFFFFFFFF` in both size fields.
 - Model-specific options go in one `extra` object that the engine declares
-  (the simulator accepts `{"frames": N}`, Qwen3-TTS `language` and `seed`);
+  (the simulator accepts `{"frames": N}`, Qwen3-TTS `language` and `seed`, Higgs TTS `seed`);
   unknown top-level fields are a `400`.
 - `stream` (not OpenAI's; vLLM clients such as `vllm bench serve` send it) is
   accepted and changes nothing: every response streams.
@@ -128,8 +140,9 @@ differs from OpenAI, it says so instead of guessing:
 | `omni-frontend` | axum routes, request parsing, wav / pcm / SSE framing, PNG, metrics |
 | `omni-sim` | the simulated engines (speech, live and image): pure cores plus thread shells |
 | `omni-kern` | the kern manifest builder, weight loading and CUDA helpers the GPU engines share |
-| `omni-qwen3` | the Qwen3 decoder stack as manifest calls over paged or dense KV, and its CUDA kernels; Qwen3-TTS builds on it |
+| `omni-qwen3` | the Qwen3 decoder stack as manifest calls over paged or dense KV, and its CUDA kernels; Qwen3-TTS and Higgs TTS build on it |
 | `omni-qwen3-tts` | Qwen3-TTS as one kern manifest (talker, code predictor, sampler, streaming codec decoder, own CUDA kernels), prompt, engine |
+| `omni-higgs-audio` | Higgs TTS 3 as one kern manifest (Qwen3 body, fused 8-codebook head and draws, folded-quantizer DAC codec decoder, own CUDA kernels), delay pattern, prompt, engine |
 | `omni-personaplex` | PersonaPlex-7B as one kern manifest (Mimi encoder, Helium, depformer, Mimi decoder, own CUDA kernels), prompt, tokenizer, live engine |
 | `omni-hidream-o1` | HiDream-O1-Image as one kern manifest (diffusion transformer, sampler, own CUDA kernels), sharded weights, prompt and M-RoPE, engine |
 | `omni-server` | the `pega-omni` binary |

@@ -1,10 +1,10 @@
 //! The delay pattern: codebook `c` of a frame is drawn `c` steps after codebook 0, so a step
 //! draws one code per codebook but every frame is spread over eight steps.
 //!
-//! [`Delay`] is the sampler's state machine at temperature-independent level: which codebooks
-//! of the next step are not drawn (they read [`BOC`]), and when generation ends. The first
-//! `CODEBOOKS` steps are the ramp; after it, codebook 0 drawing [`EOC`] starts a countdown of
-//! `CODEBOOKS - 2` more steps. [`undelay`] puts the drawn rows back into frames.
+//! [`Delay`] says which codebooks of the next step are not drawn (they read [`BOC`]) and when
+//! generation ends: the first `CODEBOOKS` steps are the ramp, and after it codebook 0 drawing
+//! [`EOC`] starts a countdown of `CODEBOOKS - 2` more steps. [`undelay`] puts the drawn rows back
+//! into frames.
 
 use crate::config::CODEBOOKS;
 
