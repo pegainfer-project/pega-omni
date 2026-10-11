@@ -1,11 +1,12 @@
-//! A Qwen3 decoder stack as manifest calls: the talker and the code predictor
-//! are both one of these.
+//! A Qwen3 decoder stack as manifest calls: Qwen3-TTS's talker and code
+//! predictor and Higgs TTS's body are each one of these.
 //!
 //! [`Stack::forward`] emits one pass over `rows` token rows: from an input
 //! embedding buffer to the final norm's output, the residual stream alongside.
-//! Where a row's K and V go, and which keys it attends to, is its [`Kv`]: the
-//! talker's paged state, or the code predictor's per-call workspace.
+//! Where a row's K and V go, and which keys it attends to, is its [`Kv`]: a
+//! paged state, or a per-call workspace.
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
 use serde_json::Value;
@@ -25,7 +26,7 @@ use omni_kern::weights::File;
 use omni_kern::weights::concat_rows;
 
 pub const HEAD_DIM: usize = 128;
-/// Tokens per page of the talker's paged KV.
+/// Tokens per page of a paged KV.
 pub const PAGE: usize = 16;
 
 struct Layer {
@@ -41,6 +42,7 @@ struct Layer {
 
 pub struct Stack {
     pub cfg: config::Stack,
+    rope_theta: f32,
     layers: Vec<Layer>,
     norm: String,
 }
@@ -95,6 +97,14 @@ impl Stack {
             cfg.head_dim
         );
         ensure!(cfg.hidden_size.is_multiple_of(256) && cfg.hidden_size <= 8192, "{prefix}: hidden {}", cfg.hidden_size);
+        let group = cfg.num_attention_heads.checked_div(cfg.num_key_value_heads).unwrap_or(0);
+        ensure!(
+            matches!(group, 1 | 2 | 4) && group * cfg.num_key_value_heads == cfg.num_attention_heads,
+            "{prefix}: {} query heads over {} key heads (attention is built for groups of 1, 2 or 4)",
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads
+        );
+        let rope_theta = cfg.rope_theta().with_context(|| prefix.to_string())?;
         let (h, d) = (cfg.hidden_size, cfg.head_dim);
         let (q, kv, inter) = (cfg.num_attention_heads * d, cfg.num_key_value_heads * d, cfg.intermediate_size);
         let layers = (0..cfg.num_hidden_layers)
@@ -127,7 +137,7 @@ impl Stack {
             })
             .collect::<Result<_>>()?;
         let norm = g.weight(&format!("{name}.norm"), &[h], &file.expect(&format!("{prefix}.norm.weight"), &[h])?.data);
-        Ok(Self { cfg: cfg.clone(), layers, norm })
+        Ok(Self { cfg: cfg.clone(), rope_theta, layers, norm })
     }
 
     pub fn qkv_width(&self) -> usize {
@@ -149,7 +159,7 @@ impl Stack {
         let per_row = [rows.clone(), json!(1), json!(1)];
         g.launch(
             &format!("{label}.embed_norm"),
-            "talker_norm_copy",
+            "qwen3_norm_copy",
             per_row.clone(),
             norm_block,
             vec![inb(input), inb(&self.layers[0].ln1), outb(s.x), outb(s.res), i32a(h), f32a(c.rms_norm_eps)],
@@ -161,13 +171,13 @@ impl Stack {
             g.gemm_rows(&at("o"), (buf(s.x), buf(s.attn), buf(&l.o)), n_arg.clone(), (h, hq * HEAD_DIM));
             g.launch(
                 &at("post_attn_norm"),
-                "talker_add_norm",
+                "qwen3_add_norm",
                 per_row.clone(),
                 norm_block,
                 vec![inb(s.x), io(s.res), inb(&l.ln2), outb(s.x), i32a(h), f32a(c.rms_norm_eps), i32a(1), i32a(0)],
             );
             g.gemm_rows(&at("gate_up"), (buf(s.gate_up), buf(s.x), buf(&l.gate_up)), n_arg.clone(), (2 * inter, h));
-            g.each8(&at("silu_mul"), "talker_silu_mul", rows, inter, vec![inb(s.gate_up), outb(s.act), i32a(inter)]);
+            g.each8(&at("silu_mul"), "qwen3_silu_mul", rows, inter, vec![inb(s.gate_up), outb(s.act), i32a(inter)]);
             g.gemm_rows(&at("down"), (buf(s.x), buf(s.act), buf(&l.down)), n_arg.clone(), (h, inter));
             let (next, dst, every, which) = match self.layers.get(i + 1) {
                 Some(n) => (&n.ln1, s.x, 1, 0),
@@ -175,7 +185,7 @@ impl Stack {
             };
             g.launch(
                 &at("next_norm"),
-                "talker_add_norm",
+                "qwen3_add_norm",
                 per_row.clone(),
                 norm_block,
                 vec![
@@ -209,20 +219,20 @@ impl Stack {
                     ini("kv_pages"),
                     i32a(PAGE),
                 ];
-                ("talker_rope", vec![ini("t_pos"), ini("t_slot"), ("inout state", state)], "talker_attend", paged)
+                ("qwen3_rope", vec![ini("t_pos"), ini("t_slot"), ("inout state", state)], "qwen3_attend", paged)
             }
             Kv::Dense { prefix, per, base, span } => {
                 let ws = format!("{prefix}{i}");
                 let layout = [i32a(per), i32a(base), i32a(span)];
                 let rope_kv = [&[outb(&ws)][..], &layout].concat();
-                ("talker_rope_dense", rope_kv, "talker_attend_dense", [&[inb(&ws)][..], &layout].concat())
+                ("qwen3_rope_dense", rope_kv, "qwen3_attend_dense", [&[inb(&ws)][..], &layout].concat())
             }
         };
         let heads = json!((hq + 2 * hk).div_ceil(8));
         let rope_args = [
             &[io(s.qkv), inb(&l.q_norm), inb(&l.k_norm)][..],
             &rope_kv,
-            &[i32a(hq), i32a(hk), f32a(c.rms_norm_eps), f32a(c.rope_theta)],
+            &[i32a(hq), i32a(hk), f32a(c.rms_norm_eps), f32a(self.rope_theta)],
         ];
         g.launch(&format!("{label}.rope"), rope, [rows.clone(), heads, json!(1)], 256, rope_args.concat());
         let scale = f32a(1.0 / (HEAD_DIM as f32).sqrt());
