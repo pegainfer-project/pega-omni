@@ -27,7 +27,7 @@ sessions in one CUDA graph per tick ([docs/duplex.md](docs/duplex.md)).
 
 The repository holds the serving front end, the engine contracts, CPU-only
 simulated engines used to load-test the front end, and three GPU engines:
-Qwen3-TTS-12Hz-1.7B-CustomVoice ([docs/qwen3-tts.md](docs/qwen3-tts.md)) for
+Qwen3-TTS-12Hz-1.7B CustomVoice / VoiceDesign ([docs/qwen3-tts.md](docs/qwen3-tts.md)) for
 speech, NVIDIA PersonaPlex-7B ([docs/personaplex.md](docs/personaplex.md))
 for full duplex: **128 concurrent live sessions on one GB300 with no playback
 stall**, and HiDream-O1-Image ([docs/hidream-o1.md](docs/hidream-o1.md)), a
@@ -52,6 +52,18 @@ target/release/pega-omni qwen3-tts --model-path Qwen3-TTS-12Hz-1.7B-CustomVoice
 curl -s localhost:8000/v1/audio/speech -H 'content-type: application/json' \
   -d '{"model":"Qwen3-TTS-12Hz-1.7B-CustomVoice","input":"Hello from pega-omni.","voice":"ryan",
        "extra":{"language":"english"}}' -o hello.wav
+```
+
+VoiceDesign uses the same subcommand with its own checkpoint. Describe the
+voice in `instructions`; `voice` is a required SDK field but is ignored by this
+model, which advertises no preset voices:
+
+```bash
+target/release/pega-omni qwen3-tts --model-path Qwen3-TTS-12Hz-1.7B-VoiceDesign
+
+curl -s localhost:8000/v1/audio/speech -H 'content-type: application/json' \
+  -d '{"model":"Qwen3-TTS-12Hz-1.7B-VoiceDesign","input":"Hello from pega-omni.","voice":"alloy",
+       "instructions":"A low, slow, middle-aged male voice.","extra":{"language":"english"}}' -o designed.wav
 ```
 
 PersonaPlex serves live sessions and a browser demo (microphone in, the model's

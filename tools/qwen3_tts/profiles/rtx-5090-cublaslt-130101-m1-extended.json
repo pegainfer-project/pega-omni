@@ -1,0 +1,203 @@
+{
+  "device": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "cublaslt": 130101
+  },
+  "description": "Nine opt-in M=1 BF16 algorithms for this device and cuBLASLt version. Existing numerical goldens pass; same-binary serving and fixed-code single-stream replay improve, while batched results are approximately flat. Free generation is not bitwise equivalent.",
+  "gemms": [
+    {
+      "m": 1,
+      "n": 1024,
+      "k": 3072,
+      "algo": {
+        "id": 13,
+        "tile": 0,
+        "stages": 0,
+        "split_k": 1,
+        "reduction": 0,
+        "swizzle": 0,
+        "custom": 75,
+        "inner_shape": 0,
+        "cluster_shape": 0
+      },
+      "baseline_us": 5.708000157,
+      "selected_us": 3.434875049,
+      "speedup": 1.6617781070847915
+    },
+    {
+      "m": 1,
+      "n": 2048,
+      "k": 1024,
+      "algo": {
+        "id": 13,
+        "tile": 0,
+        "stages": 0,
+        "split_k": 1,
+        "reduction": 0,
+        "swizzle": 0,
+        "custom": 75,
+        "inner_shape": 0,
+        "cluster_shape": 0
+      },
+      "baseline_us": 3.753124969,
+      "selected_us": 2.798999893,
+      "speedup": 1.3408807118521744
+    },
+    {
+      "m": 1,
+      "n": 4096,
+      "k": 2048,
+      "algo": {
+        "id": 13,
+        "tile": 0,
+        "stages": 0,
+        "split_k": 1,
+        "reduction": 0,
+        "swizzle": 0,
+        "custom": 75,
+        "inner_shape": 0,
+        "cluster_shape": 0
+      },
+      "baseline_us": 8.163125254,
+      "selected_us": 5.216499791,
+      "speedup": 1.5648664010461186
+    },
+    {
+      "m": 1,
+      "n": 2048,
+      "k": 2048,
+      "algo": {
+        "id": 13,
+        "tile": 0,
+        "stages": 0,
+        "split_k": 1,
+        "reduction": 0,
+        "swizzle": 0,
+        "custom": 75,
+        "inner_shape": 0,
+        "cluster_shape": 0
+      },
+      "baseline_us": 5.802374799,
+      "selected_us": 3.464125097,
+      "speedup": 1.6749899719340302
+    },
+    {
+      "m": 1,
+      "n": 4096,
+      "k": 1024,
+      "algo": {
+        "id": 13,
+        "tile": 0,
+        "stages": 0,
+        "split_k": 1,
+        "reduction": 0,
+        "swizzle": 0,
+        "custom": 75,
+        "inner_shape": 0,
+        "cluster_shape": 0
+      },
+      "baseline_us": 5.160875153,
+      "selected_us": 3.939125221,
+      "micro_speedup": 1.3101576780262503,
+      "random_probe_differing_bf16_elements": 1,
+      "random_probe_oracle_relative_l2": 0.001657081335
+    },
+    {
+      "m": 1,
+      "n": 1024,
+      "k": 2048,
+      "algo": {
+        "id": 13,
+        "tile": 0,
+        "stages": 0,
+        "split_k": 1,
+        "reduction": 0,
+        "swizzle": 0,
+        "custom": 75,
+        "inner_shape": 0,
+        "cluster_shape": 0
+      },
+      "baseline_us": 4.741500132,
+      "selected_us": 2.697749995,
+      "micro_speedup": 1.7575758097629055,
+      "random_probe_differing_bf16_elements": 1,
+      "random_probe_oracle_relative_l2": 0.001665751098
+    },
+    {
+      "m": 1,
+      "n": 6144,
+      "k": 1024,
+      "algo": {
+        "id": 13,
+        "tile": 0,
+        "stages": 0,
+        "split_k": 1,
+        "reduction": 0,
+        "swizzle": 0,
+        "custom": 75,
+        "inner_shape": 0,
+        "cluster_shape": 0
+      },
+      "baseline_us": 6.153875031,
+      "selected_us": 5.104999989,
+      "micro_speedup": 1.2054603416768,
+      "random_probe_differing_bf16_elements": 1,
+      "random_probe_oracle_relative_l2": 0.001665080472
+    },
+    {
+      "m": 1,
+      "n": 12288,
+      "k": 2048,
+      "algo": {
+        "id": 13,
+        "tile": 0,
+        "stages": 0,
+        "split_k": 1,
+        "reduction": 0,
+        "swizzle": 0,
+        "custom": 75,
+        "inner_shape": 0,
+        "cluster_shape": 0
+      },
+      "baseline_us": 17.12574996,
+      "selected_us": 11.53025031,
+      "micro_speedup": 1.485288653720476,
+      "random_probe_differing_bf16_elements": 2,
+      "random_probe_oracle_relative_l2": 0.0016431968
+    },
+    {
+      "m": 1,
+      "n": 3072,
+      "k": 2048,
+      "algo": {
+        "id": 13,
+        "tile": 0,
+        "stages": 0,
+        "split_k": 1,
+        "reduction": 0,
+        "swizzle": 0,
+        "custom": 75,
+        "inner_shape": 0,
+        "cluster_shape": 0
+      },
+      "baseline_us": 7.028750144,
+      "selected_us": 4.671874922,
+      "micro_speedup": 1.5044816612922156,
+      "random_probe_differing_bf16_elements": 1,
+      "random_probe_oracle_relative_l2": 0.001704684482
+    }
+  ],
+  "validation": {
+    "goldens": [
+      "VoiceDesign English",
+      "VoiceDesign Chinese",
+      "VoiceDesign 366-frame continuous",
+      "CustomVoice English"
+    ],
+    "criterion": "unchanged prompt/logit gates and waveform SNR >30 dB; single and interleaved three-stream replays",
+    "bitwise_equal_real_model": false,
+    "evidence": "docs/bench.md#extended-single-row-gemm-profile",
+    "measured_profile_sha256": "b6bfa0866cf7c567d0636316dff702e991df46718db68a5b81e9e746d0f7f270",
+    "measurement_annotations_affect_algorithm_selection": false
+  }
+}

@@ -107,8 +107,9 @@ pub struct Model {
 }
 
 impl Model {
-    /// Loads the checkpoint at `dir` onto `device`.
-    pub fn load(device: usize, dir: &Path, limits: Limits) -> Result<Self> {
+    /// Loads the checkpoint at `dir` onto `device`, optionally selecting M=1
+    /// cuBLASLt algorithms from a profile measured on this GPU and library.
+    pub fn load(device: usize, dir: &Path, limits: Limits, gemm_algos: Option<&Path>) -> Result<Self> {
         let config = Config::load(dir)?;
         let tokenizer = Tokenizer::load(dir)?;
         let max_seqs = bucket(limits.max_batch);
@@ -117,7 +118,11 @@ impl Model {
         let cubins = [("codec", CODEC), ("talker", TALKER)].map(|(n, b)| (n, hex(&sha2::Sha256::digest(b)), b));
         // Each padding row of a graph call names the pad lease's page once more.
         let page_table = pages_max + max_seqs;
-        let (manifest, tensors) = generate(dir, &config, &cubins, max_seqs, limits.max_tokens, page_table)?;
+        let (mut manifest, tensors) = generate(dir, &config, &cubins, max_seqs, limits.max_tokens, page_table)?;
+        if let Some(path) = gemm_algos {
+            let calls = crate::gemm::Pins::load(path, device)?.apply(&mut manifest)?;
+            tracing::info!(profile = %path.display(), calls, "enabled M=1 GEMM algorithms");
+        }
         let verified = kern_manifest::verify(kern_manifest::Manifest::from_json(&manifest.to_string())?)
             .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
         let dir = kernels_dir(&cubins.each_ref().map(|(n, sha, b)| (*n, sha.as_str(), *b)))?;

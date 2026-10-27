@@ -44,7 +44,10 @@ pub mod image;
 pub struct EngineInfo {
     pub model: String,
     pub sample_rate: u32,
+    /// Fixed voices; an empty set means the request's `voice` is ignored.
     pub voices: BTreeSet<String>,
+    /// Whether a non-blank `instructions` field is needed to synthesize speech.
+    pub instructions_required: bool,
     /// Keys the engine accepts inside a request's `extra` object, and their values.
     pub extra: BTreeMap<String, Extra>,
     pub speeds: std::ops::RangeInclusive<f32>,
@@ -113,8 +116,11 @@ impl EngineInfo {
         if chars > self.max_input_chars {
             return invalid("input", format!("{chars} characters, the limit is {}", self.max_input_chars));
         }
-        if !self.voices.contains(&draft.voice) {
+        if !self.voices.is_empty() && !self.voices.contains(&draft.voice) {
             return invalid("voice", format!("unknown voice `{}`; see GET /v1/audio/voices", draft.voice));
+        }
+        if self.instructions_required && draft.instructions.as_deref().is_none_or(|s| s.trim().is_empty()) {
+            return invalid("instructions", "a non-blank instruction is required by this model".into());
         }
         let speed = draft.speed.unwrap_or(1.0);
         if !self.speeds.contains(&speed) {

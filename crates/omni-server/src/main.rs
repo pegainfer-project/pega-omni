@@ -27,7 +27,7 @@ enum Command {
     SimLive(SimLiveArgs),
     /// Serve the CPU-only simulated image engine.
     SimImage(SimImageArgs),
-    /// Serve Qwen3-TTS (12Hz CustomVoice) on one GPU.
+    /// Serve Qwen3-TTS (12Hz CustomVoice or VoiceDesign) on one GPU.
     #[cfg(feature = "qwen3-tts")]
     Qwen3Tts(Qwen3TtsArgs),
     /// Serve PersonaPlex-7B, full duplex, on one GPU.
@@ -182,6 +182,9 @@ struct Qwen3TtsArgs {
     chunk_frames: usize,
     #[arg(long, default_value_t = 4096)]
     max_input_chars: usize,
+    /// M=1 GEMM algorithm profile measured on this GPU and cuBLASLt; heuristic without.
+    #[arg(long)]
+    gemm_algos: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "qwen3-tts")]
@@ -194,6 +197,7 @@ impl Qwen3TtsArgs {
             kv_gib: self.kv_gib,
             first_chunk_frames: self.first_chunk_frames,
             chunk_frames: self.chunk_frames,
+            gemm_algos: self.gemm_algos.clone(),
         };
         let name = self.model.clone().unwrap_or_else(|| {
             self.model_path.file_name().map_or("qwen3-tts".into(), |n| n.to_string_lossy().into_owned())

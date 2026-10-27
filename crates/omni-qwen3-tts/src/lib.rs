@@ -1,4 +1,4 @@
-//! Qwen3-TTS (12 Hz tokenizer, CustomVoice) on one GPU.
+//! Qwen3-TTS (12 Hz tokenizer, CustomVoice and VoiceDesign) on one GPU.
 //!
 //! [`model::Model`] is the whole synthesis path as one kern manifest:
 //! [`talker`] turns a [`prompt`] into codec frames one call at a time,
@@ -8,6 +8,7 @@
 mod codec;
 pub mod config;
 pub mod engine;
+pub mod gemm;
 pub mod model;
 pub mod prompt;
 mod stack;

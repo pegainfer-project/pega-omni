@@ -10,6 +10,7 @@ omni-kern.workspace = true
 
 anyhow.workspace = true
 bytes.workspace = true
+cudarc.workspace = true
 kern-manifest.workspace = true
 kern-pool.workspace = true
 kern-runtime.workspace = true

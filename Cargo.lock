@@ -1651,6 +1651,7 @@ name = "omni-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "clap",
  "eventsource-stream",
@@ -1765,6 +1766,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "cudarc",
  "kern-manifest",
  "kern-pool",
  "kern-runtime",

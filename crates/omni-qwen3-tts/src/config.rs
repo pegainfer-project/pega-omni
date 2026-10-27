@@ -43,10 +43,19 @@ pub struct Talker {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Model {
+    pub tts_model_type: ModelType,
     pub tts_bos_token_id: i32,
     pub tts_eos_token_id: i32,
     pub tts_pad_token_id: i32,
     pub talker_config: Talker,
+}
+
+/// The supported checkpoint families; Base needs reference-audio encoders.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelType {
+    CustomVoice,
+    VoiceDesign,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
