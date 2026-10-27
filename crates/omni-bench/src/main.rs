@@ -6,6 +6,8 @@
 //! real-time factor, and playback underrun: a player that starts at the first
 //! packet and plays in real time, stalling whenever the next audio has not
 //! arrived. Stall time is what a listener hears as a gap.
+//! TTFP and E2E start at dispatch; their `arrival_` counterparts also include
+//! client wait from the scheduled arrival, including the concurrency gate.
 //!
 //! `omni-bench duplex` loads a live endpoint instead ([`duplex`]).
 
@@ -90,7 +92,7 @@ struct Cli {
     warmup: usize,
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    /// Per-request timeout in seconds.
+    /// Per-dispatched-request timeout in seconds; excludes client wait.
     #[arg(long, default_value_t = 600)]
     timeout: u64,
     /// Write the summary and per-request records as JSON here.
@@ -118,8 +120,14 @@ enum Framing {
 struct Record {
     ok: bool,
     error: Option<String>,
+    /// Offsets from the start of the measured arrival schedule.
+    scheduled_ms: f64,
+    dispatch_ms: f64,
+    client_wait_ms: f64,
     ttfp_ms: Option<f64>,
     e2e_ms: f64,
+    arrival_ttfp_ms: Option<f64>,
+    arrival_e2e_ms: f64,
     audio_s: f64,
     underrun_ms: f64,
 }
@@ -163,8 +171,9 @@ struct Shot {
 }
 
 impl Shot {
-    async fn fire(&self, input: &str) -> Record {
+    async fn fire(&self, input: &str, scheduled: Instant, epoch: Instant) -> Record {
         let started = Instant::now();
+        let wait_ms = started.saturating_duration_since(scheduled).as_secs_f64() * 1e3;
         let mut body = self.body_template.clone();
         body["input"] = Value::String(input.to_string());
         let mut playback = Playback::default();
@@ -178,8 +187,13 @@ impl Shot {
         Record {
             ok: error.is_none(),
             error,
+            scheduled_ms: scheduled.duration_since(epoch).as_secs_f64() * 1e3,
+            dispatch_ms: started.duration_since(epoch).as_secs_f64() * 1e3,
+            client_wait_ms: wait_ms,
             ttfp_ms: playback.first().map(|t| t.duration_since(started).as_secs_f64() * 1e3),
             e2e_ms: e2e.as_secs_f64() * 1e3,
+            arrival_ttfp_ms: playback.first().map(|t| t.saturating_duration_since(scheduled).as_secs_f64() * 1e3),
+            arrival_e2e_ms: wait_ms + e2e.as_secs_f64() * 1e3,
             audio_s: playback.audio_seconds(),
             underrun_ms: playback.stall().as_secs_f64() * 1e3,
         }
@@ -244,8 +258,11 @@ struct Summary {
     duration_s: f64,
     request_throughput: f64,
     audio_throughput: f64,
+    client_wait_ms: Percentiles,
     ttfp_ms: Percentiles,
     e2e_ms: Percentiles,
+    arrival_ttfp_ms: Percentiles,
+    arrival_e2e_ms: Percentiles,
     rtf: Percentiles,
     underrun_ms: Percentiles,
     underrun_requests: usize,
@@ -289,8 +306,11 @@ fn summarize(label: &str, records: &[Record], duration: Duration) -> Summary {
         duration_s: secs,
         request_throughput: ok.len() as f64 / secs,
         audio_throughput: ok.iter().map(|r| r.audio_s).sum::<f64>() / secs,
+        client_wait_ms: percentiles(records.iter().map(|r| r.client_wait_ms)),
         ttfp_ms: percentiles(ok.iter().filter_map(|r| r.ttfp_ms)),
         e2e_ms: percentiles(ok.iter().map(|r| r.e2e_ms)),
+        arrival_ttfp_ms: percentiles(ok.iter().filter_map(|r| r.arrival_ttfp_ms)),
+        arrival_e2e_ms: percentiles(ok.iter().map(|r| r.arrival_e2e_ms)),
         rtf: percentiles(ok.iter().filter(|r| r.audio_s > 0.0).map(|r| r.e2e_ms / 1e3 / r.audio_s)),
         underrun_ms: percentiles(ok.iter().map(|r| r.underrun_ms)),
         underrun_requests: ok.iter().filter(|r| r.underrun_ms > 1.0).count(),
@@ -299,7 +319,7 @@ fn summarize(label: &str, records: &[Record], duration: Duration) -> Summary {
 
 fn print(s: &Summary) {
     let row = |name: &str, p: &Percentiles| {
-        println!("{name:<14} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3}", p.mean, p.p50, p.p90, p.p99, p.max)
+        println!("{name:<16} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3}", p.mean, p.p50, p.p90, p.p99, p.max)
     };
     println!("requests {} ok {} failed {} in {:.3} s", s.requests, s.ok, s.failed, s.duration_s);
     for (e, n) in &s.errors {
@@ -309,9 +329,12 @@ fn print(s: &Summary) {
         "request throughput {:.1} req/s, audio throughput {:.1} audio-s/s",
         s.request_throughput, s.audio_throughput
     );
-    println!("{:<14} {:>10} {:>10} {:>10} {:>10} {:>10}", "", "mean", "p50", "p90", "p99", "max");
+    println!("{:<16} {:>10} {:>10} {:>10} {:>10} {:>10}", "", "mean", "p50", "p90", "p99", "max");
+    row("client wait ms", &s.client_wait_ms);
     row("ttfp ms", &s.ttfp_ms);
     row("e2e ms", &s.e2e_ms);
+    row("arrival ttfp ms", &s.arrival_ttfp_ms);
+    row("arrival e2e ms", &s.arrival_e2e_ms);
     row("rtf", &s.rtf);
     row("underrun ms", &s.underrun_ms);
     println!("requests with underrun > 1 ms: {}", s.underrun_requests);
@@ -359,7 +382,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if cli.warmup > 0 {
         let warm = futures_util::future::join_all((0..cli.warmup).map(|i| {
             let (shot, prompts) = (shot.clone(), prompts.clone());
-            async move { shot.fire(&prompts[i % prompts.len()]).await }
+            async move {
+                let now = Instant::now();
+                shot.fire(&prompts[i % prompts.len()], now, now).await
+            }
         }))
         .await;
         let failed = warm.iter().filter(|r| !r.ok).count();
@@ -380,9 +406,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             tokio::time::sleep_until(next.into()).await;
         }
         let (shot, prompts, gate) = (shot.clone(), prompts.clone(), gate.clone());
+        let scheduled = next;
         tasks.push(tokio::spawn(async move {
             let _permit = gate.acquire_owned().await.expect("semaphore never closes");
-            shot.fire(&prompts[i % prompts.len()]).await
+            shot.fire(&prompts[i % prompts.len()], scheduled, started).await
         }));
     }
     let mut records = Vec::with_capacity(tasks.len());
