@@ -1,5 +1,7 @@
 //! Compiles `kernels/*.cu` to the cubins the model's kern manifest pins.
-//! `OMNI_CUDA_ARCH` picks the target (default `103a`, GB300). nvcc is `$NVCC`,
+//! `OMNI_CUDA_ARCH` picks the target (default `103a`, GB300) and whether the
+//! manifest can use programmatic dependent launch (compute capability 9.0+).
+//! nvcc is `$NVCC`,
 //! else `$CUDA_PATH/bin/nvcc`, else `/usr/local/cuda/bin/nvcc`, else `nvcc` on
 //! the `PATH`.
 
@@ -16,6 +18,14 @@ fn nvcc() -> PathBuf {
 
 fn main() {
     let arch = std::env::var("OMNI_CUDA_ARCH").unwrap_or_else(|_| "103a".into());
+    let capability: u32 = arch
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .parse()
+        .expect("OMNI_CUDA_ARCH must be a CUDA architecture such as 86, 90 or 103a");
+    println!("cargo:rustc-check-cfg=cfg(qwen3_tts_pdl)");
+    if capability >= 90 {
+        println!("cargo:rustc-cfg=qwen3_tts_pdl");
+    }
     for var in ["OMNI_CUDA_ARCH", "NVCC", "CUDA_PATH"] {
         println!("cargo:rerun-if-env-changed={var}");
     }
