@@ -69,9 +69,10 @@ bias epilogue and into the next conv's im2col), causal im2col over a
 double-buffered history, overlap-add carrying the previous frame's row,
 depthwise conv + LayerNorm, and the output conv. Residual GEMMs accumulate in
 place (cuBLASLt with beta = 1) and their biases ride along to the next
-consumer's epilogue, so no kernel exists only to add. Every codec kernel
-launches with programmatic dependent launch and loads its weights before
-waiting on its producer.
+consumer's epilogue, so no kernel exists only to add. On compute capability
+9.0+, every codec kernel launches with programmatic dependent launch (PDL)
+and loads its weights before waiting on its producer. Older targets use
+ordinary stream dependencies. Both paths retain CUDA graphs.
 
 GEMMs are kern's cuBLASLt built-in. `build.rs` compiles both files to cubins
 (`OMNI_CUDA_ARCH`, default `103a`, GB300); the manifest pins their sha256.
@@ -79,6 +80,21 @@ kern verifies the manifest, checks every launch's ABI against its cubin,
 allocates buffers at their var bounds, hands out KV pages and state slots, and
 captures `first` and `decode` per bucket. Weight layout transforms (fused QKV
 and gate/up, conv taps, folded scales) happen once at load, on the host.
+
+## Build targets
+
+`OMNI_CUDA_ARCH` selects the target architecture (`103a` by default).
+For an RTX 3090 (`86`), build and run with a small batch and KV budget:
+
+```bash
+OMNI_CUDA_ARCH=86 CARGO_TARGET_DIR=target-sm86 \
+  cargo build --release --locked -p omni-server --no-default-features --features qwen3-tts
+CUDA_VISIBLE_DEVICES=0 target-sm86/release/pega-omni qwen3-tts \
+  --model-path /path/to/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --model qwen3-tts --max-batch 2 --max-step-tokens 1024 --kv-gib 1
+```
+
+`NVCC` or `CUDA_PATH` selects the toolkit when it is not at the default path.
 
 ## Correctness
 
@@ -113,6 +129,47 @@ rounding: two streams of the same codes in one batch come out bit-identical.
 Served audio through Whisper large-v3-turbo transcribes back to the input for
 English, Chinese (with `instructions`, and the Sichuan dialect speaker) and
 Japanese, including 8 concurrent requests in one batch.
+
+### RTX 3090 validation, 2026-11-11
+
+Validated on sm86 with driver 595.58.03 and nvcc 13.2.51. The official
+reference used torch/torchaudio 2.11.0+cu130, qwen-tts at `022e286b`, BF16 and
+SDPA. The CustomVoice checkpoint revision was
+`0c0e3051f131929182e2c023b9537f8b1c68adfe`. The recorder's default English
+text, Ryan voice and seed 0 produced 70 frames; the fixture SHA256 was
+`304ac07f75c28259bba105f1ff8e6e10a8efb907132cd6df87f21129c0f8f622`.
+
+The existing golden ran with batch 3, 1024 prompt tokens and a 0.5 GiB KV
+setting. Replay the reference with the sm86 build:
+
+```bash
+OMNI_CUDA_ARCH=86 CARGO_TARGET_DIR=target-sm86 CUDA_VISIBLE_DEVICES=0 \
+  OMNI_QWEN3_TTS_MODEL=/path/to/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  OMNI_QWEN3_TTS_GOLDEN=/path/to/en-ryan.safetensors \
+  cargo test --release --locked -p omni-qwen3-tts --test golden -- --nocapture
+```
+
+`OMNI_QWEN3_TTS_MODEL` and `OMNI_QWEN3_TTS_GOLDEN` must both be set; the
+test skips when either is unset. The thresholds were unchanged:
+
+| check | sm86 result |
+|---|---|
+| tokenizer ids | identical |
+| prompt embeddings | worst row cosine 0.999994 |
+| talker logits, 71 steps | worst cosine 0.99994, argmax agrees 98.6% |
+| code-predictor logits, 70 × 15 | worst cosine 0.99933, argmax agrees 95.0% |
+| codec, streamed frame by frame | 34.56 dB SNR |
+| codec, a stream joining 7 frames late | 34.24 dB SNR |
+| two streams of the same forced frames | bit-identical waveforms |
+
+The real server passed the official SDK check with openai 3.49.0 (WAV, PCM,
+SSE, errors and model listing) and the concurrent-request/cancellation e2e.
+With batch 2, 1024 prompt tokens and a 1 GiB KV setting, its process used
+6134 MiB after load and at most 6160 MiB in 0.5-second samples during the
+checks. Other GPU workloads were active; this is a functional validation
+and a sampled memory observation, not a throughput or latency measurement.
+The `103a` target was compiled; its GPU correctness and PDL execution still
+need a run on matching hardware.
 
 ## Performance
 
