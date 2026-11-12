@@ -58,6 +58,37 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-features --locked
 
+  qwen3-tts:
+    name: Qwen3-TTS compile (sm_${{ matrix.cuda_arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cuda_arch: ["86", "103a"]
+    env:
+      CUDA: "13-4"
+      OMNI_CUDA_ARCH: ${{ matrix.cuda_arch }}
+      CARGO_TARGET_DIR: target/qwen3-tts-${{ matrix.cuda_arch }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the CUDA compiler and headers
+        run: |
+          set -euo pipefail
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends cuda-nvcc-$CUDA cuda-cudart-dev-$CUDA
+          cuda=/usr/local/cuda-${CUDA/-/.}
+          echo "$cuda/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: qwen3-tts-${{ matrix.cuda_arch }}
+          workspaces: . -> target/qwen3-tts-${{ matrix.cuda_arch }}
+      - name: Build the Qwen3-TTS server
+        run: cargo build --release --locked -p omni-server --no-default-features --features qwen3-tts
+      - name: Compile the GPU golden test
+        run: cargo test --release --locked -p omni-qwen3-tts --test golden --no-run
+
   e2e:
     name: OpenAI SDK, GPT-Live and load smoke
     runs-on: ubuntu-latest
@@ -69,11 +100,13 @@ jobs:
       - run: cargo build --release --locked
       - name: Start the simulated engine
         run: |
-          target/release/pega-omni sim --listen 127.0.0.1:8000 > server.log 2>&1 &
+          target/release/pega-omni sim --listen 127.0.0.1:8000 --step-base-us 1000 > server.log 2>&1 &
           for _ in $(seq 50); do curl -sf localhost:8000/health && exit 0; sleep 0.2; done
           cat server.log; exit 1
       - name: Official openai SDK conforms
         run: uv run --with openai tools/openai_sdk_check.py --base-url http://127.0.0.1:8000/v1
+      - name: Speech concurrency and cancellation
+        run: uv run tools/speech_e2e_check.py --base-url http://127.0.0.1:8000/v1
       - name: Start the simulated image engine
         run: |
           target/release/pega-omni sim-image --listen 127.0.0.1:8002 > server-image.log 2>&1 &

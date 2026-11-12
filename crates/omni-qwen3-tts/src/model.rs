@@ -317,7 +317,7 @@ fn generate(
     page_table: usize,
 ) -> Result<(Value, HostTensors)> {
     let t = &config.model.talker_config;
-    let mut g = Gen::with_pdl(&["codec"]);
+    let mut g = if cfg!(qwen3_tts_pdl) { Gen::with_pdl(&["codec"]) } else { Gen::default() };
     let talker = Talker::load(&mut g, &File::open(&dir.join("model.safetensors"))?, &config.model, &config.generation)?;
     talker.init(&mut g);
     let init = g.take();
