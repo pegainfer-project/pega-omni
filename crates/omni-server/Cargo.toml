@@ -17,6 +17,8 @@ qwen3-tts = ["dep:omni-qwen3-tts"]
 personaplex = ["dep:omni-personaplex"]
 # The HiDream-O1 image engine; needs the CUDA toolkit to build.
 hidream-o1 = ["dep:omni-hidream-o1"]
+# The Qwen-Image-2.1 image engine; needs the CUDA toolkit to build.
+qwen-image-21 = ["dep:omni-qwen-image-21"]
 
 [dependencies]
 omni-engine.workspace = true
@@ -25,6 +27,7 @@ omni-sim.workspace = true
 omni-qwen3-tts = { workspace = true, optional = true }
 omni-personaplex = { workspace = true, optional = true }
 omni-hidream-o1 = { workspace = true, optional = true }
+omni-qwen-image-21 = { workspace = true, optional = true }
 
 anyhow.workspace = true
 clap.workspace = true
