@@ -38,6 +38,7 @@ return its own input.
 """
 
 import argparse
+import os
 import signal
 import socket
 import stat
@@ -64,6 +65,11 @@ VAE_SCALE = 16
 MAX_TEXT_TOKENS = 2048
 # A request larger than this is a framing error, not something to allocate for.
 MAX_REQUEST = 8 << 20
+
+# Sidecar VAE knobs, env-gated; the defaults are the shipped fp32 / 256-px path.
+VAE_TILE = int(os.environ.get("OMNI_VAE_TILE", "256"))
+VAE_DTYPE = os.environ.get("OMNI_VAE_DTYPE", "fp32")
+OFFLOAD_ENCODER = os.environ.get("OMNI_VAE_OFFLOAD_ENCODER") == "1"
 
 
 def log(message: str) -> None:
@@ -167,20 +173,22 @@ class Encoder:
 
 
 class Decoder:
-    """The VAE in float32, which is the dtype the reference decodes in."""
+    """The VAE; fp32 by default (the reference's decode dtype), bf16 via OMNI_VAE_DTYPE."""
 
     def __init__(self, directory: Path, device: torch.device):
         from diffusers import AutoencoderKLQwenImage21
 
         self.device = device
+        self.dtype = torch.bfloat16 if VAE_DTYPE == "bf16" else torch.float32
         self.vae = (
             AutoencoderKLQwenImage21.from_pretrained(
-                directory / "vae", torch_dtype=torch.float32, local_files_only=True,
+                directory / "vae", torch_dtype=self.dtype, local_files_only=True,
                 device_map=f"cuda:{device.index}",
             )
             .eval()
         )
-        self.vae.enable_tiling(tile_sample_min_height=256, tile_sample_min_width=256)
+        if VAE_TILE > 0:
+            self.vae.enable_tiling(tile_sample_min_height=VAE_TILE, tile_sample_min_width=VAE_TILE)
         self.channels = self.vae.config.z_dim
         if self.channels != LATENT_DIM:
             raise ValueError(f"the vae has {self.channels} latent channels, a token is {LATENT_DIM}")
@@ -190,9 +198,9 @@ class Decoder:
         if len(mean) != self.channels or len(std) != self.channels:
             raise ValueError(f"vae config has {len(mean)} means and {len(std)} stds for {self.channels} channels")
         shape = (1, self.channels, 1, 1, 1)
-        self.mean = torch.tensor(mean, dtype=torch.float32, device=device).view(shape)
-        self.std = torch.tensor(std, dtype=torch.float32, device=device).view(shape)
-        log(f"vae: {self.channels} latent channels, {VAE_SCALE}x spatial")
+        self.mean = torch.tensor(mean, dtype=self.dtype, device=device).view(shape)
+        self.std = torch.tensor(std, dtype=self.dtype, device=device).view(shape)
+        log(f"vae: {self.channels} latent channels, {VAE_SCALE}x spatial, dtype {VAE_DTYPE}, tile {VAE_TILE}")
 
     def decode(self, height: int, width: int, payload: bytes) -> bytes:
         rows, extra = divmod(len(payload), self.channels * 2)
@@ -205,7 +213,7 @@ class Decoder:
             raise ValueError(f"{height}x{width} wants {grid_h * grid_w} latent rows, got {rows}")
         latent = torch.frombuffer(bytearray(payload), dtype=torch.bfloat16).view(1, rows, self.channels)
         z = latent.transpose(1, 2).reshape(1, self.channels, 1, grid_h, grid_w)
-        z = z.to(device=self.device, dtype=torch.float32) * self.std + self.mean
+        z = z.to(device=self.device, dtype=self.dtype) * self.std + self.mean
         with torch.no_grad():
             # (1, channels, 1, H, W), already clamped to [-1, 1] by the VAE.
             image = self.vae.decode(z, return_dict=False)[0][0, :3, 0]
@@ -226,6 +234,12 @@ def respond(kind: int, payload: bytes, encoder: Encoder, decoder: Decoder) -> by
         height, width, rows = struct.unpack("<III", payload[:12])
         if len(payload) != 12 + rows * LATENT_DIM * 2:
             raise ValueError(f"{rows} latent rows, payload is {len(payload)} bytes")
+        if OFFLOAD_ENCODER:
+            encoder.offload()
+            try:
+                return decoder.decode(height, width, payload[12:])
+            finally:
+                encoder.reload()
         return decoder.decode(height, width, payload[12:])
     raise ValueError(f"unknown request kind {kind}")
 

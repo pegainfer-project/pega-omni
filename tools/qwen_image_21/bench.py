@@ -9,6 +9,7 @@ import base64
 import json
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 def generate(url, model, prompt, size, seed):
     body = json.dumps({"model": model, "prompt": prompt, "size": size, "extra": {"seed": seed}}).encode()
@@ -29,27 +30,35 @@ def main():
     ap.add_argument("--n", type=int, default=5)
     ap.add_argument("--size", default="1024x1024")
     ap.add_argument("--prompt", default="A lighthouse on a cliff at dawn.")
+    ap.add_argument("--concurrency", type=int, default=1, help="in-flight requests (1 = sequential)")
     args = ap.parse_args()
 
     # Warmup
     print("Warming up...")
     generate(args.url, args.model, args.prompt, args.size, 0)
 
-    times = []
-    for i in range(args.n):
+    def one(i):
         dt, nbytes = generate(args.url, args.model, args.prompt, args.size, i + 1)
-        times.append(dt)
         print(f"  request {i+1}: {dt:.3f}s ({nbytes} bytes)")
+        return dt
+
+    t0 = time.perf_counter()
+    if args.concurrency <= 1:
+        times = [one(i) for i in range(args.n)]
+    else:
+        with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+            times = list(ex.map(one, range(args.n)))
+    wall = time.perf_counter() - t0
 
     times.sort()
     p50 = times[len(times) // 2]
     p95 = times[int(len(times) * 0.95)]
     mean = sum(times) / len(times)
-    print(f"\nResults ({args.n} requests, {args.size}):")
+    print(f"\nResults ({args.n} requests, {args.size}, c={args.concurrency}):")
     print(f"  mean: {mean:.3f}s")
     print(f"  p50:  {p50:.3f}s")
     print(f"  p95:  {p95:.3f}s")
-    print(f"  throughput: {1/mean:.3f} images/s")
+    print(f"  throughput: {args.n / wall:.3f} images/s")
     print(f"  DiT steps: 8 (Turbo)")
 
 if __name__ == "__main__":
