@@ -339,7 +339,7 @@ struct QwenImage21Args {
     /// Python interpreter for the text-encoder / VAE sidecar.
     #[arg(long, default_value = "python3")]
     python: String,
-    /// Pinned GEMM algorithms (from qwen-image-21-tune-gemms).
+    /// Pinned cuBLASLt GEMM algorithms measured on this GPU; the heuristic without.
     #[arg(long)]
     gemm_algos: Option<std::path::PathBuf>,
 }
