@@ -59,22 +59,24 @@ mean of 3 warmed runs:
 | vLLM-Omni 0.33 (source) + vLLM 0.33.0 | 6.99 | 0.143 img/s |
 | diffusers eager | 6.28 | 0.159 img/s |
 
-pega-omni is ~7.6% faster than vLLM-Omni on the same card. Both engines cache
-the text prefix K/V, capture the decode step as a CUDA graph and run bf16 GEMMs
-near the L20 roofline, so the win is overhead, not math. The plausible
-differences: this engine captures each grid size once and keeps the graphs for
-the process's life, while the benchmarked vLLM-Omni tied its graph entries to
-the owning request's prefix cache and recaptured per request (a same-day fix
-makes the entries persistent); and the loop here is one process calling
-encode → DiT → VAE synchronously, with no framework scheduler between stages.
+pega-omni is ~7.6% faster than the *benchmarked* vLLM-Omni on the same card, but
+that gap is entirely vLLM-Omni's per-request graph recapture: once its entries are
+persistent it reaches ~5.55 s, faster than this engine's 6.46 s. Both engines cache
+the text prefix K/V and run bf16 GEMMs near the L20 roofline, so the difference is
+overhead, not math.
 
-Measured A/B on the same L20 (vLLM-Omni, 4 identical consecutive requests)
-confirms the lever is the graph/scheduling layer, not kernel fusion:
-persistent decode-graph entries cut warm steady-state from ~6.9 s to ~5.55 s
-(~20%), while enabling the sm89 fused QK-norm+RoPE kernels changed e2e by
-<0.5% (6.88 s fused vs 6.91 s unfused, within noise). The fused-kernel change
-was therefore not submitted upstream; the persistent-graph change was
-(vllm-project/vllm-omni#10266, RFC #8586 A2).
+Measured A/B on the same L20 (vLLM-Omni, identical consecutive requests) isolates
+which overheads actually matter:
+- **Persistent decode-graph entries: the real lever.** Warm steady-state drops
+  ~6.9 s → ~5.55 s (~20%) by avoiding per-request recapture. Submitted upstream as
+  vllm-project/vllm-omni#10266 (RFC #8586 A2).
+- **Kernel fusion: no measurable gain.** sm89 fused QK-norm+RoPE changed e2e by
+  <0.5% (6.88 s fused vs 6.91 s unfused, within noise); not submitted.
+- **Single-process synchronous loop: not an independent lever.** vLLM-Omni keeps
+  its async orchestrator/queue scheduling yet with persistent graphs (5.55 s) beats
+  this engine's single-process sync loop (6.46 s), so removing the scheduler does
+  not by itself win; a within-vLLM sync-vs-async isolation was not cleanly
+  separable (the engine is coupled to its event loop).
 
 Setup notes: vLLM-Omni with Qwen-Image-2.1 needs vLLM ≥0.32 (not on PyPI); use the
 frozen-commit wheel
