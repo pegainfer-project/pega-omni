@@ -39,6 +39,10 @@ enum Command {
     /// Measure HiDream-O1's decoder GEMM algorithms on one GPU and write them for `--gemm-algos`.
     #[cfg(feature = "hidream-o1")]
     HidreamO1TuneGemms(HidreamO1TuneArgs),
+    /// Serve Qwen-Image-2.1 on one GPU, its text encoder in a sidecar.
+    #[cfg(feature = "qwen-image-21")]
+    #[command(name = "qwen-image-21")]
+    QwenImage21(QwenImage21Args),
 }
 
 #[derive(Args)]
@@ -314,6 +318,57 @@ impl HidreamO1Args {
     }
 }
 
+#[cfg(feature = "qwen-image-21")]
+#[derive(Args)]
+struct QwenImage21Args {
+    #[command(flatten)]
+    serve: Serve,
+    /// Checkpoint directory (model_index.json, transformer/, scheduler/).
+    #[arg(long)]
+    model_path: std::path::PathBuf,
+    /// The model name clients send; defaults to the checkpoint directory's name.
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    device: usize,
+    /// Pictures one request may ask for.
+    #[arg(long, default_value_t = 4)]
+    max_n: u32,
+    #[arg(long, default_value_t = omni_qwen_image_21::engine::MAX_PROMPT_CHARS)]
+    max_prompt_chars: usize,
+    /// Python interpreter for the text-encoder / VAE sidecar.
+    #[arg(long, default_value = "python3")]
+    python: String,
+    /// Pinned cuBLASLt GEMM algorithms measured on this GPU; the heuristic without.
+    #[arg(long)]
+    gemm_algos: Option<std::path::PathBuf>,
+}
+
+#[cfg(feature = "qwen-image-21")]
+impl QwenImage21Args {
+    fn start(&self) -> anyhow::Result<Started> {
+        use omni_qwen_image_21::engine;
+        use omni_qwen_image_21::gemm::{Gemms, Pins};
+        let name = self.model.clone().unwrap_or_else(|| {
+            self.model_path.file_name().map_or("qwen-image-21".into(), |n| n.to_string_lossy().into_owned())
+        });
+        let gemms = match &self.gemm_algos {
+            Some(path) => Pins::load(path, self.device)?,
+            None => Gemms::Heuristic,
+        };
+        let (handle, thread) = engine::start(
+            self.device,
+            self.model_path.clone(),
+            name.clone(),
+            (self.max_n, self.max_prompt_chars),
+            self.serve.queue,
+            gemms,
+            self.python.clone(),
+        )?;
+        Ok((handle.into(), thread, name))
+    }
+}
+
 impl SimArgs {
     fn profile(&self) -> anyhow::Result<Profile> {
         Profile {
@@ -374,6 +429,11 @@ fn main() -> anyhow::Result<()> {
         Command::HidreamO1TuneGemms(args) => {
             let limits = omni_hidream_o1::engine::limits(omni_hidream_o1::engine::MAX_PROMPT_CHARS);
             return omni_hidream_o1::tune::tune(args.device, &args.model_path, limits, &args.out);
+        }
+        #[cfg(feature = "qwen-image-21")]
+        Command::QwenImage21(args) => {
+            let started = args.start()?;
+            (args.serve, started)
         }
     };
     let serve = &serve;

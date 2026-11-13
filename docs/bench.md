@@ -320,3 +320,76 @@ Tick time (the GPU call as the engine sees it), from the engine's debug log:
 
 The first tick of each new bucket includes its graph capture (up to 41 ms,
 once per bucket per process).
+
+# Qwen-Image-2.1 on one L20
+
+**TL;DR** (2026-11-12, one NVIDIA L20, 46 GB): Qwen-Image-2.1-Turbo's 8 steps
+at 1024x1024 take **6.46 s/image** (0.155 img/s) here. The benchmarked vLLM-Omni
+0.33 ran 6.99 s, but that gap is entirely its per-request decode-graph
+recapture: with persistent entries it reaches ~5.55 s, faster than this engine.
+A same-card A/B isolates the lever (persistent graphs, ~20%); kernel fusion and
+the single-process sync loop are not. Preliminary: not the pinned-core protocol.
+
+## Method
+
+- One NVIDIA L20 (46 GB, sm_89), one engine on the card at a time; 1024x1024,
+  the Turbo checkpoint's own 8-step sigma grid, no guidance, bf16; identical
+  prompt ("A lighthouse on a cliff at dawn."), size and steps on every engine.
+- pega-omni: `tools/qwen_image_21/bench.py` against the live
+  `/v1/images/generations` server, PNG and base64 included; one warmup then
+  the mean of 3 timed runs (p50 6.457 s, p95 6.488 s).
+- vLLM-Omni: `tools/qwen_image_21/bench_vllm.py` in process, one warmup then
+  3 timed runs, seed 42; vLLM-Omni 0.33 from source
+  (`SETUPTOOLS_SCM_PRETEND_VERSION=0.33.0`) on the frozen-commit vLLM 0.33.0
+  wheel with `--torch-backend=cu130`, Python 3.11+.
+- What this record does not establish: server/client core pinning, an
+  otherwise idle machine, or an `omni-bench` A/B (it has no image mode yet).
+  Preliminary against the AGENTS.md gate for performance claims.
+
+## Same-card comparison
+
+| Engine | s/image | throughput |
+|---|---:|---:|
+| pega-omni (this branch) | 6.46 | 0.155 img/s |
+| vLLM-Omni 0.33 + vLLM 0.33.0 | 6.99 | 0.143 img/s |
+| diffusers eager | 6.28 | 0.159 img/s |
+
+Breakdown (pega-omni): encode ~0.06 s, DiT ~5.1 s, VAE ~1.3 s; the DiT is near
+the L20 bf16 GEMM roofline (~3.9 s of GEMM + attention/elementwise). The 7.6%
+gap to the benchmarked vLLM-Omni is entirely its per-request decode-graph
+recapture: with persistent entries vLLM-Omni reaches ~5.55 s, faster than this
+engine's 6.46 s. A same-card A/B (identical consecutive requests) isolates the
+levers: persistent decode-graph entries ~6.9 → ~5.55 s (~20%, submitted upstream
+as vllm-project/vllm-omni#10266, RFC #8586 A2); kernel fusion <0.5% (6.88 fused
+vs 6.91 unfused, within noise); the single-process synchronous loop is not an
+independent lever — vLLM-Omni's async orchestrator with persistent graphs beats
+it. Engine details and the vLLM-Omni setup notes: `docs/qwen-image-21.md`.
+
+## VAE decode A/B (2026-11-13)
+
+Same L20 (46 GB, sm_89), 1024x1024, Turbo 8 steps, c=1, one warmup + 5 timed
+requests per config (`tools/qwen_image_21/bench.py`, `OMNI_TIMING` split), GPU
+exclusive per config. Engine built sm_89 (nvcc 12.1); sidecar torch 2.14.1+cu130,
+transformers 5.20.2, diffusers 0.41.0.dev0 (git 6256aa7). Golden re-recorded with
+`--kv-cache`; picture PSNR 35.76 dB (fp32 VAE) and 35.77 dB (bf16 VAE), gate 30 dB.
+The knobs are env-gated in `python/sidecar.py` (`OMNI_VAE_TILE`, `OMNI_VAE_DTYPE`,
+`OMNI_VAE_OFFLOAD_ENCODER`).
+
+| Config | s/image | VAE | note |
+|---|---:|---:|---|
+| fp32, tile 256 (baseline) | 6.55 | ~1.30 s | shipped default |
+| **bf16, tile 256** | **5.96** | **~0.77 s** | ~9% faster, PSNR 35.77 dB |
+| fp32, tile 512 | 9.38 | ~4.08 s | VAE attention grows with tile area |
+| fp32, untiled | OOM | — | HTTP 500 |
+| bf16, untiled | OOM | — | HTTP 500 |
+| fp32, tile 256 + encoder offload | 26.6 | ~21.4 s | 8B encoder PCIe round-trip per request |
+| fp32, untiled + encoder offload | 29.2 | ~24 s | worst |
+
+Only bf16 VAE (with 256-px tiling) is a win: it halves the VAE decode (~1.30 →
+~0.77 s) at unchanged accuracy, taking the picture from 6.55 to 5.96 s and
+narrowing the gap to vLLM-Omni's persistent-graph 5.55 s from ~0.91 to ~0.41 s.
+Larger tiles are slower (the tiled VAE's attention scales with tile area),
+untiled OOMs even in bf16, and offloading the encoder around decode costs far
+more than it saves. The residual ~0.41 s is vLLM-Omni's fused VAE norms and
+in-process decode; closing it needs a fused/in-process bf16 VAE, not a knob.
+Preliminary: sequential same-session A/B, not pinned-core/idle-verified.

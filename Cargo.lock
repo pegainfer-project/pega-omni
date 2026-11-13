@@ -1760,6 +1760,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-qwen-image-21"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "cudarc",
+ "half",
+ "kern-manifest",
+ "kern-runtime",
+ "memmap2",
+ "omni-engine",
+ "omni-kern",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tracing",
+]
+
+[[package]]
 name = "omni-qwen3-tts"
 version = "0.1.0"
 dependencies = [
@@ -1792,6 +1812,7 @@ dependencies = [
  "omni-frontend",
  "omni-hidream-o1",
  "omni-personaplex",
+ "omni-qwen-image-21",
  "omni-qwen3-tts",
  "omni-sim",
  "pprof",
