@@ -46,7 +46,9 @@ GEMM roofline (~3.9 s of GEMM + attention/elementwise). Diffusers eager on the s
 card: 6.28 s/image.
 
 Env knobs: `OMNI_TIMING=1` (per-stage latency), `OMNI_DEBUG_PRED=1` (dump pred),
-`OMNI_EAGER=1` (disable CUDA graphs).
+`OMNI_EAGER=1` (disable CUDA graphs). Sidecar VAE: `OMNI_VAE_TILE` (px, `0` =
+untiled; default 256), `OMNI_VAE_DTYPE=bf16` (default fp32), and
+`OMNI_VAE_OFFLOAD_ENCODER=1` (offload the text encoder around VAE decode).
 
 ## Same-card comparison vs vLLM-Omni (L20, 1024×1024, Turbo 8 steps, seed 42)
 
