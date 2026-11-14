@@ -30,7 +30,8 @@ Base additionally records the prepared reference PCM, FP32 speaker mel and its
 BF16 encoder input, speaker embedding, reference text IDs and ICL codes. Both
 layouts record trailing_text_hidden and tts_pad_embed for decode replay.
 The Base waveform is decoded continuously with the complete ICL reference
-prefix; the public decoder's chunking is not a continuous-decoding oracle.
+prefix, saved as wav_full, and cropped at the exact reference-frame boundary.
+The public decoder's 300-frame chunking is not a continuous-decoding oracle.
 
 Logits are pre-processor (no penalty, suppression or temperature), so a
 teacher-forced replay of `codes` must match them regardless of sampling.
@@ -75,6 +76,12 @@ def main() -> None:
     ap.add_argument("--ref-text")
     ap.add_argument("--non-streaming-mode", choices=["true", "false"], default="true")
     ap.add_argument("--max-new-tokens", type=int)
+    ap.add_argument(
+        "--min-total-frames", type=int, default=0, help="Reject cases that miss the requested codec boundary."
+    )
+    ap.add_argument(
+        "--min-trailing-tokens", type=int, default=0, help="Reject cases without the requested trailing text."
+    )
     args = ap.parse_args()
     if args.mode != "customvoice" and args.ref_audio is None:
         ap.error("Base modes require --ref-audio")
@@ -116,6 +123,7 @@ def main() -> None:
     predictor_generate = model.talker.code_predictor.generate
 
     def record_predictor(**kw):
+        seen["predictor_kwargs"] = {key: value for key, value in kw.items() if not isinstance(value, torch.Tensor)}
         out = predictor_generate(**kw, output_logits=True)
         seen["predictor"].append(torch.stack([cpu(logits[0]) for logits in out.logits]))
         return out
@@ -175,18 +183,32 @@ def main() -> None:
         raise ValueError("Generation did not reach EOS; increase --max-new-tokens before recording a golden")
     if frames == 0 or len(seen["talker"]) != frames + 1 or len(seen["predictor"]) != frames:
         raise ValueError("Expected one talker EOS step after the generated audio frames")
+    groups = model.config.talker_config.num_code_groups
+    if codes.shape != (frames, groups) or any(logits.shape[0] != groups - 1 for logits in seen["predictor"]):
+        raise ValueError("Expected one talker code and one predictor logit vector per remaining code group")
+    ref_frames = 0 if ref_codes is None else ref_codes.shape[0]
+    total_frames = ref_frames + frames
+    trailing_tokens = tensors["trailing_text_hidden"].shape[0]
+    if total_frames < args.min_total_frames:
+        raise ValueError(f"Expected at least {args.min_total_frames} total codec frames, got {total_frames}")
+    if trailing_tokens < args.min_trailing_tokens:
+        raise ValueError(f"Expected at least {args.min_trailing_tokens} trailing text tokens, got {trailing_tokens}")
 
     tokenizer = model.speech_tokenizer
     rate = tokenizer.model.config.output_sample_rate
     samples_per_frame = tokenizer.model.decode_upsample_rate
+    crop_start = ref_frames * samples_per_frame
+    full_samples = total_frames * samples_per_frame
     if args.mode == "customvoice":
         wavs, rate = tokenizer.decode([{"audio_codes": codes.cuda()}])
         wav = torch.from_numpy(wavs[0])
     else:
         decode_codes = codes if ref_codes is None else torch.cat([ref_codes.cpu(), codes])
         decoded = tokenizer.model.decoder(decode_codes.T[None].to(tokenizer.device))[0, 0]
-        ref_frames = 0 if ref_codes is None else ref_codes.shape[0]
-        wav = decoded[ref_frames * samples_per_frame :]
+        if decoded.numel() != full_samples:
+            raise ValueError("Continuous decoder length does not match the complete reference and generated codes")
+        tensors["wav_full"] = cpu(decoded)
+        wav = decoded[crop_start:full_samples]
     if wav.numel() != frames * samples_per_frame:
         raise ValueError("Generated waveform length does not match the code-frame boundary")
 
@@ -210,7 +232,30 @@ def main() -> None:
         "non_streaming_mode": args.non_streaming_mode,
         "generate_kwargs": json.dumps(generate_kwargs, sort_keys=True),
         "talker_generate_kwargs": json.dumps(seen["talker_kwargs"], sort_keys=True),
+        "predictor_generate_kwargs": json.dumps(seen["predictor_kwargs"], sort_keys=True),
         "waveform_decoder": "public" if args.mode == "customvoice" else "continuous",
+        "codec_boundaries": json.dumps(
+            {
+                "reference_frames": ref_frames,
+                "generated_frames": frames,
+                "total_frames": total_frames,
+                "samples_per_frame": samples_per_frame,
+                "full_samples": full_samples,
+                "crop_start": crop_start,
+                "crop_end": full_samples,
+                "reference_input_samples": 0 if reference is None else reference.size,
+            },
+            sort_keys=True,
+        ),
+        "text_track": json.dumps(
+            {
+                "target_tokens": text_ids.numel(),
+                "reference_tokens": 0 if ref_ids is None else ref_ids.numel(),
+                "prefill_tokens": tensors["prefill_embeds"].shape[0],
+                "trailing_tokens": trailing_tokens,
+            },
+            sort_keys=True,
+        ),
     }
     if args.ref_audio is not None:
         meta["ref_text"] = args.ref_text or ""
