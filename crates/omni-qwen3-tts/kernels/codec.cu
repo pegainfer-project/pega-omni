@@ -52,11 +52,11 @@ __device__ __forceinline__ void bias_snake8(float* v, const bf16* bias, const fl
   for (int k = 0; k < 8; ++k) v[k] = snake(v[k] + b[k], av[k], ib[k]);
 }
 
-// Every kernel here is launched with programmatic dependent launch: it waits
-// for its predecessor to complete before touching anything, then lets its
-// successor launch, which waits in turn.
+// Wait before reading the predecessor's output, then allow successors to launch.
 __device__ __forceinline__ void pdl() {
+#if __CUDA_ARCH__ >= 900
   asm volatile("griddepcontrol.wait;\n\tgriddepcontrol.launch_dependents;" ::: "memory");
+#endif
 }
 
 // Row r: [codebook 0 | Σ codebooks 1..15], each `half` wide; `books` is
