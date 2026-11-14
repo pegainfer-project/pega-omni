@@ -6,6 +6,9 @@ code predictor, sampler, codec decoder) is one
 [kern](https://github.com/pegainfer-project/kern) manifest that
 `omni-qwen3-tts` generates at load and one `kern-runtime` executes.
 
+[Base reference recordings](qwen3-tts-base.md) document the official
+voice-clone fixtures prepared for subsequent Base support.
+
 ## Programs
 
 A request is `prefill`, then `first`, then `decode` until it draws the end
