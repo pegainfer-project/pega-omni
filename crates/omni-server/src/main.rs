@@ -30,6 +30,9 @@ enum Command {
     /// Serve Qwen3-TTS (12Hz CustomVoice) on one GPU.
     #[cfg(feature = "qwen3-tts")]
     Qwen3Tts(Qwen3TtsArgs),
+    /// Serve Higgs TTS 3 (4B) on one GPU.
+    #[cfg(feature = "higgs-audio")]
+    HiggsAudio(HiggsAudioArgs),
     /// Serve PersonaPlex-7B, full duplex, on one GPU.
     #[cfg(feature = "personaplex")]
     Personaplex(PersonaplexArgs),
@@ -210,6 +213,69 @@ impl Qwen3TtsArgs {
     }
 }
 
+#[cfg(feature = "higgs-audio")]
+#[derive(Args)]
+struct HiggsAudioArgs {
+    #[command(flatten)]
+    serve: Serve,
+    /// Checkpoint directory (config.json, model.safetensors, tokenizer.json).
+    #[arg(long)]
+    model_path: std::path::PathBuf,
+    /// The model name clients send; defaults to the checkpoint directory's name.
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    device: usize,
+    #[arg(long, default_value_t = 32)]
+    max_batch: usize,
+    /// Prompt tokens prefilled per step.
+    #[arg(long, default_value_t = 4096)]
+    max_step_tokens: usize,
+    /// KV cache size.
+    #[arg(long, default_value_t = 8.0)]
+    kv_gib: f64,
+    #[arg(long, default_value_t = 12)]
+    first_chunk_frames: usize,
+    #[arg(long, default_value_t = 25)]
+    chunk_frames: usize,
+    /// Softmax temperature of every codebook's draw; 0 takes the argmax.
+    #[arg(long, default_value_t = 0.8)]
+    temperature: f32,
+    /// Codes each draw keeps; 0 keeps all.
+    #[arg(long, default_value_t = 50)]
+    top_k: i32,
+    #[arg(long, default_value_t = 4096)]
+    max_input_chars: usize,
+}
+
+#[cfg(feature = "higgs-audio")]
+impl HiggsAudioArgs {
+    fn start(&self) -> anyhow::Result<Started> {
+        use omni_higgs_audio::engine;
+        use omni_higgs_audio::model::Sampling;
+        let opts = engine::Options {
+            max_batch: self.max_batch,
+            max_step_tokens: self.max_step_tokens,
+            kv_gib: self.kv_gib,
+            first_chunk_frames: self.first_chunk_frames,
+            chunk_frames: self.chunk_frames,
+            sampling: Sampling { temperature: self.temperature, top_k: self.top_k },
+        };
+        let name = self.model.clone().unwrap_or_else(|| {
+            self.model_path.file_name().map_or("higgs-audio".into(), |n| n.to_string_lossy().into_owned())
+        });
+        let (handle, thread) = engine::start(
+            self.device,
+            self.model_path.clone(),
+            opts,
+            name.clone(),
+            self.max_input_chars,
+            self.serve.queue,
+        )?;
+        Ok((handle.into(), thread, name))
+    }
+}
+
 #[cfg(feature = "personaplex")]
 #[derive(Args)]
 struct PersonaplexArgs {
@@ -357,6 +423,11 @@ fn main() -> anyhow::Result<()> {
         }
         #[cfg(feature = "qwen3-tts")]
         Command::Qwen3Tts(args) => {
+            let started = args.start()?;
+            (args.serve, started)
+        }
+        #[cfg(feature = "higgs-audio")]
+        Command::HiggsAudio(args) => {
             let started = args.start()?;
             (args.serve, started)
         }

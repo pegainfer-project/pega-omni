@@ -44,9 +44,9 @@ use crate::config::Config;
 use crate::prompt::NO_CODEC;
 use crate::prompt::Prompt;
 use crate::prompt::Tokenizer;
-use crate::stack::PAGE;
-use crate::stack::Stack;
 use crate::talker::Talker;
+use omni_qwen3::PAGE;
+use omni_qwen3::Stack;
 
 pub use crate::talker::GROUPS;
 
@@ -114,7 +114,8 @@ impl Model {
         let max_seqs = bucket(limits.max_batch);
         let kv_tokens = (limits.kv_gib * (1u64 << 30) as f64) as usize / kv_bytes_per_token(&config);
         let pages_max = kv_tokens.div_ceil(PAGE) + 1;
-        let cubins = [("codec", CODEC), ("talker", TALKER)].map(|(n, b)| (n, hex(&sha2::Sha256::digest(b)), b));
+        let cubins = [("codec", CODEC), ("qwen3", omni_qwen3::CUBIN), ("talker", TALKER)]
+            .map(|(n, b)| (n, hex(&sha2::Sha256::digest(b)), b));
         // Each padding row of a graph call names the pad lease's page once more.
         let page_table = pages_max + max_seqs;
         let (manifest, tensors) = generate(dir, &config, &cubins, max_seqs, limits.max_tokens, page_table)?;
@@ -311,7 +312,7 @@ fn kv_bytes_per_token(config: &Config) -> usize {
 fn generate(
     dir: &Path,
     config: &Config,
-    cubins: &[(&str, String, &[u8]); 2],
+    cubins: &[(&str, String, &[u8]); 3],
     max_seqs: usize,
     max_tokens: usize,
     page_table: usize,
