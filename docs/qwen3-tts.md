@@ -51,12 +51,15 @@ audio leaves: every call already returns its frames decoded.
 
 ## Kernels
 
-`kernels/talker.cu` is the talker's and predictor's: paged attention (one
-block per row and KV head, online softmax over 32-key tiles; a ragged prefill
-row finds its sequence's pages through `kv_indptr`) and its dense twin for
-the predictor, per-head RMSNorm + RoPE + K/V write, fused residual RMSNorm (with
-a strided row selection, so the predictor's first pass keeps only its second
-row), SiLU-gate, embedding gathers, and the sampler. The sampler keeps the
+The talker's and predictor's decoder layers are `omni-qwen3`'s (shared with Higgs TTS), and its
+`kernels/qwen3.cu` has their kernels: paged attention (one block per row and KV head, online
+softmax over 32-key tiles; a ragged prefill row finds its sequence's pages through `kv_indptr`)
+and its dense twin for the predictor, per-head RMSNorm + RoPE + K/V write, fused residual RMSNorm
+(with a strided row selection, so the predictor's first pass keeps only its second row) and
+SiLU-gate.
+
+`kernels/talker.cu` is the rest of the talker's and predictor's: embedding gathers, the codec
+track, the frame embedding, the predictor's input, and the sampler. The sampler keeps the
 Hugging Face processor order in one block per row: repetition penalty and
 control-token suppression on the raw logits, temperature, top-k keeping ties
 (a radix select over the float bits), softmax, and a draw against the
@@ -69,16 +72,23 @@ bias epilogue and into the next conv's im2col), causal im2col over a
 double-buffered history, overlap-add carrying the previous frame's row,
 depthwise conv + LayerNorm, and the output conv. Residual GEMMs accumulate in
 place (cuBLASLt with beta = 1) and their biases ride along to the next
-consumer's epilogue, so no kernel exists only to add. Every codec kernel
-launches with programmatic dependent launch and loads its weights before
-waiting on its producer.
+consumer's epilogue, so no kernel exists only to add. On compute capability
+9.0+, codec kernels use programmatic dependent launch (PDL). Older targets
+use ordinary stream dependencies. Both paths retain CUDA graphs.
 
-GEMMs are kern's cuBLASLt built-in. `build.rs` compiles both files to cubins
-(`OMNI_CUDA_ARCH`, default `103a`, GB300); the manifest pins their sha256.
+GEMMs are kern's cuBLASLt built-in. `build.rs` compiles both files to cubins;
+the manifest pins their sha256.
 kern verifies the manifest, checks every launch's ABI against its cubin,
 allocates buffers at their var bounds, hands out KV pages and state slots, and
 captures `first` and `decode` per bucket. Weight layout transforms (fused QKV
 and gate/up, conv taps, folded scales) happen once at load, on the host.
+
+## Build targets
+
+`OMNI_CUDA_ARCH` selects the target architecture (`103a` by default).
+`NVCC` or `CUDA_PATH` selects the toolkit when it is not at the default path.
+For an RTX 3090, build with `OMNI_CUDA_ARCH=86` and start with a small budget,
+such as `--max-batch 2 --max-step-tokens 1024 --kv-gib 1`.
 
 ## Correctness
 
@@ -113,6 +123,67 @@ rounding: two streams of the same codes in one batch come out bit-identical.
 Served audio through Whisper large-v3-turbo transcribes back to the input for
 English, Chinese (with `instructions`, and the Sichuan dialect speaker) and
 Japanese, including 8 concurrent requests in one batch.
+
+### RTX 3090 validation, 2026-11-11
+
+Validated on sm86 with driver 595.58.03 and nvcc 13.2.51. The official
+reference used torch/torchaudio 2.11.0+cu130, qwen-tts at `022e286b`, BF16 and
+SDPA. The CustomVoice checkpoint revision was
+`0c0e3051f131929182e2c023b9537f8b1c68adfe`. The recorder's default English
+text, Ryan voice and seed 0 produced 70 frames; the fixture SHA256 was
+`304ac07f75c28259bba105f1ff8e6e10a8efb907132cd6df87f21129c0f8f622`.
+
+The existing golden ran with batch 3, 1024 prompt tokens and a 0.5 GiB KV
+setting. Replay the reference with the sm86 build:
+
+```bash
+OMNI_CUDA_ARCH=86 CARGO_TARGET_DIR=target-sm86 CUDA_VISIBLE_DEVICES=0 \
+  OMNI_QWEN3_TTS_MODEL=/path/to/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  OMNI_QWEN3_TTS_GOLDEN=/path/to/en-ryan.safetensors \
+  cargo test --release --locked -p omni-qwen3-tts --test golden -- --nocapture
+```
+
+The thresholds were unchanged:
+
+| check | sm86 result |
+|---|---|
+| tokenizer ids | identical |
+| prompt embeddings | worst row cosine 0.999994 |
+| talker logits, 71 steps | worst cosine 0.99994, argmax agrees 98.6% |
+| code-predictor logits, 70 × 15 | worst cosine 0.99933, argmax agrees 95.0% |
+| codec, streamed frame by frame | 34.56 dB SNR |
+| codec, a stream joining 7 frames late | 34.24 dB SNR |
+| two streams of the same forced frames | bit-identical waveforms |
+
+A repeat on 2026-11-13 (Asia/Shanghai), using the documented recorder versions
+and defaults, produced identical reference tensors and again 70 frames, not
+the original table's 79. The three-stream replay passed, with 34.59/34.19 dB
+SNR for the lockstep/late-joining streams. The table above retains the first
+3090 run. Its SNR and the original table's 36.6 dB use different fixtures and
+do not establish an architecture-dependent SNR change.
+
+The real server passed the official SDK check with openai 3.49.0 (WAV, PCM,
+SSE, errors and model listing).
+With batch 2, 1024 prompt tokens and a 1 GiB KV setting, the maximum sampled
+process memory was 6160 MiB during local serving validation. Other GPU
+workloads were active; this is a functional validation and a sampled memory
+observation, not a throughput or latency measurement.
+
+### sm103a build equivalence
+
+Using nvcc 13.2.51 and the flags from `build.rs` (`-cubin -O3 -std=c++17`,
+`-I../omni-kern/kernels`, `-gencode=arch=compute_103a,code=sm_103a`), the
+following cubins are byte-identical between `main` at `dfdd530` and this
+branch's GPU sources at `f5f7e05`:
+
+| cubin | SHA256 on both revisions |
+|---|---|
+| codec | `8d614a692ce9f2d3f1759512e71e6309db883a91898d116356e0a689f585afb1` |
+| talker | `0e7ce4462a5739dc76702fb921fd3fc0db3cd06466321d461aa13aed3784decb` |
+
+Executing both revisions' `build.rs` produced the same cubins. For `103a`,
+the branch emits `qwen3_tts_pdl`, selecting the same `Gen::with_pdl(&["codec"])`
+manifest configuration as `main`.
 
 ## Performance
 
