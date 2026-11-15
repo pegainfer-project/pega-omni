@@ -393,3 +393,27 @@ untiled OOMs even in bf16, and offloading the encoder around decode costs far
 more than it saves. The residual ~0.41 s is vLLM-Omni's fused VAE norms and
 in-process decode; closing it needs a fused/in-process bf16 VAE, not a knob.
 Preliminary: sequential same-session A/B, not pinned-core/idle-verified.
+
+## Lossless lever A/B (2026-11-15)
+
+Same L20 (46 GB, sm_89), 1024x1024, Turbo 8 steps, c=1, one warmup + 5 timed
+requests, GPU exclusive per config. Two lossless levers from the inference-opt
+review, each measured against its baseline:
+
+| Lever | baseline | optimized | delta | quality |
+|---|---:|---:|---:|---|
+| GEMM algo tuning (`qwen-image-21-tune-gemms`) | 6.459 s (fp32 VAE) | 6.450 s | ~0.1% (noise) | PSNR 35.76 dB unchanged |
+| VAE `torch.compile` (tried, not kept) | 5.936 s (bf16 VAE) | 5.927 s | ~0.15% (noise) | VAE ~748 ms unchanged |
+
+The GEMM tuner (`crates/omni-qwen-image-21/src/tune.rs`) keeps only the largest
+bitwise-identical cuBLASLt class per shape and times whole decode steps; the
+decode graph is 363 calls. On L20 the heuristic already picks near-optimal
+algorithms (the slow gate_up candidate is avoided), so pinning buys ~nothing
+here — the gain is card-bound (HiDream saw up to 8.8% on a different card).
+`torch.compile` does not speed the VAE: its cost is conv/attention compute, not
+elementwise ops a compiler fuses. Both levers are **not adopted on L20 under
+current evidence**; the tuner stays available for other cards. The residual
+~0.4 s to vLLM-Omni's 5.55 s is its fused VAE RMS-norm kernel and in-process
+decode, which needs a custom fused / in-process bf16 VAE rather than a knob.
+The encoder-offload and `torch.compile` knobs were removed after these
+measurements (null/negative); the retained VAE knob is `OMNI_VAE_DTYPE=bf16`.
