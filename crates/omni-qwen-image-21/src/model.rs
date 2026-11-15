@@ -174,6 +174,11 @@ impl Model {
     pub fn synchronize(&self) -> Result<()> {
         Ok(self.rt.synchronize()?)
     }
+
+    /// Selects a GEMM candidate for `var` (the tuner times each in turn).
+    pub fn pick(&mut self, var: &str, index: usize) {
+        self.picks.insert(var.into(), index as u64);
+    }
 }
 
 fn generate(dir: &Path, cfg: &Transformer, sha: &str, limits: Limits, gemms: &Gemms) -> Result<(Value, HostTensors)> {

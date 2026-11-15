@@ -132,7 +132,11 @@ fn engine_matches_the_official_run() {
 
     let t = Instant::now();
     let limits = Limits { max_text: text_len, max_patches: patches };
-    let mut model = Model::load(0, &model_dir, limits, &Gemms::Heuristic).unwrap();
+    let gemms = match std::env::var("OMNI_QWEN_IMAGE_21_GEMM_ALGOS") {
+        Ok(path) => omni_qwen_image_21::gemm::Pins::load(std::path::Path::new(&path), 0).unwrap(),
+        Err(_) => Gemms::Heuristic,
+    };
+    let mut model = Model::load(0, &model_dir, limits, &gemms).unwrap();
     eprintln!("loaded in {:.1?}", t.elapsed());
     let (dtype, shape, embeds) = golden.raw("encoder_hidden");
     assert_eq!((dtype, shape.as_slice()), (Dtype::BF16, &[text_len, 4096][..]));

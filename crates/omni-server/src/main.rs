@@ -43,6 +43,10 @@ enum Command {
     #[cfg(feature = "qwen-image-21")]
     #[command(name = "qwen-image-21")]
     QwenImage21(QwenImage21Args),
+    /// Measure Qwen-Image-2.1's decoder GEMM algorithms on one GPU and write them for `--gemm-algos`.
+    #[cfg(feature = "qwen-image-21")]
+    #[command(name = "qwen-image-21-tune-gemms")]
+    QwenImage21TuneGemms(QwenImage21TuneArgs),
 }
 
 #[derive(Args)]
@@ -369,6 +373,19 @@ impl QwenImage21Args {
     }
 }
 
+#[cfg(feature = "qwen-image-21")]
+#[derive(Args)]
+struct QwenImage21TuneArgs {
+    /// Checkpoint directory.
+    #[arg(long)]
+    model_path: std::path::PathBuf,
+    #[arg(long, default_value_t = 0)]
+    device: usize,
+    /// Where to write the algorithms.
+    #[arg(long)]
+    out: std::path::PathBuf,
+}
+
 impl SimArgs {
     fn profile(&self) -> anyhow::Result<Profile> {
         Profile {
@@ -434,6 +451,11 @@ fn main() -> anyhow::Result<()> {
         Command::QwenImage21(args) => {
             let started = args.start()?;
             (args.serve, started)
+        }
+        #[cfg(feature = "qwen-image-21")]
+        Command::QwenImage21TuneGemms(args) => {
+            let limits = omni_qwen_image_21::engine::limits(omni_qwen_image_21::engine::MAX_PROMPT_CHARS);
+            return omni_qwen_image_21::tune::tune(args.device, &args.model_path, limits, &args.out);
         }
     };
     let serve = &serve;

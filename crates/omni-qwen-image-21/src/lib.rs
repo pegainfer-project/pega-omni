@@ -19,4 +19,5 @@ pub mod model;
 pub mod prompt;
 pub mod sampler;
 pub mod sidecar;
+pub mod tune;
 pub mod weights;
