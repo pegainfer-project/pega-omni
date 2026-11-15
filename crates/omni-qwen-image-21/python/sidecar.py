@@ -69,7 +69,6 @@ MAX_REQUEST = 8 << 20
 # Sidecar VAE knobs, env-gated; the defaults are the shipped fp32 / 256-px path.
 VAE_TILE = int(os.environ.get("OMNI_VAE_TILE", "256"))
 VAE_DTYPE = os.environ.get("OMNI_VAE_DTYPE", "fp32")
-OFFLOAD_ENCODER = os.environ.get("OMNI_VAE_OFFLOAD_ENCODER") == "1"
 
 
 def log(message: str) -> None:
@@ -128,15 +127,6 @@ class Encoder:
             )
             self.dim = self.model.config.get_text_config().hidden_size
             log(f"text encoder loaded: dim {self.dim}")
-
-    def offload(self):
-        if self.model is not None:
-            self.model.to("cpu")
-            torch.cuda.empty_cache()
-
-    def reload(self):
-        if self.model is not None:
-            self.model.to(self.device)
 
     def encode(self, prompt: str) -> bytes:
         self._ensure_model()
@@ -234,12 +224,6 @@ def respond(kind: int, payload: bytes, encoder: Encoder, decoder: Decoder) -> by
         height, width, rows = struct.unpack("<III", payload[:12])
         if len(payload) != 12 + rows * LATENT_DIM * 2:
             raise ValueError(f"{rows} latent rows, payload is {len(payload)} bytes")
-        if OFFLOAD_ENCODER:
-            encoder.offload()
-            try:
-                return decoder.decode(height, width, payload[12:])
-            finally:
-                encoder.reload()
         return decoder.decode(height, width, payload[12:])
     raise ValueError(f"unknown request kind {kind}")
 
