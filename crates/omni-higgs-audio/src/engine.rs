@@ -103,6 +103,7 @@ pub fn info(name: &str, max_input_chars: usize) -> EngineInfo {
         model: name.into(),
         sample_rate: SAMPLE_RATE,
         voices: BTreeSet::from(["default".to_string()]),
+        instructions_required: false,
         extra: BTreeMap::from([("seed".to_string(), Extra::Integer(0..=i64::MAX))]),
         speeds: 1.0..=1.0,
         max_input_chars,

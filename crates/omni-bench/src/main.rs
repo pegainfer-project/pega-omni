@@ -75,6 +75,9 @@ struct Cli {
     input_chars: usize,
     #[arg(long, default_value = "alloy")]
     voice: String,
+    /// Voice description or delivery instructions sent with every request.
+    #[arg(long)]
+    instructions: Option<String>,
     #[arg(long, value_enum, default_value_t = Format::Pcm)]
     response_format: Format,
     #[arg(long, value_enum, default_value_t = Framing::Audio)]
@@ -82,6 +85,9 @@ struct Cli {
     /// JSON object sent as the request's `extra` (engine-specific options).
     #[arg(long)]
     extra: Option<String>,
+    /// Additional top-level JSON fields, e.g. vLLM-Omni's task_type, language and stream.
+    #[arg(long)]
+    extra_body: Option<String>,
     /// PCM sample rate of the server's audio, used for audio durations.
     #[arg(long, default_value_t = 24_000)]
     sample_rate: u32,
@@ -322,7 +328,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         "inf" => None,
         r => Some(r.parse().context("--request-rate is a number or `inf`")?),
     };
-    let extra: Option<Value> = cli.extra.as_deref().map(serde_json::from_str).transpose().context("--extra is JSON")?;
+    let object = |raw: &str, flag: &str| -> anyhow::Result<serde_json::Map<String, Value>> {
+        let value: Value = serde_json::from_str(raw).with_context(|| format!("{flag} is JSON"))?;
+        value.as_object().cloned().with_context(|| format!("{flag} must be a JSON object"))
+    };
+    let extra = cli.extra.as_deref().map(|raw| object(raw, "--extra")).transpose()?;
+    let extra_body = cli.extra_body.as_deref().map(|raw| object(raw, "--extra-body")).transpose()?;
     let prompts = Arc::new(prompts(&cli)?);
     let format = match cli.response_format {
         Format::Wav => "wav",
@@ -339,7 +350,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         "stream_format": stream_format,
     });
     if let Some(e) = extra {
-        template["extra"] = e;
+        template["extra"] = Value::Object(e);
+    }
+    if let Some(instructions) = &cli.instructions {
+        template["instructions"] = json!(instructions);
+    }
+    if let Some(fields) = extra_body {
+        for (name, value) in fields {
+            if matches!(
+                name.as_str(),
+                "model" | "input" | "voice" | "response_format" | "stream_format" | "instructions" | "extra"
+            ) {
+                bail!("--extra-body cannot override reserved field `{name}`; use its dedicated option");
+            }
+            template[&name] = value;
+        }
     }
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(cli.max_concurrency)
@@ -400,6 +425,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 "request_rate": cli.request_rate, "max_concurrency": cli.max_concurrency,
                 "input_chars": cli.input_chars, "response_format": cli.response_format,
                 "stream_format": cli.stream_format, "extra": cli.extra, "warmup": cli.warmup, "seed": cli.seed,
+                "voice": cli.voice, "instructions": cli.instructions, "extra_body": cli.extra_body,
+                "sample_rate": cli.sample_rate, "request_template": shot.body_template,
             },
             "summary": summary,
             "records": records,

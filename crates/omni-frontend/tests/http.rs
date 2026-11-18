@@ -142,3 +142,35 @@ async fn models_and_voices_describe_the_engine() {
     let (models, voices) = (get("/v1/models").await, get("/v1/audio/voices").await);
     assert_eq!((models["data"][0]["id"].as_str(), voices["voices"].as_array().map(Vec::len)), (Some("sim"), Some(11)));
 }
+
+#[tokio::test]
+async fn instruction_driven_engine_has_no_presets_and_names_missing_instructions() {
+    // Only the declared contract differs; the front end has no model branch.
+    let profile = Profile::default();
+    let mut info = profile.info("designed");
+    info.voices.clear();
+    info.instructions_required = true;
+    let (handle, inbox) = omni_engine::channel(info, 64);
+    omni_sim::spawn(inbox, profile);
+    let app = omni_frontend::router(handle, None);
+    let resp = app.clone().oneshot(Request::get("/v1/audio/voices").body(Body::empty()).unwrap()).await.unwrap();
+    let voices: Value = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(voices, json!({"voices": []}));
+
+    for instructions in [None, Some(json!(null)), Some(json!("")), Some(json!(" \t\n"))] {
+        let mut body = json!({"model": "designed", "input": "Hello.", "voice": "alloy"});
+        if let Some(instructions) = instructions {
+            body["instructions"] = instructions;
+        }
+        let (status, _, bytes) = post(&app, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error(&bytes).1.as_deref(), Some("instructions"));
+    }
+    for voice in [json!("alloy"), json!({"id": "not-a-preset"})] {
+        let body = json!({"model": "designed", "input": "Hello.", "voice": voice,
+                          "instructions": "A low, slow voice.", "extra": {"frames": 1}});
+        let (status, _, bytes) = post(&app, body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(bytes.starts_with(b"RIFF"));
+    }
+}

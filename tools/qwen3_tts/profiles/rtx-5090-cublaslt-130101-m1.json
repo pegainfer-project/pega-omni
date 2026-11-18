@@ -1,0 +1,96 @@
+{
+  "device": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "cublaslt": 130101
+  },
+  "description": "M=1 BF16 pins from a hot-operand CUDA Graph microbenchmark on this device/library. Real-model goldens pass their existing tolerances; output bitwise equality is not guaranteed. End-to-end performance validation is separate.",
+  "gemms": [
+    {
+      "m": 1,
+      "n": 1024,
+      "k": 3072,
+      "algo": {
+        "id": 13,
+        "tile": 0,
+        "stages": 0,
+        "split_k": 1,
+        "reduction": 0,
+        "swizzle": 0,
+        "custom": 75,
+        "inner_shape": 0,
+        "cluster_shape": 0
+      },
+      "baseline_us": 5.708000157,
+      "selected_us": 3.434875049,
+      "speedup": 1.6617781070847915
+    },
+    {
+      "m": 1,
+      "n": 2048,
+      "k": 1024,
+      "algo": {
+        "id": 13,
+        "tile": 0,
+        "stages": 0,
+        "split_k": 1,
+        "reduction": 0,
+        "swizzle": 0,
+        "custom": 75,
+        "inner_shape": 0,
+        "cluster_shape": 0
+      },
+      "baseline_us": 3.753124969,
+      "selected_us": 2.798999893,
+      "speedup": 1.3408807118521744
+    },
+    {
+      "m": 1,
+      "n": 4096,
+      "k": 2048,
+      "algo": {
+        "id": 13,
+        "tile": 0,
+        "stages": 0,
+        "split_k": 1,
+        "reduction": 0,
+        "swizzle": 0,
+        "custom": 75,
+        "inner_shape": 0,
+        "cluster_shape": 0
+      },
+      "baseline_us": 8.163125254,
+      "selected_us": 5.216499791,
+      "speedup": 1.5648664010461186
+    },
+    {
+      "m": 1,
+      "n": 2048,
+      "k": 2048,
+      "algo": {
+        "id": 13,
+        "tile": 0,
+        "stages": 0,
+        "split_k": 1,
+        "reduction": 0,
+        "swizzle": 0,
+        "custom": 75,
+        "inner_shape": 0,
+        "cluster_shape": 0
+      },
+      "baseline_us": 5.802374799,
+      "selected_us": 3.464125097,
+      "speedup": 1.6749899719340302
+    }
+  ],
+  "validation": {
+    "goldens": [
+      "VoiceDesign English",
+      "VoiceDesign Chinese",
+      "VoiceDesign 366-frame continuous",
+      "CustomVoice English"
+    ],
+    "criterion": "existing prompt/logit gates and waveform SNR >=30 dB",
+    "bitwise_equal_real_model": false,
+    "end_to_end_performance": "pending"
+  }
+}
