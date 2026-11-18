@@ -12,14 +12,12 @@ CUDA_VISIBLE_DEVICES; this does not require an idle machine.
     uv run tools/qwen3_tts/record_cases.py --manifest /data/base-inputs/manifest.json \
         --model /models/Qwen3-TTS-12Hz-1.7B-Base --out /data/base-fixtures --diagnostics
 
---check-only checks existing fixtures and rewrites the summary/quality input
-without loading models. Quality evaluation requires --diagnostics for paired
-layouts. Fixtures and exported WAVs remain outside Git.
+--check-only checks existing fixtures and rewrites the summary and listening
+WAVs without loading models. Fixtures and exported WAVs remain outside Git.
 """
 
 import argparse
 import json
-import os
 import subprocess
 import wave
 from pathlib import Path
@@ -41,7 +39,7 @@ def main() -> None:
     root = args.manifest.resolve().parent
     args.out.mkdir(parents=True, exist_ok=True)
     recorder = Path(__file__).with_name("golden.py")
-    summary, quality = [], []
+    summary = []
     for case in manifest["cases"]:
         if args.case and case["id"] not in args.case:
             continue
@@ -124,28 +122,8 @@ def main() -> None:
                     with wave.open(str(path), "wb") as audio:
                         audio.setparams((1, 2, int(meta["sample_rate"]), 0, "NONE", "not compressed"))
                         audio.writeframes(pcm.tobytes())
-                    quality.append(
-                        {
-                            "case_id": case["id"],
-                            "mode": "x_vector_only" if mode == "xvector" else mode,
-                            "language": "en" if case["language"] == "English" else "zh",
-                            "non_streaming_mode": layout == "true",
-                            "text": case["text"],
-                            "waveform": path.name,
-                        }
-                    )
                 print(f"Checked {name}: {boundaries}", flush=True)
-    controls = [
-        {
-            key: value if key == "language" else os.path.relpath(root / value, args.out.resolve())
-            for key, value in control.items()
-        }
-        for control in manifest["controls"]
-    ]
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    (args.out / "quality-input.json").write_text(
-        json.dumps({"records": quality, "controls": controls}, ensure_ascii=False, indent=2) + "\n"
-    )
 
 
 if __name__ == "__main__":

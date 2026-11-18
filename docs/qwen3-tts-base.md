@@ -38,7 +38,7 @@ resampling, and writes mono 24 kHz PCM16 WAVs plus `manifest.json`.
 NumPy 2.5.4, SciPy 1.18.1 and SoundFile 0.14.0 are pinned in the script.
 The manifest records conversion versions and parameters, source paths and
 sample counts. It also prepares a distinct same-speaker recording and a
-different-speaker recording per language for the quality controls.
+different-speaker recording per language for listening comparisons.
 
 ## Record and check
 
@@ -71,10 +71,10 @@ contain more than one trailing text embedding. Missing coverage fails the
 run rather than silently truncating or padding a recording.
 
 Outputs include each fixture's command and log, `summary.json` with tensor
-shapes and recorded boundaries, short-reference WAVs, and `quality-input.json`.
-Keep audio and large fixtures outside Git. To recheck recordings without a GPU,
-repeat the command with `--check-only` to recheck fixture metadata and
-recorded boundaries before rewriting the summary and quality input.
+shapes and recorded boundaries, and WAVs of the short-reference outputs for
+listening. Keep audio and large fixtures outside Git. To recheck recordings
+without a GPU, repeat the command with `--check-only` to check fixture metadata
+and boundaries and regenerate the summary and listening WAVs.
 
 ## Fixture contract
 
@@ -111,40 +111,6 @@ X-vector-only has no reference-code prefix. The public decoder chunks at
 Metadata records `codec_boundaries` (frame counts, samples per frame and
 crop start/end), `text_track` lengths and effective generation arguments.
 
-## Paired layout diagnostic
-
-The independent models are `openai/whisper-small` at
-`973afd24965f72e36ca33b3055d56a652f456b4d` and
-`microsoft/wavlm-base-plus-sv` at `feb593a6c23c1cc3d9510425c29b0a14d2b07b1e`.
-Download only their inference files:
-
-```bash
-uvx --from huggingface_hub hf download openai/whisper-small \
-  --revision 973afd24965f72e36ca33b3055d56a652f456b4d --local-dir /models/whisper-small \
-  --include model.safetensors '*.json' merges.txt
-uvx --from huggingface_hub hf download microsoft/wavlm-base-plus-sv \
-  --revision feb593a6c23c1cc3d9510425c29b0a14d2b07b1e --local-dir /models/wavlm-base-plus-sv \
-  --include pytorch_model.bin config.json preprocessor_config.json
-uv run tools/qwen3_tts/quality.py --manifest /data/base-fixtures/quality-input.json \
-  --asr-model /models/whisper-small --speaker-model /models/wavlm-base-plus-sv \
-  --device cuda:0 --out /data/base-fixtures/quality-results.json
-```
-
-The script requires paired True/False text layouts. Its report contains model
-directory names, effective ASR generation settings, per-case target text,
-transcripts, English WER / Chinese CER, speaker cosines and controls.
-Scoring applies NFKC and casefold, then replaces `’` with ASCII `'`.
-English uses ASCII alphanumeric words with internal apostrophes; Chinese
-counts Unicode letters and numbers individually, ignoring punctuation and
-whitespace. It does not expand numbers or convert simplified/traditional
-characters.
-
-ASR is greedy; waveforms must fit its 30-second short-form path.
-WavLM is independent of the Qwen speaker encoder, but its VoxCeleb training
-and English-tagged model card do not establish a universal cosine threshold,
-especially for Chinese.
-These few cases diagnose layout differences; they are not a quality gate.
-
 ## Recorded results
 
 2026-11-14, RTX 3090 (sm86), torch/torchaudio 2.11.0+cu130,
@@ -174,30 +140,6 @@ also rejected missing reference inputs and a real generation capped before
 EOS without writing a fixture. The six existing CustomVoice tensors matched
 the previous local fixture exactly; the rebuilt sm86 Rust golden passed its
 unchanged thresholds (SNR 34.59 / 34.19 dB).
-
-The eight short-reference outputs were also scored with the pinned independent
-models above. Cosine compares generated speech with the reference recording.
-
-| Language | Mode | True WER / CER | False WER / CER | True cosine | False cosine |
-|---|---|---:|---:|---:|---:|
-| English | x-vector-only | 0 / 65 | 0 / 65 | 0.8574 | 0.8143 |
-| English | ICL | 0 / 65 | 0 / 65 | 0.9547 | 0.9081 |
-| Chinese | x-vector-only | 27 / 102 | 27 / 102 | 0.9656 | 0.9669 |
-| Chinese | ICL | 27 / 102 | 0 / 102 | 0.9690 | 0.9677 |
-
-The error columns count edits / reference words or characters. In each of the
-three Chinese outputs with 27 edits, 26 were traditional/simplified character
-variants and one was the recognizer's `晴` → `勤` substitution. The script
-does not convert character variants, so its raw CER is not a pronunciation
-error rate or evidence of a True-layout regression.
-
-Real-audio same/different-speaker cosine controls were 0.9724 / 0.8046 for
-English and 0.9524 / 0.7631 for Chinese. English x-vector-only output scored
-0.8584 / 0.8389 against the different speaker in True / False layouts,
-showing weak speaker discrimination in this sample. Chinese verifier scores
-remain uncalibrated. These data do not establish a general layout-quality
-ranking; the primary fixtures use True to capture the initial complete-text
-prompt, while False fixtures retain the decode-time text path.
 
 Manual listening covered the four prepared references, four speaker-control
 recordings, and eight short-reference outputs. No obvious errors were reported
