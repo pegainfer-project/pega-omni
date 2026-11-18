@@ -23,13 +23,20 @@ check belongs in CI.
 - `crates/omni-sim`: `Sim` is a pure state machine (admission, frames,
   chunks, step cost); `spawn` is the thread shell. Decisions go in `Sim`,
   where property tests reach them.
+- `crates/omni-qwen3`: the Qwen3 decoder stack as manifest calls (`Stack`, over paged or dense
+  KV) and its kernels (`kernels/qwen3.cu`, the `qwen3` module every model built on it lists).
 - `crates/omni-qwen3-tts`: Qwen3-TTS as one generated kern manifest.
-  `talker.rs`, `stack.rs` and `codec.rs` emit the calls (through
-  `omni-kern`'s builder), `kernels/*.cu` the kernels they launch; `model.rs` is the runtime
+  `talker.rs` and `codec.rs` emit the calls (through `omni-kern`'s builder, the stack's through
+  `omni-qwen3`), `kernels/*.cu` the kernels they launch; `model.rs` is the runtime
   shell, `engine.rs` the scheduler. `tests/golden.rs` is the correctness
   oracle.
 - `crates/omni-kern`: what the GPU engines share: the manifest builder
   (`Gen`), weight loading, `common.cuh`.
+- `crates/omni-higgs-audio`: Higgs TTS 3 (4B) as one generated kern manifest. `model.rs` emits the programs (the Qwen3 body
+  through `omni-qwen3`) and is the runtime shell, `codec.rs` the codec decoder,
+  `kernels/higgs.cu` and `kernels/codec.cu` the kernels they launch, `delay.rs` the delay pattern
+  (a pure state machine the host owns), `engine.rs` the scheduler. `tests/golden.rs` is the
+  correctness oracle.
 - `crates/omni-personaplex`: PersonaPlex-7B (full duplex) as one manifest;
   `model.rs` the runtime shell, `engine.rs` the clock, `tests/golden.rs` the
   oracle.
@@ -44,6 +51,9 @@ check belongs in CI.
   official SDK against a live server; it is the compatibility oracle, not our
   reading of the docs.
 - `tools/live_check.py`: the GPT-Live oracle, like the SDK check for speech.
+- `tools/higgs_audio/golden.py`: records the Hugging Face run `omni-higgs-audio`'s golden test
+  compares against (on the CPU; `codec_config.json` is the codec's config, which the checkpoint
+  does not ship).
 - `tools/personaplex/golden.py`: records the reference run
   `omni-personaplex`'s golden test compares against.
 - `tools/qwen3_tts/`: `golden.py` records the official run the golden test

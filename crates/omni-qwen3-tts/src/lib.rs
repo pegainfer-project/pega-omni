@@ -11,7 +11,6 @@ pub mod engine;
 pub mod gemm;
 pub mod model;
 pub mod prompt;
-mod stack;
 mod talker;
 
 pub use omni_kern::weights;

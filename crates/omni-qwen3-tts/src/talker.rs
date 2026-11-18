@@ -23,12 +23,6 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::config;
-use crate::stack::HEAD_DIM;
-use crate::stack::Keep;
-use crate::stack::Kv;
-use crate::stack::Pass;
-use crate::stack::Scratch;
-use crate::stack::Stack;
 use omni_kern::Gen;
 use omni_kern::buf;
 use omni_kern::buf_at;
@@ -44,6 +38,12 @@ use omni_kern::state_in;
 use omni_kern::state_io;
 use omni_kern::stride;
 use omni_kern::weights::File;
+use omni_qwen3::HEAD_DIM;
+use omni_qwen3::Keep;
+use omni_qwen3::Kv;
+use omni_qwen3::Pass;
+use omni_qwen3::Scratch;
+use omni_qwen3::Stack;
 
 pub const GROUPS: usize = 16;
 /// Code-predictor KV slots per sequence: one per position of a frame.

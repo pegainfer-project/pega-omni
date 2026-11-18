@@ -8,19 +8,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-/// A Qwen3 decoder stack's shape.
-#[derive(Clone, Debug, Deserialize)]
-pub struct Stack {
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
-    pub num_hidden_layers: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub head_dim: usize,
-    pub rms_norm_eps: f32,
-    pub rope_theta: f32,
-    pub vocab_size: usize,
-}
+pub use omni_qwen3::config::Stack;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Talker {
