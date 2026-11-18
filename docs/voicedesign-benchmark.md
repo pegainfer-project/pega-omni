@@ -1,9 +1,11 @@
 # VoiceDesign correctness and performance validation
 
-This runbook describes the matched VoiceDesign comparison. The completed
-RTX 5090 measurements and numerical checks are recorded in
-[bench.md](bench.md#qwen3-tts-voicedesign-on-rtx-5090). The CustomVoice
-measurements in `qwen3-tts-vs-vllm-omni.md` use a different checkpoint.
+This runbook describes the VoiceDesign comparison. The RTX 5090
+measurements include a
+[fixed-concurrency comparison](bench.md#qwen3-tts-voicedesign-on-rtx-5090)
+and an [open-arrival comparison against vLLM-Omni 0.32.0](bench.md#open-arrivals-against-vllm-omni-0320).
+The CustomVoice measurements in `qwen3-tts-vs-vllm-omni.md` use a
+different checkpoint.
 
 ## Verified device (2026-10-27)
 
@@ -92,11 +94,10 @@ latency. Preserve the original workload and record any adaptation.
 
 ## Comparison protocol
 
-- Pin a published baseline, initially `vllm==0.30.0` and
-  `vllm-omni==0.30.0`, rather than the older release candidate in the
-  CustomVoice script. Record the package versions and deploy configuration.
-  Current source revisions may require a different matched vLLM version;
-  report them as a separate baseline.
+- Pin a published vLLM-Omni release with its required vLLM version. The
+  open-arrival study used `vllm==0.32.0` and `vllm-omni==0.32.0`
+  with CUDA 13.0. Record the package versions and deploy configuration.
+  [vLLM-Omni compatibility and release notes](https://github.com/vllm-project/vllm-omni/releases/tag/v0.32.0)
 - Start with the stable release's `qwen3_tts.yaml`, then evaluate its
   `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile. The latter uses
   codec graph batches up to eight and 1+25 chunks; it is a candidate, not
@@ -122,6 +123,13 @@ latency. Preserve the original workload and record any adaptation.
   audio seconds per wall second, playback underrun, failure rate, output
   duration distributions and peak GPU memory. Review saved audio and content
   quality alongside speed.
+
+For a capacity comparison, schedule arrivals independently of when earlier
+requests complete. Reuse the exact arrival offsets across engines. Measure
+first PCM and completion from each scheduled arrival to include queuing
+outside the HTTP connection. Count every offered request in the SLO
+denominator and keep any latency spikes that occur after warmup. Document
+the client admission limit and each deployment's chunk policy.
 
 Profile the verified baseline before changing kernels. Candidate areas from
 code inspection are the predictor's short-context attention, small-M GEMMs

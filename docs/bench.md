@@ -592,3 +592,96 @@ algorithm payload equals the measured nine-entry file; only descriptive
 annotations were updated after validation. The original four-entry file
 stays unchanged. Runtime source, default heuristic selection and M>=2
 operations are unchanged by this profile extension.
+
+## Open arrivals against vLLM-Omni 0.32.0
+
+The 2026-11-18 to 2026-11-19 run used one RTX 5090 with 32607 MiB of memory,
+a 575 W power limit, driver 595.71.05, CUDA 13.0.88 and cuBLASLt 130101.
+Pega ran source `8801d20`, compiled for `sm_120`, with batch 32, 4096
+step tokens, 4 GiB KV, the nine-entry single-row GEMM profile and fixed
+2+8-frame chunks. The baseline used vLLM and vLLM-Omni 0.32.0 with
+PyTorch 2.13.0+cu130. [vLLM-Omni 0.32.0 release](https://github.com/vllm-project/vllm-omni/releases/tag/v0.32.0)
+
+The published single-stage profile's fused Predictor failed to start on
+this GPU. Its Triton kernel requested 136 KiB of shared memory against a
+99 KiB hardware limit. With `code_predictor_fused: false`, single-stage
+streaming decode and the fused sampler remained enabled. At 16 and 32
+offered requests/s, that configuration, its first-audio shortcut variant,
+and the matched 2+8 two-stage B4 configuration all met the joint latency
+target for all 96 requests per variant. The single-stage configuration
+with the shortcut disabled had the highest mean joint goodput, 21.40
+requests/s versus 20.60 and 19.03. It used the release's native audio
+chunking in the full sweep.
+
+Both engines used the same verified VoiceDesign weights, 30 English texts
+and instructions, generation caps, numeric seeds and scheduled arrival
+offsets. Sampling implementations can produce different waveforms and
+lengths. One engine ran at a time, with separate CPU cores for server,
+client and controller. Each rate used 480 timed requests and 32 warmup
+requests per engine in each of three alternating A/B pairs. The request
+schedule continued independently of completion, with up to 128 in-flight
+HTTP requests. Latency ran from scheduled arrival and included client
+and server waiting. Audio throughput divides emitted audio seconds by
+the offer-and-drain wall time.
+
+The joint service-level objective (SLO) is first PCM within 200 ms and
+full completion within 2 s. Each table cell gives the median of the three
+run estimates, with Pega first and vLLM-Omni second.
+
+| Offered req/s | Joint SLO | First PCM p99 (ms) | Completion p99 (ms) | Audio-s/s |
+|---:|---:|---:|---:|---:|
+| 8 | 100.0% / 100.0% | 37.3 / 75.0 | 765.2 / 826.1 | 35.74 / 35.58 |
+| 16 | 100.0% / 100.0% | 42.7 / 76.9 | 844.6 / 973.6 | 70.78 / 70.82 |
+| 32 | 100.0% / 100.0% | 45.7 / 88.2 | 1021.8 / 987.0 | 139.14 / 138.40 |
+| 48 | 70.4% / 100.0% | 387.8 / 111.7 | 1168.0 / 1130.3 | 200.18 / 205.02 |
+| 64 | 17.9% / 100.0% | 1844.9 / 122.0 | 2480.5 / 1232.8 | 216.54 / 268.58 |
+
+All 14,400 timed requests completed with frame-aligned output and no
+generation-cap hits. Peak sampled whole-device memory in client windows,
+including warmup, was 10,446 MiB for Pega and 19,646 MiB for vLLM-Omni.
+At 48 requests/s, vLLM-Omni attained the joint SLO in 100%, 56.25% and 100%
+of requests across the three runs. The middle run logged Triton JIT of
+`_history_kernel` in that rate's window, with client-gate wait p99 at 546
+ms. At 64 requests/s, vLLM-Omni met the objective in all three runs, with
+first-PCM p99 ranging from 115.8 to 134.1 ms. These are observed results
+at discrete offered rates on this GPU.
+
+The measured Pega source also passed the full workspace tests and strict
+Clippy, the official Python SDK check against the real GPU server, and
+configured single-stream and three-stream golden replays for English,
+Chinese, long VoiceDesign and CustomVoice. Worst waveform SNR was 32.37
+dB across the configured replays. The serving benchmark measures
+performance and output completion.
+[Per-run metrics, configuration and request-trace hashes](benchmarks/voicedesign-rtx5090-vllm-omni032-open-arrivals-20261118.json.gz)
+
+### Pega admission budget at high load
+
+The same binary alternated batch 32 / 4096 step tokens with batch 64 /
+8192 step tokens in three pairs, with 4 GiB KV and the same 2+8 chunking.
+The larger budget is the engine default. Each configuration completed
+all 2,880 offered requests at 48 and 64 requests/s.
+
+| Offered req/s | Joint SLO, 32 / 64 | First PCM p99 (ms), 32 / 64 | Audio-s/s, 32 / 64 |
+|---:|---:|---:|---:|
+| 48 | 72.7% / 100.0% | 363.7 / 52.8 | 200.14 / 203.22 |
+| 64 | 16.3% / 100.0% | 1891.7 / 126.8 | 216.25 / 264.54 |
+
+With batch 64, all three runs met the joint objective on every timed
+request at each rate. The two parameters changed together, so the
+measurement applies to the budget combination.
+
+Three new alternating pairs compared this batch-64 deployment directly
+with the selected vLLM-Omni 0.32.0 profile. All 5,760 timed requests
+completed with frame-aligned output and no generation-cap hits.
+Every request in all three pairs met both latency targets.
+
+| Offered req/s | Joint SLO, Pega / vLLM-Omni | First PCM p99 (ms) | Completion p99 (ms) | Audio-s/s |
+|---:|---:|---:|---:|---:|
+| 48 | 100.0% / 100.0% | 51.7 / 91.8 | 1122.0 / 1202.2 | 205.08 / 205.09 |
+| 64 | 100.0% / 100.0% | 144.7 / 112.3 | 1374.2 / 1284.7 | 264.30 / 267.55 |
+
+At 48 requests/s, the first-PCM p99 ranges were 50.9–52.0 ms for Pega
+and 90.9–99.7 ms for vLLM-Omni. At 64 requests/s, they were
+119.7–146.9 ms and 110.5–113.7 ms. Peak sampled whole-device memory
+in client windows, including warmup, was 10,938 and 18,738 MiB.
+[High-load A/B data and reproduction sources](benchmarks/voicedesign-rtx5090-vllm-omni032-batch64-20261119.json.gz)
