@@ -250,6 +250,9 @@ pub fn spawn(inbox: Inbox, profile: Profile) -> JoinHandle<()> {
 type Sinks = BTreeMap<u64, UnboundedSender<Event>>;
 
 fn take(sim: &mut Sim, sinks: &mut Sinks, s: omni_engine::Submission) {
+    if s.sink.is_closed() {
+        return;
+    }
     sim.admit(&s.speech);
     sinks.insert(s.speech.id, s.sink);
 }

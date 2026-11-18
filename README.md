@@ -149,6 +149,16 @@ placeholder when the server lists no preset voices. With reference audio
 enabled, speech request bodies are limited to 8 MiB, and at most four can
 be read or prepared at once. Excess requests receive `429`.
 
+`pega-omni sim --reference-audio` accepts both modes with 1–30 second clips
+and a 24 kHz reference input rate. The SDK check sends the reference fields
+in `extra_body` and exercises both modes against the running server:
+
+```bash
+pega-omni sim --reference-audio --listen 127.0.0.1:8000
+# In another terminal:
+uv run --with openai tools/openai_sdk_check.py --reference-audio
+```
+
 ## Layout
 
 | Crate | |
