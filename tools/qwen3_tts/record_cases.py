@@ -29,13 +29,15 @@ from safetensors import safe_open
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--manifest", type=Path, required=True)
-    ap.add_argument("--model", required=True)
+    ap.add_argument("--model", help="Base checkpoint directory (required when recording)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--diagnostics", action="store_true")
     ap.add_argument("--check-only", action="store_true")
     ap.add_argument("--case", action="append", choices=["en-short", "en-long", "cn-short", "cn-long"])
     args = ap.parse_args()
-    manifest = json.loads(args.manifest.read_text())
+    if not args.check_only and args.model is None:
+        ap.error("--model is required when recording")
+    manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     root = args.manifest.resolve().parent
     args.out.mkdir(parents=True, exist_ok=True)
     recorder = Path(__file__).with_name("golden.py")
@@ -49,37 +51,37 @@ def main() -> None:
             for mode in ["xvector", "icl"]:
                 name = f"{case['id']}-{mode}-{layout}"
                 fixture = args.out / f"{name}.safetensors"
-                command = [
-                    "uv",
-                    "run",
-                    str(recorder),
-                    "--model",
-                    args.model,
-                    "--out",
-                    str(fixture),
-                    "--mode",
-                    mode,
-                    "--text",
-                    case["text"],
-                    "--language",
-                    case["language"],
-                    "--ref-audio",
-                    str(reference),
-                    "--non-streaming-mode",
-                    layout,
-                    "--seed",
-                    "0",
-                ]
-                if mode == "icl":
-                    command += ["--ref-text", case["ref_text"]]
-                if mode == "icl" and case["id"].endswith("long"):
-                    command += ["--min-total-frames", "301"]
-                if layout == "false":
-                    command += ["--min-trailing-tokens", "2"]
                 if not args.check_only:
+                    command = [
+                        "uv",
+                        "run",
+                        str(recorder),
+                        "--model",
+                        args.model,
+                        "--out",
+                        str(fixture),
+                        "--mode",
+                        mode,
+                        "--text",
+                        case["text"],
+                        "--language",
+                        case["language"],
+                        "--ref-audio",
+                        str(reference),
+                        "--non-streaming-mode",
+                        layout,
+                        "--seed",
+                        "0",
+                    ]
+                    if mode == "icl":
+                        command += ["--ref-text", case["ref_text"]]
+                    if mode == "icl" and case["id"].endswith("long"):
+                        command += ["--min-total-frames", "301"]
+                    if layout == "false":
+                        command += ["--min-trailing-tokens", "2"]
                     print(f"Recording {name}", flush=True)
-                    (args.out / f"{name}.command.json").write_text(json.dumps(command, indent=2) + "\n")
-                    with (args.out / f"{name}.log").open("w") as log:
+                    (args.out / f"{name}.command.json").write_text(json.dumps(command, indent=2) + "\n", encoding="utf-8")
+                    with (args.out / f"{name}.log").open("w", encoding="utf-8") as log:
                         subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT)
                 with safe_open(fixture, framework="numpy") as saved:
                     meta = saved.metadata()
@@ -123,7 +125,7 @@ def main() -> None:
                         audio.setparams((1, 2, int(meta["sample_rate"]), 0, "NONE", "not compressed"))
                         audio.writeframes(pcm.tobytes())
                 print(f"Checked {name}: {boundaries}", flush=True)
-    (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

@@ -65,9 +65,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument(
-        "--text", default="The quick brown fox jumps over the lazy dog, then naps in the warm afternoon sun."
-    )
+    ap.add_argument("--text", default="The quick brown fox jumps over the lazy dog, then naps in the warm afternoon sun.")
     ap.add_argument("--speaker", default="ryan")
     ap.add_argument("--language", default="english")
     ap.add_argument("--seed", type=int, default=0)
@@ -97,9 +95,7 @@ def main() -> None:
         if sample_rate != 24000 or reference.ndim != 1 or reference.size == 0:
             ap.error("--ref-audio must contain nonempty mono 24 kHz PCM")
 
-    tts = Qwen3TTSModel.from_pretrained(
-        args.model, device_map="cuda:0", dtype=torch.bfloat16, attn_implementation="sdpa"
-    )
+    tts = Qwen3TTSModel.from_pretrained(args.model, device_map="cuda:0", dtype=torch.bfloat16, attn_implementation="sdpa")
     model = tts.model
     expected = "custom_voice" if args.mode == "customvoice" else "base"
     if model.tts_model_type != expected:

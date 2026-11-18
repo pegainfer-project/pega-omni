@@ -72,9 +72,9 @@ run rather than silently truncating or padding a recording.
 
 Outputs include each fixture's command and log, `summary.json` with tensor
 shapes and recorded boundaries, and WAVs of the short-reference outputs for
-listening. Keep audio and large fixtures outside Git. To recheck recordings
-without a GPU, repeat the command with `--check-only` to check fixture metadata
-and boundaries and regenerate the summary and listening WAVs.
+listening. Keep audio and large fixtures outside Git. To recheck fixture
+metadata and boundaries and regenerate the summary and listening WAVs on the
+CPU, use `--check-only` without `--model`.
 
 ## Fixture contract
 

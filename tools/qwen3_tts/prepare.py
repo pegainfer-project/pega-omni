@@ -31,7 +31,8 @@ def prepare(case: dict, roots: dict[str, Path], audio: dict, out: Path) -> dict:
         path = root / source["path"]
         transcript = source["transcript"]
         label_path = root / transcript["path"]
-        labels = dict(line.split(maxsplit=1) for line in label_path.read_text().splitlines() if line.strip())
+        lines = label_path.read_text(encoding="utf-8").splitlines()
+        labels = dict(line.split(maxsplit=1) for line in lines if line.strip())
         label = labels[transcript["key"]]
         if transcript["format"] == "aishell3":
             label = "".join(label.split()[::2])
@@ -76,7 +77,7 @@ def main() -> None:
     ap.add_argument("--cn-root", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
-    cases = json.loads(args.cases.read_text())
+    cases = json.loads(args.cases.read_text(encoding="utf-8"))
     args.out.mkdir(parents=True, exist_ok=True)
     prepared = [
         prepare(case, {"en": args.en_root, "cn": args.cn_root}, cases["audio"], args.out) for case in cases["cases"]
@@ -97,7 +98,9 @@ def main() -> None:
         "cases": prepared,
         "evaluation_audio": controls,
     }
-    (args.out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    (args.out / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     print(json.dumps({case["id"]: {key: case[key] for key in ("samples", "duration_seconds")} for case in prepared}))
 
 
