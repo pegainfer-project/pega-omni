@@ -3,9 +3,8 @@
 //! The wire format follows OpenAI's API reference. Two deliberate differences:
 //! `response_format` defaults to `wav` (not `mp3`) and only `wav` / `pcm` are
 //! encoded today; the others are refused by name rather than silently
-//! substituted. Model-specific options live in one `extra` object that the
-//! engine declares, never as new top-level fields. Unknown top-level fields are
-//! an error: a typo must not turn into a default.
+//! substituted. Engines can opt into the shared reference audio fields.
+//! Model-specific options live in `extra`. Unknown top-level fields are an error.
 
 use std::collections::BTreeMap;
 
@@ -18,8 +17,12 @@ use omni_engine::EngineInfo;
 use omni_engine::Invalid;
 use omni_engine::Speech;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
+
+use crate::reference_audio;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -62,6 +65,38 @@ struct Body {
     _stream: Option<bool>,
     #[serde(default)]
     extra: BTreeMap<String, Value>,
+    #[serde(default, deserialize_with = "present")]
+    ref_audio: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    ref_text: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    x_vector_only_mode: Option<Value>,
+}
+
+/// Keep an explicit JSON null distinct from omission so type errors name the field.
+fn present<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(de).map(Some)
+}
+
+fn reference_field<T: DeserializeOwned>(
+    value: Option<Value>,
+    field: &'static str,
+    expected: &str,
+) -> Result<Option<T>, ApiError> {
+    value
+        .map(|value| {
+            let kind = match &value {
+                Value::Null => "null",
+                Value::Bool(_) => "a boolean",
+                Value::Number(_) => "a number",
+                Value::String(_) => "a string",
+                Value::Array(_) => "an array",
+                Value::Object(_) => "an object",
+            };
+            serde_json::from_value(value)
+                .map_err(|_| ApiError::invalid(Some(field), format!("expected {expected}, got {kind}")))
+        })
+        .transpose()
 }
 
 #[derive(Deserialize)]
@@ -169,13 +204,25 @@ pub fn parse(bytes: &[u8], info: &EngineInfo) -> Result<(Speech, Delivery), ApiE
     let voice = match body.voice {
         Voice::Name(v) | Voice::Object { id: v } => v,
     };
+    let uri = reference_field::<String>(body.ref_audio, "ref_audio", "a string")?;
+    let ref_text = reference_field(body.ref_text, "ref_text", "a string")?;
+    let x_vector_only_mode = reference_field(body.x_vector_only_mode, "x_vector_only_mode", "a boolean")?;
+    let ref_audio = match (uri, &info.reference_audio) {
+        (Some(uri), Some(info)) => Some(reference_audio::decode(&uri, info)?),
+        (Some(_), None) => {
+            return Err(ApiError::invalid(Some("ref_audio"), "this model does not accept reference audio".into()));
+        }
+        (None, _) => None,
+    };
     let draft = Draft {
         input: body.input,
         voice,
         instructions: body.instructions,
         speed: body.speed,
         extra: body.extra,
-        ..Draft::default()
+        ref_audio,
+        ref_text,
+        x_vector_only_mode,
     };
     Ok((info.check(draft)?, delivery))
 }

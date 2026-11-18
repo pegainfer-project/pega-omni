@@ -12,6 +12,7 @@ axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
+hound.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 png.workspace = true

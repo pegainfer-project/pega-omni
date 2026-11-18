@@ -3,9 +3,9 @@
 //! The front end knows no model. It parses a request against the engine's
 //! [`EngineInfo`](omni_engine::EngineInfo), hands a checked
 //! [`Speech`](omni_engine::Speech) to the engine through a
-//! [`Handle`], and streams whatever audio comes back. Admission never blocks:
-//! a full engine queue is an immediate `429`, so the only waiting a request
-//! does is inside the engine, where it is visible as `omni_engine_waiting`.
+//! [`Handle`], and streams whatever audio comes back. A full engine queue is
+//! an immediate `429`. Reference audio routes also bound concurrent reads and
+//! CPU preparation before engine admission.
 //!
 //! A server fronts a speech, a live (full-duplex) or an image engine
 //! ([`Engines`]). Routes: `POST /v1/audio/speech` (speech), the GPT-Live
@@ -24,14 +24,19 @@ mod live;
 pub mod live_audio;
 pub mod live_protocol;
 pub mod protocol;
+mod reference_audio;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use axum::Extension;
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
+use axum::extract::DefaultBodyLimit;
+use axum::extract::FromRequest;
+use axum::extract::Request;
 use axum::extract::State;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::http::StatusCode;
@@ -45,11 +50,14 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use omni_engine::Handle;
 use omni_engine::Load;
 use omni_engine::Rejected;
+use omni_engine::Speech;
 use omni_engine::live::LiveHandle;
 use serde_json::json;
+use tokio::sync::Semaphore;
 
 use crate::audio::Outcome;
 use crate::protocol::ApiError;
+use crate::protocol::Delivery;
 
 /// The engine a server fronts.
 #[derive(Clone)]
@@ -122,11 +130,21 @@ struct Shared {
 }
 
 const DEMO: &str = include_str!("live.html");
+const REFERENCE_BODY_LIMIT: usize = 8 * 1024 * 1024;
+const REFERENCE_READS: usize = 4;
 
 /// The full route table over `engines`; `prometheus` enables `/metrics`.
 pub fn router(engines: impl Into<Engines>, prometheus: Option<PrometheusHandle>) -> Router {
+    let engines = engines.into();
+    let speech_route = if engines.speech().is_some_and(|engine| engine.info.reference_audio.is_some()) {
+        post(speech_with_reference)
+            .route_layer(DefaultBodyLimit::max(REFERENCE_BODY_LIMIT))
+            .route_layer(Extension(Arc::new(Semaphore::new(REFERENCE_READS))))
+    } else {
+        post(speech)
+    };
     Router::new()
-        .route("/v1/audio/speech", post(speech))
+        .route("/v1/audio/speech", speech_route)
         .route("/v1/live/sessions", get(live_socket))
         .route("/", get(demo))
         .route("/live/config", get(live_config))
@@ -136,7 +154,7 @@ pub fn router(engines: impl Into<Engines>, prometheus: Option<PrometheusHandle>)
         .route("/v1/audio/voices", get(voices))
         .route("/health", get(|| async { "ok" }))
         .route("/metrics", get(scrape))
-        .with_state(Arc::new(Shared { engines: engines.into(), prometheus }))
+        .with_state(Arc::new(Shared { engines, prometheus }))
 }
 
 fn not_here(what: &str) -> ApiError {
@@ -208,8 +226,41 @@ pub async fn serve(
 async fn speech(State(s): State<Arc<Shared>>, body: Bytes) -> Result<Response, ApiError> {
     let arrived = Instant::now();
     let engine = s.engines.speech().ok_or_else(|| not_here("speech"))?;
-    let info = &engine.info;
-    let (speech, delivery) = protocol::parse(&body, info).inspect_err(|_| {
+    submit_speech(engine, protocol::parse(&body, &engine.info), arrived)
+}
+
+async fn speech_with_reference(
+    State(s): State<Arc<Shared>>,
+    Extension(slots): Extension<Arc<Semaphore>>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let arrived = Instant::now();
+    let engine = s.engines.speech().ok_or_else(|| not_here("speech"))?;
+    let permit = slots.try_acquire_owned().map_err(|_| {
+        metrics::counter!("omni_requests_total", "outcome" => "rejected").increment(1);
+        ApiError::overloaded("reference audio preparation is full".into())
+    })?;
+    let body = Bytes::from_request(request, &s).await.map_err(|e| {
+        metrics::counter!("omni_requests_total", "outcome" => "invalid").increment(1);
+        ApiError { status: e.status(), ..ApiError::invalid(None, e.body_text()) }
+    })?;
+    let info = engine.info.clone();
+    let parsed = tokio::task::spawn_blocking(move || {
+        // A disconnected client still occupies its slot until this work finishes.
+        let _permit = permit;
+        protocol::parse(&body, &info)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("reference audio preparation failed: {e}")))?;
+    submit_speech(engine, parsed, arrived)
+}
+
+fn submit_speech(
+    engine: &Handle,
+    parsed: Result<(Speech, Delivery), ApiError>,
+    arrived: Instant,
+) -> Result<Response, ApiError> {
+    let (speech, delivery) = parsed.inspect_err(|_| {
         metrics::counter!("omni_requests_total", "outcome" => "invalid").increment(1);
     })?;
     let events = engine.submit(speech).map_err(|e| {
@@ -220,7 +271,7 @@ async fn speech(State(s): State<Arc<Shared>>, body: Bytes) -> Result<Response, A
         }
     })?;
     let report = move |o: Outcome| record(arrived, o);
-    Ok(audio::respond(events, delivery, info.sample_rate, Box::new(report)))
+    Ok(audio::respond(events, delivery, engine.info.sample_rate, Box::new(report)))
 }
 
 fn record(arrived: Instant, o: Outcome) {

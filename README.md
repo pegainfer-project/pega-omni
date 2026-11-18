@@ -132,6 +132,23 @@ differs from OpenAI, it says so instead of guessing:
   url`, other `output_format`s and `stream: true` are refused by name, and
   `seed` goes in `extra`. `pega-omni sim-image` serves an image simulator.
 
+### Reference audio
+
+Speech engines can opt into three top-level request fields:
+
+| Field | Accepted value |
+|---|---|
+| `ref_audio` | Required `data:audio/wav;base64,...` URI with standard Base64 and a complete PCM16 WAV |
+| `x_vector_only_mode` | Boolean. `true` uses only the audio; `false` or omission uses both audio and transcript |
+| `ref_text` | Nonblank transcript for audio and transcript mode. Omit in audio-only mode |
+
+WAV sources may have one or two channels at 16, 24, 44.1, or 48 kHz. The
+server checks clip duration at the source rate, mixes to mono, and resamples
+to the engine's reference input rate. `voice` is still required and can be a
+placeholder when the server lists no preset voices. With reference audio
+enabled, speech request bodies are limited to 8 MiB, and at most four can
+be read or prepared at once. Excess requests receive `429`.
+
 ## Layout
 
 | Crate | |

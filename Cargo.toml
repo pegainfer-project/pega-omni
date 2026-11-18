@@ -61,6 +61,7 @@ kern-runtime = { git = "https://github.com/pegainfer-project/kern", rev = "b43bb
 # The cuBLASLt kern-runtime builds on, for listing GEMM algorithms.
 cudarc = { version = "=0.19.7", features = ["cuda-13000"] }
 hdrhistogram = "7"
+hound = "3.5"
 http-body-util = "0.1"
 memmap2 = "0.9"
 metrics = "0.24"
