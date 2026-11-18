@@ -7,9 +7,9 @@
 //! end holds a [`Handle`], the engine holds the matching [`Inbox`], and the
 //! channel between them is the whole interface.
 //!
-//! Audio crosses the boundary as mono signed 16-bit little-endian PCM at
-//! [`EngineInfo::sample_rate`]. Container formats (wav, SSE framing) are the
-//! front end's business; the engine never encodes.
+//! Audio crosses the boundary as mono signed 16-bit little-endian PCM.
+//! Output uses [`EngineInfo::sample_rate`]; reference input has its own rate.
+//! Containers and wire framing are the front end's business.
 //!
 //! Cancellation is ownership: when the client goes away the front end drops the
 //! event receiver, the engine's next send fails, and the engine retires the
@@ -25,6 +25,7 @@ pub mod live;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
@@ -49,6 +50,52 @@ pub struct EngineInfo {
     pub extra: BTreeMap<String, Extra>,
     pub speeds: std::ops::RangeInclusive<f32>,
     pub max_input_chars: usize,
+    /// Reference conditions accepted in place of a preset voice.
+    pub reference_audio: Option<ReferenceAudioInfo>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReferenceAudioInfo {
+    pub sample_rate: u32,
+    pub duration_seconds: RangeInclusive<u32>,
+    pub audio_only: bool,
+    pub with_transcript: bool,
+}
+
+impl ReferenceAudioInfo {
+    /// Checks whole PCM frames at a source or normalized sample rate.
+    pub fn check_duration(&self, frames: usize, sample_rate: u32) -> Result<(), Invalid> {
+        let bound = |seconds: u32| u64::from(seconds) * u64::from(sample_rate);
+        let (min, max) = (*self.duration_seconds.start(), *self.duration_seconds.end());
+        if sample_rate == 0 || !(bound(min)..=bound(max)).contains(&(frames as u64)) {
+            return Err(Invalid {
+                param: "ref_audio",
+                message: format!("expected {min}..={max} seconds, got {frames} samples at {sample_rate} Hz"),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Mono signed 16-bit little-endian reference audio as decoded by the front end.
+#[derive(Clone, Debug)]
+pub struct ReferencePcm {
+    pub pcm: Bytes,
+    pub sample_rate: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReferenceMode {
+    AudioOnly,
+    WithTranscript(String),
+}
+
+/// A reference whose PCM and conditioning mode have been checked for this engine.
+#[derive(Clone, Debug)]
+pub struct Reference {
+    pub pcm: Bytes,
+    pub sample_rate: u32,
+    pub mode: ReferenceMode,
 }
 
 /// The values an `extra` key accepts.
@@ -82,6 +129,7 @@ pub struct Speech {
     pub instructions: Option<String>,
     pub speed: f32,
     pub extra: BTreeMap<String, Value>,
+    pub reference: Option<Reference>,
 }
 
 /// The unchecked fields of a speech request, as the protocol layer parsed them.
@@ -92,6 +140,9 @@ pub struct Draft {
     pub instructions: Option<String>,
     pub speed: Option<f32>,
     pub extra: BTreeMap<String, Value>,
+    pub ref_audio: Option<ReferencePcm>,
+    pub ref_text: Option<String>,
+    pub x_vector_only_mode: Option<bool>,
 }
 
 /// Why a draft was refused: the request field at fault and what was wrong.
@@ -113,7 +164,8 @@ impl EngineInfo {
         if chars > self.max_input_chars {
             return invalid("input", format!("{chars} characters, the limit is {}", self.max_input_chars));
         }
-        if !self.voices.contains(&draft.voice) {
+        let reference_voice = self.reference_audio.is_some() && self.voices.is_empty();
+        if !reference_voice && !self.voices.contains(&draft.voice) {
             return invalid("voice", format!("unknown voice `{}`; see GET /v1/audio/voices", draft.voice));
         }
         let speed = draft.speed.unwrap_or(1.0);
@@ -128,6 +180,7 @@ impl EngineInfo {
                 }
             }
         }
+        let reference = self.check_reference(draft.ref_audio, draft.ref_text, draft.x_vector_only_mode)?;
         Ok(Speech {
             id: 0,
             input: draft.input,
@@ -135,7 +188,58 @@ impl EngineInfo {
             instructions: draft.instructions,
             speed,
             extra: draft.extra,
+            reference,
         })
+    }
+
+    fn check_reference(
+        &self,
+        audio: Option<ReferencePcm>,
+        text: Option<String>,
+        audio_only: Option<bool>,
+    ) -> Result<Option<Reference>, Invalid> {
+        let Some(info) = &self.reference_audio else {
+            for (present, param) in [
+                (audio.is_some(), "ref_audio"),
+                (text.is_some(), "ref_text"),
+                (audio_only.is_some(), "x_vector_only_mode"),
+            ] {
+                if present {
+                    return Err(Invalid { param, message: "this model does not accept reference audio".into() });
+                }
+            }
+            return Ok(None);
+        };
+        let ReferencePcm { pcm, sample_rate } =
+            audio.ok_or_else(|| Invalid { param: "ref_audio", message: "reference audio is required".into() })?;
+        if sample_rate != info.sample_rate || !pcm.len().is_multiple_of(2) {
+            return Err(Invalid {
+                param: "ref_audio",
+                message: format!("expected whole mono PCM16 samples at {} Hz", info.sample_rate),
+            });
+        }
+        info.check_duration(pcm.len() / 2, sample_rate)?;
+
+        let audio_only = audio_only.unwrap_or(false);
+        if !(if audio_only { info.audio_only } else { info.with_transcript }) {
+            return Err(Invalid {
+                param: "x_vector_only_mode",
+                message: format!("this model does not support x_vector_only_mode={audio_only}"),
+            });
+        }
+        let mode = if audio_only {
+            if text.is_some() {
+                return Err(Invalid { param: "ref_text", message: "must be omitted in audio-only mode".into() });
+            }
+            ReferenceMode::AudioOnly
+        } else {
+            let text = text.filter(|text| !text.trim().is_empty()).ok_or_else(|| Invalid {
+                param: "ref_text",
+                message: "a nonblank transcript is required in audio-and-transcript mode".into(),
+            })?;
+            ReferenceMode::WithTranscript(text)
+        };
+        Ok(Some(Reference { pcm, sample_rate, mode }))
     }
 }
 

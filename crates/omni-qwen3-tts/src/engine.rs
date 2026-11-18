@@ -93,6 +93,7 @@ pub fn info(model: &Model, name: &str, max_input_chars: usize) -> EngineInfo {
         ]),
         speeds: 1.0..=1.0,
         max_input_chars,
+        reference_audio: None,
     }
 }
 

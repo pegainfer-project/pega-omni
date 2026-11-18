@@ -169,7 +169,13 @@ pub fn parse(bytes: &[u8], info: &EngineInfo) -> Result<(Speech, Delivery), ApiE
     let voice = match body.voice {
         Voice::Name(v) | Voice::Object { id: v } => v,
     };
-    let draft =
-        Draft { input: body.input, voice, instructions: body.instructions, speed: body.speed, extra: body.extra };
+    let draft = Draft {
+        input: body.input,
+        voice,
+        instructions: body.instructions,
+        speed: body.speed,
+        extra: body.extra,
+        ..Draft::default()
+    };
     Ok((info.check(draft)?, delivery))
 }
