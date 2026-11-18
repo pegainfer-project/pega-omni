@@ -99,6 +99,17 @@ def main() -> None:
                     boundaries = json.loads(meta["codec_boundaries"])
                     track = json.loads(meta["text_track"])
                     shapes = {key: saved.get_slice(key).get_shape() for key in saved.keys()}  # noqa: SIM118
+                    if "ref_codec_latent" in shapes:
+                        latent = saved.get_tensor("ref_codec_latent")
+                        code_shape = shapes.get("ref_codes")
+                        if (
+                            mode != "icl"
+                            or not code_shape
+                            or latent.shape != (code_shape[0], 512)
+                            or latent.dtype != np.float32
+                            or not np.isfinite(latent).all()
+                        ):
+                            raise ValueError(f"{fixture}: expected finite FP32 codec latents aligned to reference codes")
                     if mode == "icl" and case["id"].endswith("long") and boundaries["total_frames"] <= 300:
                         raise ValueError(f"{fixture}: long ICL did not cross 300 frames")
                     if layout == "false" and track["trailing_tokens"] <= 1:

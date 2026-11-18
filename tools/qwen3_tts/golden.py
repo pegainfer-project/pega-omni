@@ -27,8 +27,9 @@ Records one sample with the non-streaming text layout unless explicitly changed:
     wav              [T*1920]     generated audio, float in [-1, 1]
 
 Base additionally records the prepared reference PCM, FP32 speaker mel and its
-BF16 encoder input, speaker embedding, reference text IDs and ICL codes. Both
-layouts record trailing_text_hidden and tts_pad_embed for decode replay.
+BF16 encoder input, and speaker embedding. ICL also records reference text IDs,
+reference codes and the codec quantizer's input. Both layouts record
+trailing_text_hidden and tts_pad_embed for decode replay.
 The Base waveform is decoded continuously with the complete ICL reference
 prefix, saved as wav_full, and cropped at the exact reference-frame boundary.
 The public decoder's 300-frame chunking is not a continuous-decoding oracle.
@@ -46,6 +47,8 @@ separate from recording, so future implementations receive identical samples.
 
 import argparse
 import json
+from contextlib import nullcontext
+from importlib.metadata import version
 from pathlib import Path
 from unittest.mock import patch
 
@@ -144,9 +147,19 @@ def main() -> None:
         def record_speaker_input(_module, inputs):
             tensors["speaker_mel_input"] = cpu(inputs[0][0])
 
+        encoder = model.speech_tokenizer.model.encoder
+        quantize = encoder.quantizer.encode
+
+        def record_codec_latent(embeddings, num_quantizers):
+            tensors["ref_codec_latent"] = cpu(embeddings[0].transpose(0, 1))
+            return quantize(embeddings, num_quantizers)
+
+        codec_capture = (
+            patch.object(encoder.quantizer, "encode", record_codec_latent) if args.mode == "icl" else nullcontext()
+        )
         hook = model.speaker_encoder.register_forward_pre_hook(record_speaker_input)
         try:
-            with patch.object(official, "mel_spectrogram", record_mel):
+            with codec_capture, patch.object(official, "mel_spectrogram", record_mel):
                 items = tts.create_voice_clone_prompt(
                     ref_audio=(reference, 24000), ref_text=args.ref_text, x_vector_only_mode=args.mode == "xvector"
                 )
@@ -155,7 +168,10 @@ def main() -> None:
         tensors["speaker_embedding"] = cpu(items[0].ref_spk_embedding)
         prompt = tts._prompt_items_to_voice_clone_prompt(items)
         ref_codes = items[0].ref_code
-        if ref_codes is not None:
+        if args.mode == "icl":
+            latent = tensors.get("ref_codec_latent")
+            if ref_codes is None or latent is None or latent.shape != (ref_codes.shape[0], encoder.config.hidden_size):
+                raise ValueError("Expected a codec quantizer input row for each reference code frame")
             tensors["ref_codes"] = cpu(ref_codes, torch.int64)
             ref_ids = tts._tokenize_texts([tts._build_ref_text(args.ref_text)])[0]
             tensors["ref_text_ids"] = cpu(ref_ids[0], torch.int64)
@@ -253,8 +269,17 @@ def main() -> None:
             sort_keys=True,
         ),
     }
-    if args.ref_audio is not None:
-        meta["ref_text"] = args.ref_text or ""
+    if reference is not None:
+        major, minor = torch.cuda.get_device_capability(model.device)
+        meta.update(
+            ref_text=args.ref_text or "",
+            gpu_name=torch.cuda.get_device_name(model.device),
+            gpu_compute_capability=f"{major}.{minor}",
+            torch_cuda_version=torch.version.cuda,
+            torch_version=str(torch.__version__),
+            transformers_version=version("transformers"),
+            qwen_tts_version=version("qwen-tts"),
+        )
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, args.out, metadata=meta)
     print(json.dumps({**meta, **{k: list(v.shape) for k, v in tensors.items()}}))
