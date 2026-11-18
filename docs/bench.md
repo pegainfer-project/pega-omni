@@ -17,6 +17,28 @@ packet) is fixed.
 - `tools/bench_sweep.sh <tag> <server args>` reproduces each row
   (env `CONCS`, `N`, `RATE`, `EXTRA`, `FORMAT`, `FRAMING`).
 
+### Request arrival and latency accounting
+
+`omni-bench` schedules finite `--request-rate` arrivals with a seeded Poisson
+process, even while every client slot is occupied. `inf` schedules every request
+at the start of the measurement. `--max-concurrency` limits dispatched requests;
+later arrivals wait in the client. A concurrency-limited run can therefore have
+short dispatch-to-audio latency while scheduled arrivals wait much longer.
+
+The JSON report keeps the dispatch-based `ttfp_ms`, `e2e_ms` and `rtf` fields.
+It also records `scheduled_ms` and `dispatch_ms` as offsets from the measurement
+start, and `client_wait_ms` as their difference. This wait includes generator
+scheduling delays and time spent waiting for a concurrency permit; it is not
+server queue time. `arrival_ttfp_ms` and `arrival_e2e_ms` include this wait. Use
+the arrival metrics when evaluating latency against the offered request rate,
+and report failures alongside successful-request latency percentiles.
+
+Summary client-wait percentiles include every request; the other latency
+percentiles include successful requests. Warmups are excluded. `--timeout`
+still bounds each dispatched request, so a request can spend longer than that
+timeout waiting in the client before dispatch. Historical results below use
+dispatch-based latency and are unchanged.
+
 ## 1. `TCP_NODELAY`
 
 First run, 50k requests, `extra.frames = 13` (1.04 s audio, chunks 1+4+4+4):
