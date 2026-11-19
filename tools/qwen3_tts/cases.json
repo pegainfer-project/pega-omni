@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "audio": {
+    "sample_rate": 24000,
+    "channels": 1,
+    "encoding": "PCM_16",
+    "resampler": "scipy.signal.resample_poly",
+    "window": [
+      "kaiser",
+      5.0
+    ],
+    "padtype": "constant",
+    "quantization": "round-to-even after clipping to [-1, 32767/32768]"
+  },
+  "datasets": {
+    "en": {
+      "name": "LibriSpeech dev-clean",
+      "source": "https://www.openslr.org/12/",
+      "archive": "https://www.openslr.org/resources/12/dev-clean.tar.gz",
+      "license": "CC-BY-4.0",
+      "license_path": "LibriSpeech/LICENSE.TXT"
+    },
+    "cn": {
+      "name": "AISHELL-3",
+      "source": "https://huggingface.co/datasets/AISHELL/AISHELL-3/tree/f20d5db4a31fe779ef07bb1af4ea92da5c786622",
+      "revision": "f20d5db4a31fe779ef07bb1af4ea92da5c786622",
+      "license": "Apache-2.0 (source dataset card)",
+      "transcript_processing": "Remove alternating pinyin tokens; preserve the dataset character labels without corrections."
+    }
+  },
+  "cases": [
+    {
+      "id": "en-short",
+      "language": "English",
+      "speaker_id": "1272",
+      "ref_text": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+      "text": "The morning train arrived on time, and we walked along the river before breakfast. A small boat passed beneath the old stone bridge while the shops were opening on the opposite bank. After a short rest, we bought some fresh bread and returned to the station, where our friends were waiting to hear about the journey and make plans for the rest of the day.",
+      "sources": [
+        {
+          "dataset": "en",
+          "path": "LibriSpeech/dev-clean/1272/128104/1272-128104-0000.flac",
+          "sample_rate": 16000,
+          "samples": 93680,
+          "text": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+          "transcript": {
+            "path": "LibriSpeech/dev-clean/1272/128104/1272-128104.trans.txt",
+            "key": "1272-128104-0000",
+            "format": "librispeech"
+          }
+        }
+      ],
+      "transcript_human_reviewed": false,
+      "purpose": "Natural short reference."
+    },
+    {
+      "id": "en-long",
+      "language": "English",
+      "speaker_id": "1272",
+      "ref_text": "HE TELLS US THAT AT THIS FESTIVE SEASON OF THE YEAR WITH CHRISTMAS AND ROAST BEEF LOOMING BEFORE US SIMILES DRAWN FROM EATING AND ITS RESULTS OCCUR MOST READILY TO THE MIND",
+      "text": "When the rain stopped, we opened the windows and watched the clouds move slowly over the hills. Please read the next sentence clearly, then pause for a moment before telling us that the afternoon meeting will begin at three. Everyone should bring a notebook and leave enough time to ask questions before the library closes.",
+      "sources": [
+        {
+          "dataset": "en",
+          "path": "LibriSpeech/dev-clean/1272/128104/1272-128104-0002.flac",
+          "sample_rate": 16000,
+          "samples": 199760,
+          "text": "HE TELLS US THAT AT THIS FESTIVE SEASON OF THE YEAR WITH CHRISTMAS AND ROAST BEEF LOOMING BEFORE US SIMILES DRAWN FROM EATING AND ITS RESULTS OCCUR MOST READILY TO THE MIND",
+          "transcript": {
+            "path": "LibriSpeech/dev-clean/1272/128104/1272-128104.trans.txt",
+            "key": "1272-128104-0002",
+            "format": "librispeech"
+          }
+        }
+      ],
+      "transcript_human_reviewed": false,
+      "purpose": "Natural long reference; the generated continuation also exercises long codec context."
+    },
+    {
+      "id": "cn-short",
+      "language": "Chinese",
+      "speaker_id": "SSB0009",
+      "ref_text": "羊城晚报五月八日报道今年的母亲节五月十日",
+      "text": "今天下午天气晴朗，我们准备沿着河边散步，然后去附近的书店看看。路上如果遇到认识的朋友，就邀请他们一起喝杯茶，聊聊最近的工作和生活。等太阳快要落山的时候，我们再坐公交车回家，准备一顿简单的晚饭。晚饭后，再把今天拍的照片发给家人。",
+      "sources": [
+        {
+          "dataset": "cn",
+          "path": "train/wav/SSB0009/SSB00090025.wav",
+          "sample_rate": 44100,
+          "samples": 234946,
+          "text": "羊城晚报五月八日报道今年的母亲节五月十日",
+          "transcript": {
+            "path": "train/content.txt",
+            "key": "SSB00090025.wav",
+            "format": "aishell3"
+          }
+        }
+      ],
+      "transcript_human_reviewed": false,
+      "purpose": "Natural short reference."
+    },
+    {
+      "id": "cn-long",
+      "language": "Chinese",
+      "speaker_id": "SSB0273",
+      "ref_text": "记者万勤通讯员李雨生一女子贩毒不现金交易直至今日不动产登记工作第三部际联席会议在京召开",
+      "text": "雨停以后，我们打开窗户，看着远处的云慢慢飘过山顶。请用清晰自然的声音读完这段话，稍作停顿，然后告诉大家，明天下午三点的会议将在图书馆旁边的新大楼举行。请大家提前十分钟到场，并带好记录用的纸和笔。",
+      "sources": [
+        {
+          "dataset": "cn",
+          "path": "train/wav/SSB0273/SSB02730077.wav",
+          "sample_rate": 44100,
+          "samples": 418993,
+          "text": "记者万勤通讯员李雨生一女子贩毒不现金交易",
+          "transcript": {
+            "path": "train/content.txt",
+            "key": "SSB02730077.wav",
+            "format": "aishell3"
+          }
+        },
+        {
+          "dataset": "cn",
+          "path": "train/wav/SSB0273/SSB02730036.wav",
+          "sample_rate": 44100,
+          "samples": 401618,
+          "text": "直至今日不动产登记工作第三部际联席会议在京召开",
+          "transcript": {
+            "path": "train/content.txt",
+            "key": "SSB02730036.wav",
+            "format": "aishell3"
+          }
+        }
+      ],
+      "transcript_human_reviewed": false,
+      "purpose": "Boundary reference made by concatenating complete recordings; not a natural continuous utterance or a quality reference."
+    }
+  ],
+  "evaluation_audio": [
+    {
+      "id": "en-heldout",
+      "language": "English",
+      "speaker_id": "1272",
+      "sources": [
+        {
+          "dataset": "en",
+          "path": "LibriSpeech/dev-clean/1272/128104/1272-128104-0001.flac",
+          "sample_rate": 16000,
+          "samples": 77040,
+          "text": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+          "transcript": {
+            "path": "LibriSpeech/dev-clean/1272/128104/1272-128104.trans.txt",
+            "key": "1272-128104-0001",
+            "format": "librispeech"
+          }
+        }
+      ],
+      "ref_text": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+      "transcript_human_reviewed": false,
+      "purpose": "Independent speaker-verifier control; not a voice-clone generation case."
+    },
+    {
+      "id": "en-different",
+      "language": "English",
+      "speaker_id": "422",
+      "sources": [
+        {
+          "dataset": "en",
+          "path": "LibriSpeech/dev-clean/422/122949/422-122949-0004.flac",
+          "sample_rate": 16000,
+          "samples": 111760,
+          "text": "HE HONOURS WHATEVER HE RECOGNIZES IN HIMSELF SUCH MORALITY EQUALS SELF GLORIFICATION",
+          "transcript": {
+            "path": "LibriSpeech/dev-clean/422/122949/422-122949.trans.txt",
+            "key": "422-122949-0004",
+            "format": "librispeech"
+          }
+        }
+      ],
+      "ref_text": "HE HONOURS WHATEVER HE RECOGNIZES IN HIMSELF SUCH MORALITY EQUALS SELF GLORIFICATION",
+      "transcript_human_reviewed": false,
+      "purpose": "Independent speaker-verifier control; not a voice-clone generation case."
+    },
+    {
+      "id": "cn-heldout",
+      "language": "Chinese",
+      "speaker_id": "SSB0009",
+      "sources": [
+        {
+          "dataset": "cn",
+          "path": "train/wav/SSB0009/SSB00090015.wav",
+          "sample_rate": 44100,
+          "samples": 223687,
+          "text": "不仅在赛事热身阶段安排型男教练带动热身",
+          "transcript": {
+            "path": "train/content.txt",
+            "key": "SSB00090015.wav",
+            "format": "aishell3"
+          }
+        }
+      ],
+      "ref_text": "不仅在赛事热身阶段安排型男教练带动热身",
+      "transcript_human_reviewed": false,
+      "purpose": "Independent speaker-verifier control; not a voice-clone generation case."
+    },
+    {
+      "id": "cn-different",
+      "language": "Chinese",
+      "speaker_id": "SSB0273",
+      "sources": [
+        {
+          "dataset": "cn",
+          "path": "train/wav/SSB0273/SSB02730077.wav",
+          "sample_rate": 44100,
+          "samples": 418993,
+          "text": "记者万勤通讯员李雨生一女子贩毒不现金交易",
+          "transcript": {
+            "path": "train/content.txt",
+            "key": "SSB02730077.wav",
+            "format": "aishell3"
+          }
+        }
+      ],
+      "ref_text": "记者万勤通讯员李雨生一女子贩毒不现金交易",
+      "transcript_human_reviewed": false,
+      "purpose": "Independent speaker-verifier control; not a voice-clone generation case."
+    }
+  ],
+  "controls": [
+    {
+      "language": "en",
+      "reference": "en-short.wav",
+      "heldout": "en-heldout.wav",
+      "different": "en-different.wav"
+    },
+    {
+      "language": "zh",
+      "reference": "cn-short.wav",
+      "heldout": "cn-heldout.wav",
+      "different": "cn-different.wav"
+    }
+  ]
+}
