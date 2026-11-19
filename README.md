@@ -147,7 +147,8 @@ server checks clip duration at the source rate, mixes to mono, and resamples
 to the engine's reference input rate. `voice` is still required and can be a
 placeholder when the server lists no preset voices. With reference audio
 enabled, speech request bodies are limited to 8 MiB, and at most four can
-be read or prepared at once. Excess requests receive `429`.
+be read or prepared at once. Excess requests receive `429`. The server
+allows 60 seconds to receive the full body and returns `408` on timeout.
 
 `pega-omni sim --reference-audio` accepts both modes with 1–30 second clips
 and a 24 kHz reference input rate. The SDK check sends the reference fields

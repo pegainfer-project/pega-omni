@@ -6,6 +6,7 @@
 //! substituted. Engines can opt into the shared reference audio fields.
 //! Model-specific options live in `extra`. Unknown top-level fields are an error.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use axum::Json;
@@ -19,8 +20,8 @@ use omni_engine::Speech;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 use crate::reference_audio;
 
@@ -46,7 +47,7 @@ pub struct Delivery {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Body {
+struct Body<'a> {
     model: String,
     input: String,
     voice: Voice,
@@ -65,39 +66,43 @@ struct Body {
     _stream: Option<bool>,
     #[serde(default)]
     extra: BTreeMap<String, Value>,
-    #[serde(default, deserialize_with = "present")]
-    ref_audio: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    ref_text: Option<Value>,
-    #[serde(default, deserialize_with = "present")]
-    x_vector_only_mode: Option<Value>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    ref_audio: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    ref_text: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    x_vector_only_mode: Option<&'a RawValue>,
 }
 
 /// Keep an explicit JSON null distinct from omission so type errors name the field.
-fn present<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Value>, D::Error> {
-    Value::deserialize(de).map(Some)
+fn present<'de, D: Deserializer<'de>>(de: D) -> Result<Option<&'de RawValue>, D::Error> {
+    <&RawValue>::deserialize(de).map(Some)
 }
 
-fn reference_field<T: DeserializeOwned>(
-    value: Option<Value>,
+/// A raw token identifies the JSON type while keeping container contents in the request buffer.
+fn reference_field<'de, T: Deserialize<'de>>(
+    value: Option<&'de RawValue>,
     field: &'static str,
     expected: &str,
 ) -> Result<Option<T>, ApiError> {
-    value
-        .map(|value| {
-            let kind = match &value {
-                Value::Null => "null",
-                Value::Bool(_) => "a boolean",
-                Value::Number(_) => "a number",
-                Value::String(_) => "a string",
-                Value::Array(_) => "an array",
-                Value::Object(_) => "an object",
-            };
-            serde_json::from_value(value)
-                .map_err(|_| ApiError::invalid(Some(field), format!("expected {expected}, got {kind}")))
-        })
-        .transpose()
+    let Some(value) = value else { return Ok(None) };
+    let kind = match value.get().as_bytes()[0] {
+        b'n' => "null",
+        b't' | b'f' => "a boolean",
+        b'"' => "a string",
+        b'[' => "an array",
+        b'{' => "an object",
+        _ => "a number",
+    };
+    if kind != expected {
+        return Err(ApiError::invalid(Some(field), format!("expected {expected}, got {kind}")));
+    }
+    T::deserialize(value).map(Some).map_err(|e| ApiError::invalid(Some(field), e.to_string()))
 }
+
+/// Ordinary data URIs borrow the request bytes. JSON escapes need an owned string.
+#[derive(Deserialize)]
+struct AudioUri<'a>(#[serde(borrow)] Cow<'a, str>);
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -204,25 +209,19 @@ pub fn parse(bytes: &[u8], info: &EngineInfo) -> Result<(Speech, Delivery), ApiE
     let voice = match body.voice {
         Voice::Name(v) | Voice::Object { id: v } => v,
     };
-    let uri = reference_field::<String>(body.ref_audio, "ref_audio", "a string")?;
+    let uri = reference_field::<AudioUri>(body.ref_audio, "ref_audio", "a string")?.map(|uri| uri.0);
     let ref_text = reference_field(body.ref_text, "ref_text", "a string")?;
     let x_vector_only_mode = reference_field(body.x_vector_only_mode, "x_vector_only_mode", "a boolean")?;
-    let ref_audio = match (uri, &info.reference_audio) {
-        (Some(uri), Some(info)) => Some(reference_audio::decode(&uri, info)?),
-        (Some(_), None) => {
-            return Err(ApiError::invalid(Some("ref_audio"), "this model does not accept reference audio".into()));
-        }
-        (None, _) => None,
-    };
     let draft = Draft {
         input: body.input,
         voice,
         instructions: body.instructions,
         speed: body.speed,
         extra: body.extra,
-        ref_audio,
+        ref_audio: uri.as_deref(),
         ref_text,
         x_vector_only_mode,
     };
-    Ok((info.check(draft)?, delivery))
+    let speech = info.check_with_audio(draft, reference_audio::decode)?;
+    Ok((speech, delivery))
 }

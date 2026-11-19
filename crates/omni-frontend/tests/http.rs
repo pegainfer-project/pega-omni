@@ -232,12 +232,16 @@ async fn reference_at_the_engine_rate_preserves_signed_samples_and_transcript() 
     let wav = reference_wav(REFERENCE_RATE, 1, &samples);
     let padded = wav_with_metadata(&wav, b"JUNK\x01\0\0\0x\0");
     let audio = wav_uri(&padded);
-    let body = reference_body(json!({ "ref_audio": audio, "ref_text": "These words are spoken." }));
-    let reference = submitted_reference(&app, &inbox, body).await;
+    let transcript = r#"She said, "你好。""#;
+    let body = reference_body(json!({ "ref_audio": audio, "ref_text": transcript }));
+    let escaped = body.to_string().replacen("audio/wav", r"audio\/wav", 1);
+    let response = app.oneshot(speech_request(Body::from(escaped))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let reference = inbox.rx.try_recv().unwrap().speech.reference.unwrap();
 
     assert_eq!((reference.sample_rate, reference.pcm.as_ref()), (REFERENCE_RATE, samples.as_slice()));
     let ReferenceMode::WithTranscript(text) = reference.mode else { panic!("default reference mode") };
-    assert_eq!(text, "These words are spoken.");
+    assert_eq!(text, transcript);
 }
 
 #[tokio::test]
@@ -292,12 +296,19 @@ async fn invalid_references_name_the_field_and_never_reach_the_engine() {
     let cases = [
         ("missing audio", json!({ "ref_text": "hello" }), "ref_audio"),
         ("numeric audio", json!({ "ref_audio": 4 }), "ref_audio"),
+        ("array audio", json!({ "ref_audio": ["clip"] }), "ref_audio"),
+        ("object transcript", json!({ "ref_audio": audio, "ref_text": { "text": "hello" } }), "ref_text"),
         ("bare base64", json!({ "ref_audio": STANDARD.encode(&wav), "ref_text": "hello" }), "ref_audio"),
         ("bad base64", json!({ "ref_audio": "data:audio/wav;base64,!!!", "ref_text": "hello" }), "ref_audio"),
         ("truncated data", json!({ "ref_audio": wav_uri(&wav[..wav.len() - 1]), "ref_text": "hello" }), "ref_audio"),
         ("not PCM", json!({ "ref_audio": wav_uri(&not_pcm), "ref_text": "hello" }), "ref_audio"),
         ("missing chunk pad", json!({ "ref_audio": wav_uri(&missing_pad), "ref_text": "hello" }), "ref_audio"),
-        ("default transcript missing", json!({ "ref_audio": audio }), "ref_text"),
+        ("missing transcript before WAV decoding", json!({ "ref_audio": "invalid URI" }), "ref_text"),
+        (
+            "invalid speed before WAV decoding",
+            json!({ "speed": 9.0, "ref_audio": "invalid URI", "ref_text": "hi" }),
+            "speed",
+        ),
         ("blank transcript", json!({ "ref_audio": audio, "ref_text": " \n\t" }), "ref_text"),
         (
             "audio-only with text",
@@ -311,12 +322,12 @@ async fn invalid_references_name_the_field_and_never_reach_the_engine() {
     }
 
     let (audio_only_app, inbox) = reference_app(true, false);
-    let body = reference_body(json!({ "ref_audio": audio, "ref_text": "hello" }));
+    let body = reference_body(json!({ "ref_audio": "invalid URI", "ref_text": "hello" }));
     assert_reference_error(&audio_only_app, &inbox, "ICL disabled", body, "x_vector_only_mode").await;
 }
 
-#[tokio::test]
-async fn stalled_uploads_take_permits_before_body_read_and_abort_releases_a_permit() {
+#[tokio::test(start_paused = true)]
+async fn stalled_uploads_release_their_permits_on_disconnect_or_timeout() {
     let (app, inbox) = reference_app(true, false);
     let mut uploads = Vec::new();
     for _ in 0..4 {
@@ -341,12 +352,20 @@ async fn stalled_uploads_take_permits_before_body_read_and_abort_releases_a_perm
     let aborted = uploads.pop().unwrap();
     aborted.abort();
     assert!(aborted.await.unwrap_err().is_cancelled());
+    // A new upload can now acquire the released slot alongside the three still pending.
+    let stalled = Body::from_stream(stream::pending::<Result<Bytes, Infallible>>());
+    uploads.push(tokio::spawn(app.clone().oneshot(speech_request(stalled))));
+    for upload in uploads {
+        let response =
+            tokio::time::timeout(Duration::from_secs(61), upload).await.expect("upload deadline").unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(error(&bytes), ("invalid_request_error".into(), None));
+    }
+    assert_eq!(inbox.rx.try_recv().err(), Some(TryRecvError::Empty));
     let wav = reference_wav(REFERENCE_RATE, 1, &vec![0; 2 * REFERENCE_RATE as usize]);
     let recovered = submitted_reference(&app, &inbox, audio_only_body(&wav)).await;
     assert_eq!(recovered.pcm.len(), 2 * REFERENCE_RATE as usize);
-    for upload in uploads {
-        upload.abort();
-    }
 }
 
 #[tokio::test]

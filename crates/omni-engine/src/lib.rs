@@ -15,7 +15,7 @@
 //! event receiver, the engine's next send fails, and the engine retires the
 //! request. No cancel message exists.
 //!
-//! A [`Speech`] only exists after [`EngineInfo::check`] accepted it, so an
+//! [`EngineInfo`] checks a [`Draft`] before producing a [`Speech`], so an
 //! engine never re-validates the voice, the speed or the extension values.
 //!
 //! Full-duplex engines speak the [`live`] contract instead: sessions on a
@@ -133,16 +133,32 @@ pub struct Speech {
 }
 
 /// The unchecked fields of a speech request, as the protocol layer parsed them.
-#[derive(Clone, Debug, Default)]
-pub struct Draft {
+/// The front end can supply encoded audio for [`EngineInfo::check_with_audio`].
+#[derive(Clone, Debug)]
+pub struct Draft<A = ReferencePcm> {
     pub input: String,
     pub voice: String,
     pub instructions: Option<String>,
     pub speed: Option<f32>,
     pub extra: BTreeMap<String, Value>,
-    pub ref_audio: Option<ReferencePcm>,
+    pub ref_audio: Option<A>,
     pub ref_text: Option<String>,
     pub x_vector_only_mode: Option<bool>,
+}
+
+impl Default for Draft {
+    fn default() -> Self {
+        Self {
+            input: String::new(),
+            voice: String::new(),
+            instructions: None,
+            speed: None,
+            extra: BTreeMap::new(),
+            ref_audio: None,
+            ref_text: None,
+            x_vector_only_mode: None,
+        }
+    }
 }
 
 /// Why a draft was refused: the request field at fault and what was wrong.
@@ -156,6 +172,15 @@ pub struct Invalid {
 impl EngineInfo {
     /// Accepts a draft this engine can serve, or names the first field it cannot.
     pub fn check(&self, draft: Draft) -> Result<Speech, Invalid> {
+        self.check_with_audio(draft, |pcm, _| Ok(pcm))
+    }
+
+    /// Checks request fields before asking the caller to decode any reference audio.
+    pub fn check_with_audio<A>(
+        &self,
+        draft: Draft<A>,
+        decode: impl FnOnce(A, &ReferenceAudioInfo) -> Result<ReferencePcm, Invalid>,
+    ) -> Result<Speech, Invalid> {
         let chars = draft.input.chars().count();
         let invalid = |param, message: String| Err(Invalid { param, message });
         if chars == 0 {
@@ -180,7 +205,7 @@ impl EngineInfo {
                 }
             }
         }
-        let reference = self.check_reference(draft.ref_audio, draft.ref_text, draft.x_vector_only_mode)?;
+        let reference = self.check_reference(draft.ref_audio, draft.ref_text, draft.x_vector_only_mode, decode)?;
         Ok(Speech {
             id: 0,
             input: draft.input,
@@ -192,11 +217,12 @@ impl EngineInfo {
         })
     }
 
-    fn check_reference(
+    fn check_reference<A>(
         &self,
-        audio: Option<ReferencePcm>,
+        audio: Option<A>,
         text: Option<String>,
         audio_only: Option<bool>,
+        decode: impl FnOnce(A, &ReferenceAudioInfo) -> Result<ReferencePcm, Invalid>,
     ) -> Result<Option<Reference>, Invalid> {
         let Some(info) = &self.reference_audio else {
             for (present, param) in [
@@ -210,16 +236,8 @@ impl EngineInfo {
             }
             return Ok(None);
         };
-        let ReferencePcm { pcm, sample_rate } =
+        let audio =
             audio.ok_or_else(|| Invalid { param: "ref_audio", message: "reference audio is required".into() })?;
-        if sample_rate != info.sample_rate || !pcm.len().is_multiple_of(2) {
-            return Err(Invalid {
-                param: "ref_audio",
-                message: format!("expected whole mono PCM16 samples at {} Hz", info.sample_rate),
-            });
-        }
-        info.check_duration(pcm.len() / 2, sample_rate)?;
-
         let audio_only = audio_only.unwrap_or(false);
         if !(if audio_only { info.audio_only } else { info.with_transcript }) {
             return Err(Invalid {
@@ -239,6 +257,14 @@ impl EngineInfo {
             })?;
             ReferenceMode::WithTranscript(text)
         };
+        let ReferencePcm { pcm, sample_rate } = decode(audio, info)?;
+        if sample_rate != info.sample_rate || !pcm.len().is_multiple_of(2) {
+            return Err(Invalid {
+                param: "ref_audio",
+                message: format!("expected whole mono PCM16 samples at {} Hz", info.sample_rate),
+            });
+        }
+        info.check_duration(pcm.len() / 2, sample_rate)?;
         Ok(Some(Reference { pcm, sample_rate, mode }))
     }
 }

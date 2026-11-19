@@ -28,6 +28,7 @@ mod reference_audio;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::Instant;
 
 use axum::Extension;
@@ -132,6 +133,7 @@ struct Shared {
 const DEMO: &str = include_str!("live.html");
 const REFERENCE_BODY_LIMIT: usize = 8 * 1024 * 1024;
 const REFERENCE_READS: usize = 4;
+const REFERENCE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The full route table over `engines`; `prometheus` enables `/metrics`.
 pub fn router(engines: impl Into<Engines>, prometheus: Option<PrometheusHandle>) -> Router {
@@ -240,9 +242,19 @@ async fn speech_with_reference(
         metrics::counter!("omni_requests_total", "outcome" => "rejected").increment(1);
         ApiError::overloaded("reference audio preparation is full".into())
     })?;
-    let body = Bytes::from_request(request, &s).await.map_err(|e| {
+    let body = match tokio::time::timeout(REFERENCE_UPLOAD_TIMEOUT, Bytes::from_request(request, &s)).await {
+        Ok(Ok(body)) => Ok(body),
+        Ok(Err(e)) => Err(ApiError { status: e.status(), ..ApiError::invalid(None, e.body_text()) }),
+        Err(_) => Err(ApiError {
+            status: StatusCode::REQUEST_TIMEOUT,
+            ..ApiError::invalid(
+                None,
+                format!("request body must arrive within {} seconds", REFERENCE_UPLOAD_TIMEOUT.as_secs()),
+            )
+        }),
+    }
+    .inspect_err(|_| {
         metrics::counter!("omni_requests_total", "outcome" => "invalid").increment(1);
-        ApiError { status: e.status(), ..ApiError::invalid(None, e.body_text()) }
     })?;
     let info = engine.info.clone();
     let parsed = tokio::task::spawn_blocking(move || {

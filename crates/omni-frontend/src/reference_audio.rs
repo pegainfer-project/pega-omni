@@ -11,6 +11,7 @@ use bytes::Bytes;
 use hound::SampleFormat;
 use hound::WavReader;
 use hound::WavSpec;
+use omni_engine::Invalid;
 use omni_engine::ReferenceAudioInfo;
 use omni_engine::ReferencePcm;
 use rubato::Fft;
@@ -18,11 +19,9 @@ use rubato::FixedSync;
 use rubato::Resampler as _;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 
-use crate::protocol::ApiError;
-
 const WAV_PREFIX: &str = "data:audio/wav;base64,";
 
-pub(crate) fn decode(uri: &str, info: &ReferenceAudioInfo) -> Result<ReferencePcm, ApiError> {
+pub(crate) fn decode(uri: &str, info: &ReferenceAudioInfo) -> Result<ReferencePcm, Invalid> {
     let encoded = uri.strip_prefix(WAV_PREFIX).ok_or_else(|| invalid(format!("expected the `{WAV_PREFIX}` prefix")))?;
     let wav = STANDARD.decode(encoded).map_err(|err| invalid(format!("invalid base64 ({err})")))?;
     let (source, spec) = wav_pcm(&wav)?;
@@ -47,11 +46,11 @@ pub(crate) fn decode(uri: &str, info: &ReferenceAudioInfo) -> Result<ReferencePc
     Ok(ReferencePcm { pcm, sample_rate })
 }
 
-fn invalid(message: impl Display) -> ApiError {
-    ApiError::invalid(Some("ref_audio"), format!("invalid `ref_audio` ({message})"))
+fn invalid(message: impl Display) -> Invalid {
+    Invalid { param: "ref_audio", message: format!("invalid `ref_audio` ({message})") }
 }
 
-fn wav_pcm(wav: &[u8]) -> Result<(&[u8], WavSpec), ApiError> {
+fn wav_pcm(wav: &[u8]) -> Result<(&[u8], WavSpec), Invalid> {
     let mut chunks = wav;
     let declared_len = hound::read_wave_header(&mut chunks).map_err(invalid)?;
     if declared_len != wav.len() as u64 {
@@ -108,7 +107,7 @@ fn quantize(sample: f32) -> [u8; 2] {
     (sample.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16).to_le_bytes()
 }
 
-fn resample(mut samples: Vec<f32>, from: u32, to: u32) -> Result<Bytes, ApiError> {
+fn resample(mut samples: Vec<f32>, from: u32, to: u32) -> Result<Bytes, Invalid> {
     let mut fft = Fft::new(from as usize, to as usize, from as usize / 100, 1, FixedSync::Both).map_err(invalid)?;
     let take = fft.input_frames_next();
     let give = fft.output_frames_next();
