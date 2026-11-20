@@ -125,6 +125,7 @@ impl Profile {
             extra: [("frames".to_string(), Extra::Integer(1..=self.max_frames as i64))].into(),
             speeds: 0.25..=4.0,
             max_input_chars: 4096,
+            reference_audio: None,
         }
     }
 }
@@ -249,6 +250,9 @@ pub fn spawn(inbox: Inbox, profile: Profile) -> JoinHandle<()> {
 type Sinks = BTreeMap<u64, UnboundedSender<Event>>;
 
 fn take(sim: &mut Sim, sinks: &mut Sinks, s: omni_engine::Submission) {
+    if s.sink.is_closed() {
+        return;
+    }
     sim.admit(&s.speech);
     sinks.insert(s.speech.id, s.sink);
 }

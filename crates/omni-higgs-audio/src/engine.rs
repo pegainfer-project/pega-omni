@@ -106,6 +106,7 @@ pub fn info(name: &str, max_input_chars: usize) -> EngineInfo {
         extra: BTreeMap::from([("seed".to_string(), Extra::Integer(0..=i64::MAX))]),
         speeds: 1.0..=1.0,
         max_input_chars,
+        reference_audio: None,
     }
 }
 

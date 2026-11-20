@@ -69,6 +69,9 @@ struct SimArgs {
     serve: Serve,
     #[arg(long, default_value = "pega-omni-sim")]
     model: String,
+    /// Accept reference audio and transcripts in place of preset voices.
+    #[arg(long)]
+    reference_audio: bool,
     #[arg(long, default_value_t = 24_000)]
     sample_rate: u32,
     #[arg(long, default_value_t = 12.5)]
@@ -404,7 +407,21 @@ fn main() -> anyhow::Result<()> {
     let (serve, (engines, engine, model)): (Serve, Started) = match Cli::parse().command {
         Command::Sim(args) => {
             let profile = args.profile()?;
-            let (handle, inbox) = omni_engine::channel(profile.info(&args.model), args.serve.queue);
+            let mut info = profile.info(&args.model);
+            let queue = if args.reference_audio {
+                info.voices.clear();
+                info.reference_audio = Some(omni_engine::ReferenceAudioInfo {
+                    sample_rate: 24_000,
+                    duration_seconds: 1..=30,
+                    audio_only: true,
+                    with_transcript: true,
+                });
+                // Each queued submission owns its reference audio until the sim takes it.
+                args.serve.queue.min(8)
+            } else {
+                args.serve.queue
+            };
+            let (handle, inbox) = omni_engine::channel(info, queue);
             (args.serve, (handle.into(), omni_sim::spawn(inbox, profile), args.model))
         }
         Command::SimLive(args) => {

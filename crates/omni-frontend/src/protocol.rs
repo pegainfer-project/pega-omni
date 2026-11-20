@@ -3,10 +3,10 @@
 //! The wire format follows OpenAI's API reference. Two deliberate differences:
 //! `response_format` defaults to `wav` (not `mp3`) and only `wav` / `pcm` are
 //! encoded today; the others are refused by name rather than silently
-//! substituted. Model-specific options live in one `extra` object that the
-//! engine declares, never as new top-level fields. Unknown top-level fields are
-//! an error: a typo must not turn into a default.
+//! substituted. Engines can opt into the shared reference audio fields.
+//! Model-specific options live in `extra`. Unknown top-level fields are an error.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use axum::Json;
@@ -18,8 +18,12 @@ use omni_engine::EngineInfo;
 use omni_engine::Invalid;
 use omni_engine::Speech;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
 use serde_json::Value;
+use serde_json::value::RawValue;
+
+use crate::reference_audio;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -43,7 +47,7 @@ pub struct Delivery {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Body {
+struct Body<'a> {
     model: String,
     input: String,
     voice: Voice,
@@ -62,7 +66,43 @@ struct Body {
     _stream: Option<bool>,
     #[serde(default)]
     extra: BTreeMap<String, Value>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    ref_audio: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    ref_text: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    x_vector_only_mode: Option<&'a RawValue>,
 }
+
+/// Keep an explicit JSON null distinct from omission so type errors name the field.
+fn present<'de, D: Deserializer<'de>>(de: D) -> Result<Option<&'de RawValue>, D::Error> {
+    <&RawValue>::deserialize(de).map(Some)
+}
+
+/// A raw token identifies the JSON type while keeping container contents in the request buffer.
+fn reference_field<'de, T: Deserialize<'de>>(
+    value: Option<&'de RawValue>,
+    field: &'static str,
+    expected: &str,
+) -> Result<Option<T>, ApiError> {
+    let Some(value) = value else { return Ok(None) };
+    let kind = match value.get().as_bytes()[0] {
+        b'n' => "null",
+        b't' | b'f' => "a boolean",
+        b'"' => "a string",
+        b'[' => "an array",
+        b'{' => "an object",
+        _ => "a number",
+    };
+    if kind != expected {
+        return Err(ApiError::invalid(Some(field), format!("expected {expected}, got {kind}")));
+    }
+    T::deserialize(value).map(Some).map_err(|e| ApiError::invalid(Some(field), e.to_string()))
+}
+
+/// Ordinary data URIs borrow the request bytes. JSON escapes need an owned string.
+#[derive(Deserialize)]
+struct AudioUri<'a>(#[serde(borrow)] Cow<'a, str>);
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -169,7 +209,19 @@ pub fn parse(bytes: &[u8], info: &EngineInfo) -> Result<(Speech, Delivery), ApiE
     let voice = match body.voice {
         Voice::Name(v) | Voice::Object { id: v } => v,
     };
-    let draft =
-        Draft { input: body.input, voice, instructions: body.instructions, speed: body.speed, extra: body.extra };
-    Ok((info.check(draft)?, delivery))
+    let uri = reference_field::<AudioUri>(body.ref_audio, "ref_audio", "a string")?.map(|uri| uri.0);
+    let ref_text = reference_field(body.ref_text, "ref_text", "a string")?;
+    let x_vector_only_mode = reference_field(body.x_vector_only_mode, "x_vector_only_mode", "a boolean")?;
+    let draft = Draft {
+        input: body.input,
+        voice,
+        instructions: body.instructions,
+        speed: body.speed,
+        extra: body.extra,
+        ref_audio: uri.as_deref(),
+        ref_text,
+        x_vector_only_mode,
+    };
+    let speech = info.check_with_audio(draft, reference_audio::decode)?;
+    Ok((speech, delivery))
 }
