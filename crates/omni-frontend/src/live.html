@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>pega-omni live</title>
+<title>kern-omni live</title>
 <style>
   :root {
     --bg: #f4f3f0; --bg-glow: #e7ecff; --panel: rgba(255, 255, 255, .78); --solid: #ffffff;
@@ -127,6 +127,8 @@
 
   footer { text-align: center; font-size: 12px; color: var(--faint); margin-top: 22px; }
   footer code { font-family: var(--mono); }
+  footer a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--line); }
+  footer a:hover { color: var(--ink); border-color: var(--ink); }
 </style>
 </head>
 <body>
@@ -134,7 +136,7 @@
   <header>
     <div class="brand">
       <div class="logo" aria-hidden="true"></div>
-      <h1>pega-omni live</h1>
+      <h1>kern-omni live</h1>
       <span class="model" id="model">…</span>
     </div>
     <span id="status" class="pill">Ready</span>
@@ -199,7 +201,7 @@
     </section>
   </div>
 
-  <footer>Full-duplex speech over <code>/v1/live/sessions</code> (GPT-Live)</footer>
+  <footer>Powered by <a href="https://github.com/pegainfer-project/kern-omni" target="_blank" rel="noopener">kern-omni</a> · Full-duplex speech over <code>/v1/live/sessions</code> (GPT-Live)</footer>
 </main>
 <script>
 const RATE = 24000;
