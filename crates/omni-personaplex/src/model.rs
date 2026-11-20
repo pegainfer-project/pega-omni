@@ -65,6 +65,10 @@ const MIMI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mimi.cubin"));
 
 const INIT: usize = STREAMS + CODEBOOKS - 1;
 const PAGES: usize = CONTEXT.div_ceil(PAGE);
+/// Cached `(voice, instructions)` prefixes kept in KV to skip repeated prefill.
+const PREFIX_CACHE_SLOTS: usize = 8;
+/// Longest prefix (in tokens) eligible for caching (~32 MiB in FP8 KV per cached prefix).
+const PREFIX_CACHE_MAX_LEN: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -115,6 +119,7 @@ pub struct Out {
 pub struct Prefix {
     prompt: Prompt,
     voice_row: usize,
+    key: (usize, Vec<u32>),
 }
 
 impl Prefix {
@@ -128,6 +133,18 @@ impl Prefix {
     }
 }
 
+/// Reusable host staging buffers for [`Model::tick`].
+#[derive(Default)]
+struct TickScratch {
+    t: Rows,
+    lines: Vec<i32>,
+    frame: Vec<i32>,
+    pcm: Vec<u8>,
+    force: Vec<i32>,
+    force_caller: Vec<i32>,
+    seeds: Vec<i32>,
+}
+
 pub struct Model {
     pub tokenizer: Tokenizer,
     rt: Runtime,
@@ -136,6 +153,9 @@ pub struct Model {
     max_seqs: usize,
     /// Each voice's first row in the `voices` weight, and the voice.
     voices: BTreeMap<String, (usize, Voice)>,
+    /// Prefilled KV leases keyed by `(voice_row, text_token_ids)` for fast reuse.
+    prefix_cache: BTreeMap<(usize, Vec<u32>), Lease>,
+    tick_buf: TickScratch,
 }
 
 fn rows_of<const N: usize>(bytes: &[u8]) -> Vec<[i32; N]> {
@@ -161,12 +181,81 @@ impl Model {
         let verified = kern_manifest::verify(kern_manifest::Manifest::from_json(&manifest.to_string())?)
             .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
         let kernels = kernels_dir(&cubins.each_ref().map(|(n, sha, b)| (*n, sha.as_str(), *b)))?;
-        let tokens = ((limits.max_sessions * PAGES + 1) * PAGE) as u64;
-        let capacity = Capacity { tokens: Some(tokens), seqs: limits.max_sessions as u64 + 1 };
+        let cache_pages = PREFIX_CACHE_SLOTS * PREFIX_CACHE_MAX_LEN.div_ceil(PAGE);
+        let tokens = ((limits.max_sessions * PAGES + cache_pages + 1) * PAGE) as u64;
+        let capacity = Capacity { tokens: Some(tokens), seqs: (limits.max_sessions + 1 + PREFIX_CACHE_SLOTS) as u64 };
         let mut rt = Runtime::load(&verified, Some(&kernels), device, Some(capacity), None)?;
         rt.load_weights(&tensors)?;
         let pad = rt.lease(1)?;
-        Ok(Self { tokenizer, rt, pad, limits, max_seqs, voices })
+        Ok(Self {
+            tokenizer,
+            rt,
+            pad,
+            limits,
+            max_seqs,
+            voices,
+            prefix_cache: BTreeMap::new(),
+            tick_buf: TickScratch::default(),
+        })
+    }
+
+    /// Pre-captures the CUDA graph of every `tick` batch bucket up to `max_seqs`
+    /// using the padding lease, so live traffic never pays graph capture latency.
+    pub fn warmup(&mut self) -> Result<()> {
+        let buckets: Vec<usize> = omni_kern::BUCKETS.into_iter().filter(|&b| b <= self.max_seqs).collect();
+        let pad_line = self.pad.seq_line("lines", 0)?;
+        let pad_slot = self.pad.slot(0) as i32;
+        let pad_pages = self.pad.page_ids();
+        for b in buckets {
+            let mut indptr = Vec::with_capacity(b + 1);
+            let mut pages = Vec::with_capacity(b * pad_pages.len());
+            indptr.push(0i32);
+            for _ in 0..b {
+                pages.extend_from_slice(pad_pages);
+                indptr.push(pages.len() as i32);
+            }
+            let lines = vec![pad_line; b];
+            let zeros = vec![0i32; b];
+            let slots = vec![pad_slot; b];
+            let pcm = vec![0u8; b * FRAME * 4];
+            let force = vec![-1i32; b * DRAWN];
+            let force_caller = vec![-1i32; b * CODEBOOKS];
+            let seeds = vec![0i32; b * 2];
+            let v = vars(b, b);
+            let rt = &mut self.rt;
+            rt.write_input_at("lines", &ints(&lines), &v)?;
+            rt.write_input_at("pos", &ints(&zeros), &v)?;
+            rt.write_input_at("slot", &ints(&slots), &v)?;
+            rt.write_input_at("frame", &ints(&zeros), &v)?;
+            rt.write_input_at("caller", &pcm, &v)?;
+            rt.write_input_at("force", &ints(&force), &v)?;
+            rt.write_input_at("force_caller", &ints(&force_caller), &v)?;
+            rt.write_input_at("seeds", &ints(&seeds), &v)?;
+            rt.write_input_at("kv_indptr", &ints(&indptr), &v)?;
+            rt.write_input_at("kv_pages", &ints(&pages), &v)?;
+            rt.issue("tick", &v)?;
+            let _ = rt.read_buffer_prefix("emitted", 4)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `prefix`'s KV is already cached on the GPU.
+    pub fn is_cached(&self, prefix: &Prefix) -> bool {
+        self.prefix_cache.contains_key(&prefix.key)
+    }
+
+    /// Prefills `prefix` into the on-device prefix cache if it fits and is not cached yet.
+    pub fn warm_prefix(&mut self, prefix: &Prefix) -> Result<()> {
+        if self.prefix_cache.contains_key(&prefix.key)
+            || self.prefix_cache.len() >= PREFIX_CACHE_SLOTS
+            || prefix.len() > PREFIX_CACHE_MAX_LEN
+        {
+            return Ok(());
+        }
+        let lease = self.rt.lease(prefix.len())?;
+        self.prefill_leases(&[(&lease, prefix)])?;
+        self.prefix_cache.insert(prefix.key.clone(), lease);
+        Ok(())
     }
 
     pub fn voices(&self) -> impl Iterator<Item = &str> {
@@ -191,7 +280,7 @@ impl Model {
             prompt.len(),
             self.limits.max_prefill
         );
-        Ok(Prefix { prompt, voice_row: *voice_row })
+        Ok(Prefix { prompt, voice_row: *voice_row, key: (*voice_row, ids) })
     }
 
     /// A fresh session's lease.
@@ -200,26 +289,21 @@ impl Model {
         Ok(Session { lease, pos: 0, frame: 0, first_force: [-1; DRAWN] })
     }
 
-    /// Prefills each fresh session's prefix; the sessions' first tick follows.
-    pub fn start(&mut self, rows: &mut [(&mut Session, &Prefix)]) -> Result<()> {
+    /// Runs Helium `prefill` directly into the given `(lease, prefix)` pairs.
+    fn prefill_leases(&mut self, rows: &[(&Lease, &Prefix)]) -> Result<()> {
         let n = rows.len();
-        ensure!(n > 0 && n <= self.max_seqs, "{n} sessions in one prefill");
         let tokens: usize = rows.iter().map(|(_, p)| p.len()).sum();
-        ensure!(tokens <= self.limits.max_prefill, "{tokens} prompt rows exceed {}", self.limits.max_prefill);
         let mut t = Rows::default();
         let (mut ids, mut voice, mut init, mut lines) = (vec![], vec![], vec![], vec![]);
-        for (s, (session, prefix)) in rows.iter_mut().enumerate() {
-            ensure!(session.pos == 0, "session {s} was started before");
+        for (s, (lease, prefix)) in rows.iter().enumerate() {
             let (p, first) = (&prefix.prompt, prefix.voice_row);
             voice.extend((0..p.voice_steps).map(|i| (first + i) as i32));
             voice.extend(std::iter::repeat_n(-1, p.rows.len()));
             ids.extend(std::iter::repeat_n(-1, p.voice_steps * STREAMS));
             ids.extend(p.rows.iter().flatten());
             init.extend(p.first.iter().chain(&p.pending));
-            t.push(&session.lease, 0..p.len(), s);
-            lines.push(session.lease.seq_line("lines", 0)?);
-            session.pos = p.len();
-            session.first_force = p.first_force;
+            t.push(lease, 0..p.len(), s);
+            lines.push(lease.seq_line("lines", 0)?);
         }
         let v = vars(tokens, n);
         let rt = &mut self.rt;
@@ -235,6 +319,56 @@ impl Model {
         Ok(())
     }
 
+    /// Prefills each fresh session's prefix; the sessions' first tick follows.
+    /// Prefixes present in (or eligible for) the on-device prefix cache are
+    /// copied from the cached KV lease instead of re-running Helium prefill.
+    pub fn start(&mut self, rows: &mut [(&mut Session, &Prefix)]) -> Result<()> {
+        let n = rows.len();
+        ensure!(n > 0 && n <= self.max_seqs, "{n} sessions in one prefill");
+        let tokens: usize = rows.iter().map(|(_, p)| p.len()).sum();
+        ensure!(tokens <= self.limits.max_prefill, "{tokens} prompt rows exceed {}", self.limits.max_prefill);
+        for (s, (session, _)) in rows.iter().enumerate() {
+            ensure!(session.pos == 0, "session {s} was started before");
+        }
+        // Populate the prefix cache once per unique eligible prefix.
+        for (_, prefix) in rows.iter() {
+            self.warm_prefix(prefix)?;
+        }
+        // Copy KV for all cached sessions in one `copy_prefix` launch.
+        let (mut c_src, mut c_dst, mut c_init, mut c_lines) = (vec![], vec![], vec![], vec![]);
+        let mut uncached: Vec<usize> = Vec::new();
+        for (idx, (session, prefix)) in rows.iter().enumerate() {
+            if let Some(src_lease) = self.prefix_cache.get(&prefix.key) {
+                for pos in 0..prefix.len() {
+                    c_src.push(src_lease.slot(pos) as i32);
+                    c_dst.push(session.lease.slot(pos) as i32);
+                }
+                c_init.extend(prefix.prompt.first.iter().chain(&prefix.prompt.pending));
+                c_lines.push(session.lease.seq_line("lines", 0)?);
+            } else {
+                uncached.push(idx);
+            }
+        }
+        if !c_lines.is_empty() {
+            let v = vars(c_src.len(), c_lines.len());
+            let rt = &mut self.rt;
+            rt.write_input_at("c_src", &ints(&c_src), &v)?;
+            rt.write_input_at("c_dst", &ints(&c_dst), &v)?;
+            rt.write_input_at("init", &ints(&c_init), &v)?;
+            rt.write_input_at("lines", &ints(&c_lines), &v)?;
+            rt.issue("copy_prefix", &v)?;
+        }
+        if !uncached.is_empty() {
+            let pairs: Vec<(&Lease, &Prefix)> = uncached.iter().map(|&i| (&rows[i].0.lease, rows[i].1)).collect();
+            self.prefill_leases(&pairs)?;
+        }
+        for (session, prefix) in rows.iter_mut() {
+            session.pos = prefix.len();
+            session.first_force = prefix.prompt.first_force;
+        }
+        Ok(())
+    }
+
     /// Advances every session by one frame.
     pub fn tick(&mut self, rows: &mut [(&mut Session, Step)]) -> Result<Out> {
         let n = rows.len();
@@ -242,39 +376,54 @@ impl Model {
         ensure!(rows.iter().all(|(s, _)| s.pos > 0), "a session that was not started");
         ensure!(rows.iter().all(|(_, x)| x.pcm.len() == FRAME), "a caller frame is not {FRAME} samples");
         let b = bucket(n);
-        let silence = [0.0; FRAME];
-        let pad = Step { pcm: &silence, force: [-1; DRAWN], force_caller: [-1; CODEBOOKS], seed: 0 };
-        let padded: Vec<(&Lease, usize, u64, Step)> = rows
-            .iter()
-            .map(|(s, x)| {
-                let mut x = x.clone();
-                if s.frame == 0 {
-                    x.force = std::array::from_fn(|k| if x.force[k] >= 0 { x.force[k] } else { s.first_force[k] });
+        let buf = &mut self.tick_buf;
+        buf.t.clear();
+        buf.lines.clear();
+        buf.frame.clear();
+        buf.pcm.clear();
+        buf.force.clear();
+        buf.force_caller.clear();
+        buf.seeds.clear();
+        for (s, (session, x)) in rows.iter().enumerate() {
+            buf.t.push(&session.lease, session.pos..session.pos + 1, s);
+            buf.lines.push(session.lease.seq_line("lines", 0)?);
+            buf.frame.push(session.frame as i32);
+            buf.pcm.extend(x.pcm.iter().flat_map(|v| v.to_le_bytes()));
+            if session.frame == 0 {
+                for k in 0..DRAWN {
+                    buf.force.push(if x.force[k] >= 0 { x.force[k] } else { session.first_force[k] });
                 }
-                (&s.lease, s.pos, s.frame, x)
-            })
-            .chain(std::iter::repeat_with(|| (&self.pad, 0, 0, pad.clone())))
-            .take(b)
-            .collect();
-        let mut t = Rows::default();
-        padded.iter().enumerate().for_each(|(s, (lease, pos, _, _))| t.push(lease, *pos..*pos + 1, s));
-        let lines = padded.iter().map(|(l, ..)| l.seq_line("lines", 0)).collect::<Result<Vec<_>, _>>()?;
-        let frame: Vec<i32> = padded.iter().map(|(_, _, f, _)| *f as i32).collect();
-        let pcm: Vec<u8> = padded.iter().flat_map(|(.., x)| x.pcm.iter().flat_map(|v| v.to_le_bytes())).collect();
-        let force: Vec<i32> = padded.iter().flat_map(|(.., x)| x.force).collect();
-        let force_caller: Vec<i32> = padded.iter().flat_map(|(.., x)| x.force_caller).collect();
-        let seeds: Vec<i32> = padded.iter().flat_map(|(.., x)| [x.seed as i32, (x.seed >> 32) as i32]).collect();
+            } else {
+                buf.force.extend_from_slice(&x.force);
+            }
+            buf.force_caller.extend_from_slice(&x.force_caller);
+            buf.seeds.push(x.seed as i32);
+            buf.seeds.push((x.seed >> 32) as i32);
+        }
+        if b > n {
+            let pad_line = self.pad.seq_line("lines", 0)?;
+            for s in n..b {
+                buf.t.push(&self.pad, 0..1, s);
+                buf.lines.push(pad_line);
+                buf.frame.push(0);
+                buf.pcm.resize(buf.pcm.len() + FRAME * 4, 0);
+                buf.force.extend_from_slice(&[-1; DRAWN]);
+                buf.force_caller.extend_from_slice(&[-1; CODEBOOKS]);
+                buf.seeds.push(0);
+                buf.seeds.push(0);
+            }
+        }
         let v = vars(b, b);
         let rt = &mut self.rt;
-        rt.write_input_at("lines", &ints(&lines), &v)?;
-        rt.write_input_at("pos", &ints(&t.pos), &v)?;
-        rt.write_input_at("slot", &ints(&t.slot), &v)?;
-        rt.write_input_at("frame", &ints(&frame), &v)?;
-        rt.write_input_at("caller", &pcm, &v)?;
-        rt.write_input_at("force", &ints(&force), &v)?;
-        rt.write_input_at("force_caller", &ints(&force_caller), &v)?;
-        rt.write_input_at("seeds", &ints(&seeds), &v)?;
-        t.write_pages(rt, &v)?;
+        rt.write_input_at("lines", &ints(&buf.lines), &v)?;
+        rt.write_input_at("pos", &ints(&buf.t.pos), &v)?;
+        rt.write_input_at("slot", &ints(&buf.t.slot), &v)?;
+        rt.write_input_at("frame", &ints(&buf.frame), &v)?;
+        rt.write_input_at("caller", &buf.pcm, &v)?;
+        rt.write_input_at("force", &ints(&buf.force), &v)?;
+        rt.write_input_at("force_caller", &ints(&buf.force_caller), &v)?;
+        rt.write_input_at("seeds", &ints(&buf.seeds), &v)?;
+        buf.t.write_pages(rt, &v)?;
         rt.issue("tick", &v)?;
         rows.iter_mut().for_each(|(s, _)| {
             s.pos += 1;
@@ -330,6 +479,14 @@ struct Rows {
 }
 
 impl Rows {
+    fn clear(&mut self) {
+        self.pos.clear();
+        self.slot.clear();
+        self.seq.clear();
+        self.indptr.clear();
+        self.pages.clear();
+    }
+
     fn push(&mut self, lease: &Lease, positions: std::ops::Range<usize>, s: usize) {
         if self.indptr.is_empty() {
             self.indptr.push(0);
@@ -379,17 +536,19 @@ fn generate(
     max_prefill: usize,
     sampling: Sampling,
 ) -> Result<(Value, HostTensors)> {
-    let mut g = Gen::default();
+    let mut g = if cfg!(personaplex_pdl) { Gen::with_pdl(&["lm", "mimi"]) } else { Gen::default() };
     let lm_file = File::open(&dir.join("model.safetensors"))?;
     let helium = Helium::load(&mut g, &lm_file, sampling)?;
     let depformer = Depformer::load(&mut g, &lm_file, sampling)?;
     drop(lm_file);
     let voice_rows: usize = voices.values().map(|(_, v)| v.steps()).sum();
-    let voice_data: Vec<f32> = voices.values().flat_map(|(_, v)| bf16s(&v.embeddings)).collect();
-    g.weight("voices", &[voice_rows, DIM], &voice_data);
+    let voice_data: Vec<u8> = voices.values().flat_map(|(_, v)| v.embeddings.iter().copied()).collect();
+    g.weight_bf16("voices", &[voice_rows, DIM], voice_data);
 
     helium.prefill(&mut g);
     let prefill = g.take();
+    helium.copy_prefix(&mut g);
+    let copy_prefix = g.take();
     let mimi_file = File::open(&dir.join("tokenizer-e351c8d8-checkpoint125.safetensors"))?;
     mimi::encode(&mut g, &mimi_file)?;
     helium.step(&mut g);
@@ -415,6 +574,7 @@ fn generate(
 
     let mut programs = serde_json::Map::new();
     programs.insert("prefill".into(), json!({"calls": prefill}));
+    programs.insert("copy_prefix".into(), json!({"calls": copy_prefix}));
     programs.insert("tick".into(), json!({"batch": {"groups": max_seqs, "rows": 1}, "graph": true, "calls": tick}));
     let s = g.finish(&mut programs);
 
@@ -433,6 +593,8 @@ fn generate(
     g.input("t_pos", json!(["tokens"]), min(0));
     g.input("t_slot", json!(["tokens"]), json!({"index_into": "kv0"}));
     g.input("t_seq", json!(["tokens"]), min(0));
+    g.input("c_src", json!(["tokens"]), json!({"index_into": "kv0"}));
+    g.input("c_dst", json!(["tokens"]), json!({"index_into": "kv0"}));
     g.input("init", json!(["seqs", INIT]), json!({"min": 0, "max": TEXT_VOCAB}));
     g.input("kv_indptr", json!([max_seqs + 1]), json!({"min": 0, "monotone": true}));
     g.input("kv_pages", json!([page_table]), json!({"index_into": "kv0", "stride": PAGE}));

@@ -1,6 +1,5 @@
 // Single-row attention over a set of key slots, shared by Helium (paged KV
-// ring), the depformer (a dense workspace per frame) and Mimi (a ring in the
-// session's state).
+// ring) and Mimi (a ring in the session's state), plus PDL and rotary helpers.
 //
 // A slot holds `[K heads | V heads][D]` for one position. Row `n`'s query
 // head `h` (in `q`, `[rows][heads][D]` at `q_stride` per row) attends to
@@ -13,6 +12,31 @@
 #include "common.cuh"
 
 constexpr int kAttnWarps = 4;
+
+// Wait before reading the predecessor's output, then allow successors to launch.
+__device__ __forceinline__ void pdl() {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;\n\tgriddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
+template <int E>
+__device__ __forceinline__ void load_e(const bf16* p, float* dst) {
+  if constexpr (E == 4) {
+    const uint2 u = *reinterpret_cast<const uint2*>(p);
+    const bf16* v = reinterpret_cast<const bf16*>(&u);
+#pragma unroll
+    for (int d = 0; d < 4; ++d) dst[d] = f32(v[d]);
+  } else if constexpr (E == 2) {
+    const uint32_t u = *reinterpret_cast<const uint32_t*>(p);
+    const bf16* v = reinterpret_cast<const bf16*>(&u);
+    dst[0] = f32(v[0]);
+    dst[1] = f32(v[1]);
+  } else {
+#pragma unroll
+    for (int d = 0; d < E; ++d) dst[d] = f32(p[d]);
+  }
+}
 
 template <int D, typename SlotOf>
 __device__ __forceinline__ void attend_row(const bf16* q, const bf16* kv, bf16* out, int heads, int len, float scale,
@@ -53,9 +77,10 @@ __device__ __forceinline__ void attend_row(const bf16* q, const bf16* kv, bf16* 
     for (int j = 0; j < count; ++j) {
       const int64_t sj = __shfl_sync(0xffffffffu, slot, j);
       const float pj = __shfl_sync(0xffffffffu, p, j);
-      const bf16* v = kv + sj * per_slot + (heads + h) * D + lane * E;
+      float vf[E];
+      load_e<E>(kv + sj * per_slot + (heads + h) * D + lane * E, vf);
 #pragma unroll
-      for (int d = 0; d < E; ++d) acc[d] += pj * f32(v[d]);
+      for (int d = 0; d < E; ++d) acc[d] += pj * vf[d];
     }
   }
   if (lane == 0) {
@@ -92,8 +117,13 @@ __device__ __forceinline__ void rope_head(const bf16* src, bf16* dst, float pos,
     const float freq = expf((float)i * coef);
     float s, c;
     sincosf(freq * pos, &s, &c);
-    const float r = f32(src[2 * i]), im = f32(src[2 * i + 1]);
-    dst[2 * i] = to_bf16(r * c - im * s);
-    dst[2 * i + 1] = to_bf16(r * s + im * c);
+    const uint32_t raw = *reinterpret_cast<const uint32_t*>(src + 2 * i);
+    const bf16* pair = reinterpret_cast<const bf16*>(&raw);
+    const float r = f32(pair[0]), im = f32(pair[1]);
+    uint32_t out_raw;
+    bf16* out_pair = reinterpret_cast<bf16*>(&out_raw);
+    out_pair[0] = to_bf16(r * c - im * s);
+    out_pair[1] = to_bf16(r * s + im * c);
+    *reinterpret_cast<uint32_t*>(dst + 2 * i) = out_raw;
   }
 }

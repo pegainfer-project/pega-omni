@@ -29,8 +29,9 @@
 __device__ __forceinline__ float elu(float x) { return x > 0.f ? x : expm1f(x); }
 
 __device__ __forceinline__ void loadf8(const float* p, float* v) {
-#pragma unroll
-  for (int k = 0; k < 8; ++k) v[k] = p[k];
+  const float4 a = reinterpret_cast<const float4*>(p)[0], b = reinterpret_cast<const float4*>(p)[1];
+  v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w;
+  v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
 }
 
 // The encoder's first conv, 1 -> C channels over raw f32 samples, kernel K:
@@ -39,6 +40,7 @@ __device__ __forceinline__ void loadf8(const float* p, float* v) {
 extern "C" __global__ void mimi_conv_in(const float* pcm, const float* w, const float* b, void* state,
                                         const int32_t* pos, const int32_t* lines, bf16* out, int T, int C, int K,
                                         int64_t stride, int total) {
+  pdl();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int C8 = C / 8, H = K - 1;
@@ -69,6 +71,7 @@ extern "C" __global__ void mimi_conv_in(const float* pcm, const float* w, const 
 extern "C" __global__ void mimi_im2col(const bf16* x, const bf16* bias, void* state, const int32_t* pos,
                                        const int32_t* lines, bf16* col, int T, int C, int K, int S, int act,
                                        int replicate, int64_t stride, int total) {
+  pdl();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int H = K - S, C8 = C / 8, To = T / S;
@@ -98,6 +101,7 @@ extern "C" __global__ void mimi_im2col(const bf16* x, const bf16* bias, void* st
 
 // out = act(x + bias), eight channels per thread (`total` counts the groups).
 extern "C" __global__ void mimi_bias_act(const bf16* x, const bf16* bias, bf16* out, int cols, int act, int total) {
+  pdl();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   float v[8], b[8];
@@ -114,6 +118,7 @@ extern "C" __global__ void mimi_bias_act(const bf16* x, const bf16* bias, bf16* 
 // first row is the previous frame's last row, kept in the slot. Plus bias.
 extern "C" __global__ void mimi_col2im(const bf16* z, const bf16* bias, void* state, const int32_t* lines, bf16* out,
                                        int L, int r, int C, int64_t stride, int total) {
+  pdl();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int C8 = C / 8;
@@ -144,6 +149,7 @@ extern "C" __global__ void mimi_col2im(const bf16* z, const bf16* bias, void* st
 // x_prev (the previous frame's row) kept in the slot. One thread per (session, channel).
 extern "C" __global__ void mimi_upsample(const bf16* x, const float* w, void* state, const int32_t* lines, bf16* out,
                                          int C, int64_t stride, int total) {
+  pdl();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int s = i / C, c = i % C;
@@ -159,6 +165,7 @@ extern "C" __global__ void mimi_upsample(const bf16* x, const float* w, void* st
 // first when `add` is set.
 extern "C" __global__ void mimi_layer_norm(bf16* res, const bf16* bias, int add, const bf16* w, const bf16* b,
                                            bf16* out, int dim, float eps, int rows) {
+  pdl();
   const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
   if (r >= rows) return;
   bf16* row = res + (int64_t)r * dim;
@@ -204,6 +211,7 @@ extern "C" __global__ void mimi_layer_norm(bf16* res, const bf16* bias, int add,
 
 // Exact (erf) GELU in place, eight values per thread.
 extern "C" __global__ void mimi_gelu(bf16* x, int total) {
+  pdl();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   float v[8];
@@ -220,6 +228,7 @@ constexpr int kMimiHead = 64;
 // ring slot position % context, v copied there. A warp per (row, head of q, k or v).
 extern "C" __global__ void mimi_rope_kv(bf16* qkv, const int32_t* pos, const int32_t* lines, void* state, int T,
                                         int heads, float coef, int context, int64_t stride) {
+  pdl();
   const int n = blockIdx.x;
   const int head = blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5);
   if (head >= 3 * heads) return;
@@ -229,7 +238,8 @@ extern "C" __global__ void mimi_rope_kv(bf16* qkv, const int32_t* pos, const int
   bf16* ring = slot<bf16>(state, lines, s, stride);
   bf16* dst = ring + ((int64_t)(p % context) * 2 * heads + head - heads) * kMimiHead;
   if (head >= 2 * heads) {
-    for (int i = threadIdx.x & 31; i < kMimiHead; i += 32) dst[i] = src[i];
+    const int lane = threadIdx.x & 31;
+    *reinterpret_cast<uint32_t*>(dst + lane * 2) = *reinterpret_cast<const uint32_t*>(src + lane * 2);
     return;
   }
   rope_head<kMimiHead>(src, head < heads ? src : dst, (float)p, coef);
@@ -237,12 +247,13 @@ extern "C" __global__ void mimi_rope_kv(bf16* qkv, const int32_t* pos, const int
 
 struct RingSlots {
   int first, context;
-  __device__ int64_t operator()(int t) const { return (first + t) % context; }
+  __device__ __forceinline__ int64_t operator()(int t) const { return (first + t) % context; }
 };
 
 extern "C" __global__ void __launch_bounds__(kAttnWarps * 32)
     mimi_attend(const bf16* qkv, const int32_t* pos, const int32_t* lines, const void* state, bf16* out, int T,
                 int heads, float scale, int context, int64_t stride) {
+  pdl();
   const int n = blockIdx.x, s = n / T;
   const int p = pos[s] * T + n % T;
   const int len = min(p + 1, context);
@@ -255,47 +266,45 @@ constexpr int kBookDim = 256;
 constexpr int kBookSize = 2048;
 constexpr int kQuantThreads = 256;
 
-// Split residual vector quantization of each session's projected latent
-// `[semantic 256 | acoustic 256]`: codebook 0 quantizes the semantic half,
-// codebooks 1..7 the acoustic half residually. Nearest by euclidean distance
-// (‖e‖² − 2 x·e, `norms` holding ‖e‖²), in f32, lowest index on ties.
-// `books` is [8][2048][256] f32. One block per session.
+// One step of split residual vector quantization after the GEMM `dots = x · book_q^T`:
+// finds `argmin_e (norms[q][e] - 2 * dots[s][e])` (lowest index on ties), writes
+// `codes[s][q]`, and for acoustic codebooks `1..n_books-2` subtracts the f32
+// codebook entry from the running f32 residual `q_res` and stores its bf16
+// copy to `q_cur` for the next GEMM. One block of 256 threads per session.
 extern "C" __global__ void __launch_bounds__(kQuantThreads)
-    mimi_quantize(const bf16* latent, const float* books, const float* norms, int32_t* codes, int n_books) {
+    mimi_q_step(const bf16* dots, const float* norms, const float* books, bf16* q_cur, float* q_res, int32_t* codes,
+                int q, int n_books) {
+  pdl();
   const int s = blockIdx.x, tid = threadIdx.x;
-  __shared__ float x[kBookDim];
   __shared__ unsigned long long best;
-  for (int q = 0; q < n_books; ++q) {
-    if (q <= 1) x[tid] = f32(latent[(int64_t)s * 2 * kBookDim + (q == 0 ? 0 : kBookDim) + tid]);
-    if (tid == 0) best = ~0ull;
-    __syncthreads();
-    const float* book = books + (int64_t)q * kBookSize * kBookDim;
-    unsigned long long mine = ~0ull;
-    for (int e = tid; e < kBookSize; e += kQuantThreads) {
-      const float4* row = reinterpret_cast<const float4*>(book + (int64_t)e * kBookDim);
-      float dot = 0.f;
-#pragma unroll 8
-      for (int d = 0; d < kBookDim / 4; ++d) {
-        const float4 v = row[d];
-        dot += x[4 * d] * v.x + x[4 * d + 1] * v.y + x[4 * d + 2] * v.z + x[4 * d + 3] * v.w;
-      }
-      const float dist = norms[q * kBookSize + e] - 2.f * dot;
-      const uint32_t u = __float_as_uint(dist);
-      const uint32_t key = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-      const unsigned long long packed = (unsigned long long)key << 32 | (uint32_t)e;
-      mine = packed < mine ? packed : mine;
-    }
+  if (tid == 0) best = ~0ull;
+  __syncthreads();
+  const bf16* drow = dots + (int64_t)s * kBookSize;
+  const float* nrow = norms + (int64_t)q * kBookSize;
+  unsigned long long mine = ~0ull;
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      const unsigned long long other = __shfl_xor_sync(0xffffffffu, mine, o);
-      mine = other < mine ? other : mine;
-    }
-    if ((tid & 31) == 0) atomicMin(&best, mine);
-    __syncthreads();
-    const int code = (int)(best & 0xffffffffu);
-    if (tid == 0) codes[s * n_books + q] = code;
-    if (q >= 1) x[tid] -= book[(int64_t)code * kBookDim + tid];
-    __syncthreads();
+  for (int e = tid; e < kBookSize; e += kQuantThreads) {
+    const float dist = nrow[e] - 2.f * f32(drow[e]);
+    const uint32_t u = __float_as_uint(dist);
+    const uint32_t key = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    const unsigned long long packed = (unsigned long long)key << 32 | (uint32_t)e;
+    mine = packed < mine ? packed : mine;
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    const unsigned long long other = __shfl_xor_sync(0xffffffffu, mine, o);
+    mine = other < mine ? other : mine;
+  }
+  if ((tid & 31) == 0) atomicMin(&best, mine);
+  __syncthreads();
+  const int code = (int)(best & 0xffffffffu);
+  if (tid == 0) codes[s * n_books + q] = code;
+  if (q >= 1 && q < n_books - 1) {
+    const float* entry = books + ((int64_t)q * kBookSize + code) * kBookDim;
+    const int64_t at = (int64_t)s * kBookDim + tid;
+    const float r = (q == 1 ? f32(q_cur[at]) : q_res[at]) - entry[tid];
+    q_res[at] = r;
+    q_cur[at] = to_bf16(r);
   }
 }
 
@@ -304,6 +313,7 @@ extern "C" __global__ void __launch_bounds__(kQuantThreads)
 // Its projection is the GEMM after. One thread per 8 channels of a row.
 extern "C" __global__ void mimi_dequantize(const int32_t* codes, int ld, const float* books, bf16* out, int n_books,
                                            int total) {
+  pdl();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int per = 2 * kBookDim / 8;
@@ -313,8 +323,10 @@ extern "C" __global__ void mimi_dequantize(const int32_t* codes, int ld, const f
   const int lo = c < kBookDim ? 0 : 1, hi = c < kBookDim ? 1 : n_books, d = c % kBookDim;
   for (int q = lo; q < hi; ++q) {
     const float* e = books + ((int64_t)q * kBookSize + code[q]) * kBookDim + d;
+    float ev[8];
+    loadf8(e, ev);
 #pragma unroll
-    for (int k = 0; k < 8; ++k) acc[k] += e[k];
+    for (int k = 0; k < 8; ++k) acc[k] += ev[k];
   }
   store8(out + (int64_t)s * 2 * kBookDim + c, acc);
 }
@@ -325,6 +337,7 @@ extern "C" __global__ void mimi_dequantize(const int32_t* codes, int ld, const f
 extern "C" __global__ void mimi_conv_out(const bf16* x, const bf16* bias, const float* w, const float* b, void* state,
                                          const int32_t* pos, const int32_t* lines, float* pcm, int T, int C, int K,
                                          int64_t stride, int total) {
+  pdl();
   const int g = blockIdx.x * blockDim.x + threadIdx.x;
   if (g >= total) return;
   const int s = g / T, t = g % T, H = K - 1;
@@ -347,8 +360,10 @@ extern "C" __global__ void mimi_conv_out(const bf16* x, const bf16* bias, const 
       } else {
         load8(old + (int64_t)(H + src) * C + c, v);
       }
+      float wv[8];
+      loadf8(w + j * C + c, wv);
 #pragma unroll
-      for (int k = 0; k < 8; ++k) acc += w[j * C + c + k] * v[k];
+      for (int k = 0; k < 8; ++k) acc += wv[k] * v[k];
     }
   }
   pcm[g] = acc;

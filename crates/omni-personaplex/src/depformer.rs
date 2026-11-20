@@ -58,19 +58,19 @@ pub struct Depformer {
     sampling: Sampling,
 }
 
-/// The first `STEPS` of a `[DEP_STEPS_STORED * rows, cols]` per-step weight.
-fn steps(file: &File, name: &str, rows: usize, cols: usize) -> Result<Vec<f32>> {
-    let t = file.expect(name, &[DEP_STEPS_STORED * rows, cols])?;
-    Ok(t.data[..STEPS * rows * cols].to_vec())
+/// The first `STEPS` of a `[DEP_STEPS_STORED * rows, cols]` per-step weight as raw bf16 bytes.
+fn steps(file: &File, name: &str, rows: usize, cols: usize) -> Result<Vec<u8>> {
+    let mut b = file.expect_bf16(name, &[DEP_STEPS_STORED * rows, cols])?;
+    b.truncate(STEPS * rows * cols * 2);
+    Ok(b)
 }
 
-fn stacked(file: &File, name: &str, n: usize, shape: [usize; 2]) -> Result<Vec<f32>> {
-    Ok((0..n)
-        .map(|k| file.expect(&name.replace("{k}", &k.to_string()), &shape))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flat_map(|t| t.data)
-        .collect())
+fn stacked(file: &File, name: &str, n: usize, shape: [usize; 2]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(n * shape[0] * shape[1] * 2);
+    for k in 0..n {
+        out.extend_from_slice(&file.expect_bf16(&name.replace("{k}", &k.to_string()), &shape)?);
+    }
+    Ok(out)
 }
 
 impl Depformer {
@@ -79,58 +79,53 @@ impl Depformer {
             .map(|i| {
                 let p = format!("depformer.layers.{i}");
                 let n = |s: &str| format!("d.l{i}.{s}");
-                let norm = |s: &str| file.expect(&format!("{p}.{s}.alpha"), &[1, 1, DEP_DIM]);
+                let norm = |s: &str| file.expect_bf16(&format!("{p}.{s}.alpha"), &[1, 1, DEP_DIM]);
                 Ok(Layer {
-                    norm1: g.weight(&n("norm1"), &[DEP_DIM], &norm("norm1")?.data),
-                    qkv: g.weight(
+                    norm1: g.weight_bf16(&n("norm1"), &[DEP_DIM], norm("norm1")?),
+                    qkv: g.weight_bf16(
                         &n("qkv"),
                         &[STEPS * 3 * DEP_DIM, DEP_DIM],
-                        &steps(file, &format!("{p}.self_attn.in_proj_weight"), 3 * DEP_DIM, DEP_DIM)?,
+                        steps(file, &format!("{p}.self_attn.in_proj_weight"), 3 * DEP_DIM, DEP_DIM)?,
                     ),
-                    out: g.weight(
+                    out: g.weight_bf16(
                         &n("out"),
                         &[STEPS * DEP_DIM, DEP_DIM],
-                        &steps(file, &format!("{p}.self_attn.out_proj.weight"), DEP_DIM, DEP_DIM)?,
+                        steps(file, &format!("{p}.self_attn.out_proj.weight"), DEP_DIM, DEP_DIM)?,
                     ),
-                    norm2: g.weight(&n("norm2"), &[DEP_DIM], &norm("norm2")?.data),
-                    gate_in: g.weight(
+                    norm2: g.weight_bf16(&n("norm2"), &[DEP_DIM], norm("norm2")?),
+                    gate_in: g.weight_bf16(
                         &n("gate_in"),
                         &[STEPS * 2 * DEP_HIDDEN, DEP_DIM],
-                        &stacked(
-                            file,
-                            &format!("{p}.gating.{{k}}.linear_in.weight"),
-                            STEPS,
-                            [2 * DEP_HIDDEN, DEP_DIM],
-                        )?,
+                        stacked(file, &format!("{p}.gating.{{k}}.linear_in.weight"), STEPS, [2 * DEP_HIDDEN, DEP_DIM])?,
                     ),
-                    gate_out: g.weight(
+                    gate_out: g.weight_bf16(
                         &n("gate_out"),
                         &[STEPS * DEP_DIM, DEP_HIDDEN],
-                        &stacked(file, &format!("{p}.gating.{{k}}.linear_out.weight"), STEPS, [DEP_DIM, DEP_HIDDEN])?,
+                        stacked(file, &format!("{p}.gating.{{k}}.linear_out.weight"), STEPS, [DEP_DIM, DEP_HIDDEN])?,
                     ),
                 })
             })
             .collect::<Result<_>>()?;
         Ok(Self {
-            input: g.weight(
+            input: g.weight_bf16(
                 "d.input",
                 &[STEPS * DEP_DIM, DIM],
-                &stacked(file, "depformer_in.{k}.weight", STEPS, [DEP_DIM, DIM])?,
+                stacked(file, "depformer_in.{k}.weight", STEPS, [DEP_DIM, DIM])?,
             ),
-            text_emb: g.weight(
+            text_emb: g.weight_bf16(
                 "d.text_emb",
                 &[TEXT_VOCAB + 1, DEP_DIM],
-                &file.expect("depformer_text_emb.weight", &[TEXT_VOCAB + 1, DEP_DIM])?.data,
+                file.expect_bf16("depformer_text_emb.weight", &[TEXT_VOCAB + 1, DEP_DIM])?,
             ),
-            emb: g.weight(
+            emb: g.weight_bf16(
                 "d.emb",
                 &[(STEPS - 1) * (CARD + 1), DEP_DIM],
-                &stacked(file, "depformer_emb.{k}.weight", STEPS - 1, [CARD + 1, DEP_DIM])?,
+                stacked(file, "depformer_emb.{k}.weight", STEPS - 1, [CARD + 1, DEP_DIM])?,
             ),
-            heads: g.weight(
+            heads: g.weight_bf16(
                 "d.heads",
                 &[STEPS * CARD, DEP_DIM],
-                &stacked(file, "linears.{k}.weight", STEPS, [CARD, DEP_DIM])?,
+                stacked(file, "linears.{k}.weight", STEPS, [CARD, DEP_DIM])?,
             ),
             layers,
             sampling,
@@ -168,18 +163,21 @@ impl Depformer {
                 k => buf_at(&self.emb, (k - 1) * bytes(CARD + 1, DEP_DIM)),
             };
             g.launch(
-                &format!("d{k}.embed"),
-                "lm_dep_embed",
+                &format!("d{k}.embed_norm"),
+                "lm_dep_embed_norm",
                 per_row.clone(),
                 block,
-                vec![inb("d.proj"), i32a(k), ("in buffer<bf16>", table), ini("drawn"), outb("d.x"), i32a(DEP_DIM)],
-            );
-            g.launch(
-                &format!("d{k}.norm"),
-                "lm_norm",
-                per_row.clone(),
-                block,
-                vec![inb("d.x"), inb(&self.layers[0].norm1), outb("d.xn"), i32a(DEP_DIM), f32a(NORM_EPS)],
+                vec![
+                    inb("d.proj"),
+                    i32a(k),
+                    ("in buffer<bf16>", table),
+                    ini("drawn"),
+                    inb(&self.layers[0].norm1),
+                    outb("d.x"),
+                    outb("d.xn"),
+                    i32a(DEP_DIM),
+                    f32a(NORM_EPS),
+                ],
             );
             for (i, l) in self.layers.iter().enumerate() {
                 let at = |s: &str| format!("d{k}.l{i}.{s}");
@@ -192,20 +190,13 @@ impl Depformer {
                     (3 * DEP_DIM, DEP_DIM),
                 );
                 g.launch(
-                    &at("kv"),
-                    "lm_dep_kv",
-                    per_row.clone(),
-                    128,
-                    vec![inb("d.qkv"), outb(&ws), i32a(k), i32a(DEP_HEADS)],
-                );
-                g.launch(
-                    &at("attn"),
-                    "lm_dep_attend",
+                    &at("kv_attn"),
+                    "lm_dep_kv_attend",
                     [seqs.clone(), json!(DEP_HEADS), json!(1)],
-                    128,
+                    32,
                     vec![
                         inb("d.qkv"),
-                        inb(&ws),
+                        if k == 0 { outb(&ws) } else { io(&ws) },
                         i32a(k),
                         outb("d.attn"),
                         i32a(DEP_HEADS),

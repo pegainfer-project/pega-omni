@@ -121,13 +121,16 @@ pub fn start(
     let thread = std::thread::Builder::new().name("omni-personaplex".into()).spawn(move || {
         let loaded = (|| {
             let limits = Limits { max_sessions: opts.max_sessions, max_prefill: opts.max_prefill };
-            let model =
+            let mut model =
                 Model::load(device, &dir, limits, opts.sampling).with_context(|| format!("load {}", dir.display()))?;
             ensure!(
                 model.voices().any(|v| v == DEFAULT_VOICE),
                 "{} has no voice {DEFAULT_VOICE}, the default",
                 dir.display()
             );
+            model.warmup().context("warmup tick graphs")?;
+            let default_prefix = model.prompt(DEFAULT_VOICE, DEFAULT_INSTRUCTIONS)?;
+            model.warm_prefix(&default_prefix).context("warm default prefix")?;
             let (handle, inbox) = omni_engine::live::live_channel(info(&model, &name, &opts), queue);
             anyhow::Ok((handle, inbox, model))
         })();
@@ -192,14 +195,36 @@ struct Engine {
 }
 
 impl Engine {
-    /// Prefills every admitted session and starts its line.
+    /// Prefills waiting admitted sessions and starts their lines.
+    /// When live callers are active, uncached eager prefills are paced (at most
+    /// two per tick) so a burst of custom-prompt arrivals never overruns the
+    /// 80 ms frame budget; cached prefixes copy in microseconds and are never
+    /// throttled.
     fn prefill(&mut self) -> Result<()> {
-        let lens: Vec<usize> = self.admitted.iter().map(|a| a.prefix.len()).collect();
+        if self.admitted.is_empty() {
+            return Ok(());
+        }
+        let mut ready = Vec::new();
+        let mut deferred = Vec::new();
+        let mut uncached_budget = if self.calls.is_empty() { usize::MAX } else { 2 };
+        for a in self.admitted.drain(..) {
+            if self.model.is_cached(&a.prefix) {
+                ready.push(a);
+            } else if uncached_budget > 0 {
+                uncached_budget -= 1;
+                ready.push(a);
+            } else {
+                deferred.push(a);
+            }
+        }
+        self.admitted = deferred;
+        let lens: Vec<usize> = ready.iter().map(|a| a.prefix.len()).collect();
         for n in batches(&lens, self.opts.max_prefill) {
-            let mut batch: Vec<Admitted> = self.admitted.drain(..n).collect();
+            let mut batch: Vec<Admitted> = ready.drain(..n).collect();
             let mut rows: Vec<_> = batch.iter_mut().map(|a| (&mut a.session, &a.prefix)).collect();
             if let Err(e) = self.model.start(&mut rows) {
                 batch.into_iter().for_each(|a| a.submission.refuse(CloseReason::Aborted));
+                ready.into_iter().for_each(|a| a.submission.refuse(CloseReason::Aborted));
                 return Err(e);
             }
             for a in batch {

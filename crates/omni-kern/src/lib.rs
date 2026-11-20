@@ -65,6 +65,11 @@ impl Gen {
         self.add_weight(name, DType::Bf16, shape, bytes)
     }
 
+    pub fn weight_bf16(&mut self, name: &str, shape: &[usize], bytes: Vec<u8>) -> String {
+        debug_assert_eq!(shape.iter().product::<usize>() * 2, bytes.len(), "{name}");
+        self.add_weight(name, DType::Bf16, shape, bytes)
+    }
+
     pub fn weight_f32(&mut self, name: &str, data: Vec<f32>) -> String {
         let bytes = data.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.add_weight(name, DType::F32, &[data.len()], bytes)

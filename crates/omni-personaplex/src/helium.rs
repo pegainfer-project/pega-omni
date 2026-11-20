@@ -80,57 +80,55 @@ pub fn rope_coef(d: usize) -> f32 {
     (-(ROPE_PERIOD as f64).ln() * 2.0 / d as f64) as f32
 }
 
-/// Bytes of K and V one position takes in one layer.
-pub const KV_BYTES: usize = 2 * HEADS * HEAD_DIM * 2;
+/// Bytes of FP8 (E4M3) K and V plus per-head f32 scales one position takes in one layer.
+pub const KV_BYTES: usize = 2 * HEADS * HEAD_DIM + 2 * HEADS * 4;
 
 impl Helium {
     pub fn load(g: &mut Gen, file: &File, sampling: Sampling) -> Result<Self> {
-        let w = |n: &str, shape: &[usize]| file.expect(n, shape);
+        let w = |n: &str, shape: &[usize]| file.expect_bf16(n, shape);
         let layers = (0..LAYERS)
             .map(|i| {
                 let p = format!("transformer.layers.{i}");
                 let n = |s: &str| format!("h.l{i}.{s}");
                 Ok(Layer {
-                    norm1: g.weight(&n("norm1"), &[DIM], &w(&format!("{p}.norm1.alpha"), &[1, 1, DIM])?.data),
-                    qkv: g.weight(
+                    norm1: g.weight_bf16(&n("norm1"), &[DIM], w(&format!("{p}.norm1.alpha"), &[1, 1, DIM])?),
+                    qkv: g.weight_bf16(
                         &n("qkv"),
                         &[3 * DIM, DIM],
-                        &w(&format!("{p}.self_attn.in_proj_weight"), &[3 * DIM, DIM])?.data,
+                        w(&format!("{p}.self_attn.in_proj_weight"), &[3 * DIM, DIM])?,
                     ),
-                    o: g.weight(&n("o"), &[DIM, DIM], &w(&format!("{p}.self_attn.out_proj.weight"), &[DIM, DIM])?.data),
-                    norm2: g.weight(&n("norm2"), &[DIM], &w(&format!("{p}.norm2.alpha"), &[1, 1, DIM])?.data),
-                    gate_up: g.weight(
+                    o: g.weight_bf16(&n("o"), &[DIM, DIM], w(&format!("{p}.self_attn.out_proj.weight"), &[DIM, DIM])?),
+                    norm2: g.weight_bf16(&n("norm2"), &[DIM], w(&format!("{p}.norm2.alpha"), &[1, 1, DIM])?),
+                    gate_up: g.weight_bf16(
                         &n("gate_up"),
                         &[2 * HIDDEN, DIM],
-                        &w(&format!("{p}.gating.linear_in.weight"), &[2 * HIDDEN, DIM])?.data,
+                        w(&format!("{p}.gating.linear_in.weight"), &[2 * HIDDEN, DIM])?,
                     ),
-                    down: g.weight(
+                    down: g.weight_bf16(
                         &n("down"),
                         &[DIM, HIDDEN],
-                        &w(&format!("{p}.gating.linear_out.weight"), &[DIM, HIDDEN])?.data,
+                        w(&format!("{p}.gating.linear_out.weight"), &[DIM, HIDDEN])?,
                     ),
                 })
             })
             .collect::<Result<_>>()?;
-        let audio: Vec<f32> = (0..2 * CODEBOOKS)
-            .map(|k| w(&format!("emb.{k}.weight"), &[CARD + 1, DIM]))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flat_map(|t| t.data)
-            .collect();
+        let mut audio = Vec::with_capacity(2 * CODEBOOKS * (CARD + 1) * DIM * 2);
+        for k in 0..2 * CODEBOOKS {
+            audio.extend_from_slice(&w(&format!("emb.{k}.weight"), &[CARD + 1, DIM])?);
+        }
         Ok(Self {
             layers,
-            out_norm: g.weight("h.out_norm", &[DIM], &w("out_norm.alpha", &[1, 1, DIM])?.data),
-            text_emb: g.weight(
+            out_norm: g.weight_bf16("h.out_norm", &[DIM], w("out_norm.alpha", &[1, 1, DIM])?),
+            text_emb: g.weight_bf16(
                 "h.text_emb",
                 &[TEXT_VOCAB + 1, DIM],
-                &w("text_emb.weight", &[TEXT_VOCAB + 1, DIM])?.data,
+                w("text_emb.weight", &[TEXT_VOCAB + 1, DIM])?,
             ),
-            audio_emb: g.weight("h.audio_emb", &[2 * CODEBOOKS * (CARD + 1), DIM], &audio),
-            text_linear: g.weight(
+            audio_emb: g.weight_bf16("h.audio_emb", &[2 * CODEBOOKS * (CARD + 1), DIM], audio),
+            text_linear: g.weight_bf16(
                 "h.text_linear",
                 &[TEXT_VOCAB, DIM],
-                &w("text_linear.weight", &[TEXT_VOCAB, DIM])?.data,
+                w("text_linear.weight", &[TEXT_VOCAB, DIM])?,
             ),
             state: g.region(4 * 24),
             sampling,
@@ -158,6 +156,28 @@ impl Helium {
         self.forward(g, "prefill", &rows, true);
         g.launch(
             "prefill.init",
+            "lm_init",
+            [json!("seqs"), json!(1), json!(1)],
+            32,
+            vec![("inout state", json!({"state": "seq", "offset": self.state})), ini("lines"), stride(), ini("init")],
+        );
+    }
+
+    /// Copies cached prefix KV slots into new sessions' leases and initializes their token states.
+    pub fn copy_prefix(&self, g: &mut Gen) {
+        let rows = json!("tokens");
+        for i in 0..LAYERS {
+            let kv = json!({"state": format!("kv{i}")});
+            g.launch(
+                &format!("copy.l{i}"),
+                "lm_copy_kv",
+                [rows.clone(), json!(1), json!(1)],
+                256,
+                vec![("inout state", kv), ini("c_src"), ini("c_dst"), i32a(KV_BYTES)],
+            );
+        }
+        g.launch(
+            "copy.init",
             "lm_init",
             [json!("seqs"), json!(1), json!(1)],
             32,

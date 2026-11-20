@@ -16,6 +16,11 @@ fn nvcc() -> PathBuf {
 
 fn main() {
     let arch = std::env::var("OMNI_CUDA_ARCH").unwrap_or_else(|_| "103a".into());
+    println!("cargo:rustc-check-cfg=cfg(personaplex_pdl)");
+    let sm: u32 = arch.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0);
+    if sm >= 90 {
+        println!("cargo:rustc-cfg=personaplex_pdl");
+    }
     for var in ["OMNI_CUDA_ARCH", "NVCC", "CUDA_PATH"] {
         println!("cargo:rerun-if-env-changed={var}");
     }

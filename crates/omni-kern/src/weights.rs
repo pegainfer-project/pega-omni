@@ -72,6 +72,22 @@ impl File {
         ensure!(t.shape == shape, "tensor {name}: expected shape {shape:?}, got {:?}", t.shape);
         Ok(t)
     }
+
+    /// A tensor of the given shape as raw little-endian bf16 bytes (zero-copy conversion when already bf16).
+    pub fn expect_bf16(&self, name: &str, shape: &[usize]) -> Result<Vec<u8>> {
+        let (dtype, got, bytes) = self.raw(name)?;
+        ensure!(got == shape, "tensor {name}: expected shape {shape:?}, got {got:?}");
+        match dtype {
+            Dtype::BF16 => Ok(bytes.to_vec()),
+            Dtype::F32 => Ok(bytes
+                .as_chunks()
+                .0
+                .iter()
+                .flat_map(|&b| bf16::from_f32(f32::from_le_bytes(b)).to_le_bytes())
+                .collect()),
+            other => bail!("tensor {name}: unsupported dtype {other:?}"),
+        }
+    }
 }
 
 /// Row-concatenation of `[out_i, in]` matrices sharing `in`.

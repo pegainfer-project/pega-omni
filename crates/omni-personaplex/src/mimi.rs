@@ -317,27 +317,41 @@ pub fn encode(g: &mut Gen, file: &File) -> Result<()> {
     let down = file.expect("downsample.conv.conv.conv.weight", &[MIMI_DIM, MIMI_DIM, 4])?;
     conv(g, "enc.downsample", &x, (down, vec![]), "caller_latent", T_LATENT, (4, 2), false, true);
     let proj = |p: &str| file.expect(&format!("quantizer.{p}.input_proj.weight"), &[CODEBOOK_DIM, MIMI_DIM, 1]);
-    let proj = g.weight(
-        "enc.q.proj",
-        &[2 * CODEBOOK_DIM, MIMI_DIM],
-        &[proj("rvq_first")?.data, proj("rvq_rest")?.data].concat(),
-    );
-    g.gemm("enc.q.proj", "m.q", "caller_latent", &proj, 1, (2 * CODEBOOK_DIM, MIMI_DIM));
+    let proj_sem = g.weight("enc.q.proj_sem", &[CODEBOOK_DIM, MIMI_DIM], &proj("rvq_first")?.data);
+    let proj_ac = g.weight("enc.q.proj_ac", &[CODEBOOK_DIM, MIMI_DIM], &proj("rvq_rest")?.data);
+    g.gemm("enc.q.proj_sem", "m.q_sem", "caller_latent", &proj_sem, 1, (CODEBOOK_DIM, MIMI_DIM));
+    g.gemm("enc.q.proj_ac", "m.q_cur", "caller_latent", &proj_ac, 1, (CODEBOOK_DIM, MIMI_DIM));
     let (books, norms) = codebooks(file)?;
+    let books_bf16 = g.weight("q.books_bf16", &[CODEBOOKS * BOOK, CODEBOOK_DIM], &books);
     let (books, norms) = (g.weight_f32("q.books", books), g.weight_f32("q.norms", norms));
-    g.launch(
-        "enc.quantize",
-        "mimi_quantize",
-        [seqs, json!(1), json!(1)],
-        CODEBOOK_DIM as u32,
-        vec![
-            inb("m.q"),
-            inf(&books),
-            inf(&norms),
-            ("out buffer<i32>", omni_kern::buf("caller_codes")),
-            i32a(CODEBOOKS),
-        ],
-    );
+    g.need("m.q_dots", BOOK);
+    g.buffer("m.q_res", "f32", json!(["seqs", CODEBOOK_DIM]), "workspace");
+    let seqs_count = omni_kern::count(&seqs);
+    for q in 0..CODEBOOKS {
+        let src = if q == 0 { "m.q_sem" } else { "m.q_cur" };
+        g.gemm_rows(
+            &format!("enc.q{q}.dot"),
+            (omni_kern::buf("m.q_dots"), omni_kern::buf(src), buf_at(&books_bf16, q * BOOK * CODEBOOK_DIM * 2)),
+            seqs_count.clone(),
+            (BOOK, CODEBOOK_DIM),
+        );
+        g.launch(
+            &format!("enc.q{q}.pick"),
+            "mimi_q_step",
+            [seqs.clone(), json!(1), json!(1)],
+            CODEBOOK_DIM as u32,
+            vec![
+                inb("m.q_dots"),
+                inf(&norms),
+                inf(&books),
+                io("m.q_cur"),
+                (if q <= 1 { "out buffer<f32>" } else { "inout buffer<f32>" }, omni_kern::buf("m.q_res")),
+                ("out buffer<i32>", omni_kern::buf("caller_codes")),
+                i32a(q),
+                i32a(CODEBOOKS),
+            ],
+        );
+    }
     Ok(())
 }
 
